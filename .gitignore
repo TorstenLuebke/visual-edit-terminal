@@ -30,3 +30,5 @@ Thumbs.db
 # Logs
 *.log
 "@ | Set-Content .gitignore -Encoding UTF8
+# Nuitka crash reports
+nuitka-crash-report.xml
