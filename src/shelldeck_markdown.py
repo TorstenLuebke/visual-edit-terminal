@@ -66,6 +66,7 @@ def markdown_to_html(markdown_text: Any) -> str:
     parts: List[str] = []
     last = 0
 
+    code_index = 0
     for match in _CODE_FENCE_RE.finditer(text):
         before = text[last:match.start()]
         if before.strip():
@@ -75,19 +76,24 @@ def markdown_to_html(markdown_text: Any) -> str:
         code = str(match.group(2) or "").strip("\n")
         safe_code = html.escape(code)
         safe_language = html.escape(language)
+        copy_href = f"shelldeck-copy-code:{code_index}"
         parts.append(
-            "<div style='margin:10px 0; border:1px solid #3A3A3A; "
-            "border-radius:8px; background-color:#111827;'>"
-            "<div style='padding:6px 10px; background-color:#1F2937; "
+            "<div style='margin:10px 0; border:1px solid #334155; "
+            "border-radius:9px; background-color:#0F172A;'>"
+            "<div style='padding:7px 10px; background-color:#1E293B; "
             "color:#E5E7EB; font-weight:bold;'>"
-            f"{safe_language}"
+            f"<span>{safe_language}</span>"
+            f"<a href='{copy_href}' style='float:right; color:#93C5FD; "
+            "text-decoration:none; font-weight:bold;'>Kopieren</a>"
             "</div>"
-            "<pre style='margin:0; padding:10px; color:#F9FAFB; "
-            "font-family:Consolas, Courier New, monospace; white-space:pre-wrap;'>"
+            "<pre style='margin:0; padding:12px; color:#F8FAFC; "
+            "font-family:Consolas, Courier New, monospace; font-size:10pt; "
+            "line-height:1.25; white-space:pre-wrap;'>"
             f"{safe_code}"
             "</pre>"
             "</div>"
         )
+        code_index += 1
         last = match.end()
 
     rest = text[last:]

@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.8.0"
 
 
 def install_crash_logging():
@@ -168,6 +168,10 @@ class TerminalTab(QWidget):
         self.output_area = QTextEdit()
         self.output_area.setReadOnly(True)
         self.output_area.setFont(self.window.terminal_font)
+        self.output_area.setTextInteractionFlags(
+            self.output_area.textInteractionFlags() | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self.output_area.viewport().installEventFilter(self)
         self.output_area.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.output_area.customContextMenuRequested.connect(self.show_terminal_context_menu)
         layout.addWidget(self.output_area)
@@ -532,6 +536,18 @@ class TerminalTab(QWidget):
         self.window.statusBar().showMessage(f"Shell-Backend: {backend_label}")
 
     def eventFilter(self, source, event):
+        if source is self.output_area.viewport() and event.type() == QEvent.Type.MouseButtonRelease:
+            if getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton:
+                try:
+                    pos = event.position().toPoint()
+                except AttributeError:
+                    pos = event.pos()
+                anchor = self.output_area.anchorAt(pos)
+                if str(anchor).startswith("shelldeck-copy-code:"):
+                    index_text = str(anchor).split(":", 1)[1]
+                    self.copy_ollama_code_block(index_text)
+                    return True
+
         if source is self.input_line and event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 self.execute_command()
@@ -862,14 +878,23 @@ class TerminalTab(QWidget):
         else:
             self.output_area.append("\n[Ollama hat keine sichtbare Antwort geliefert.]\n")
 
-    def copy_last_ollama_code_block(self):
+    def copy_ollama_code_block(self, index=-1):
         if not self.last_ollama_code_blocks:
             self.window.show_status("Kein Codeblock zum Kopieren gefunden")
             return
-        block = self.last_ollama_code_blocks[-1]
+        try:
+            block_index = int(index)
+        except (TypeError, ValueError):
+            block_index = -1
+        if block_index < 0 or block_index >= len(self.last_ollama_code_blocks):
+            block_index = len(self.last_ollama_code_blocks) - 1
+        block = self.last_ollama_code_blocks[block_index]
         QApplication.clipboard().setText(str(block.get("code", "") or ""))
         language = str(block.get("language", "Code") or "Code")
-        self.window.show_status(f"Letzten {language}-Codeblock kopiert")
+        self.window.show_status(f"{language}-Codeblock kopiert")
+
+    def copy_last_ollama_code_block(self):
+        self.copy_ollama_code_block(-1)
 
     def handle_ollama_error(self, message):
         self.output_area.append(f"\n[Ollama-Fehler] {message}\n")
@@ -1492,6 +1517,30 @@ class TerminalWindow(QMainWindow):
             action.triggered.connect(lambda checked=False, p=normalized: self.open_profile_in_new_tab(p))
             self.profiles_menu.addAction(action)
 
+    def choose_profile_save_name(self, default_name):
+        profiles = normalize_profiles(self.tab_profiles)
+        names = [str(profile.get("name", "") or "").strip() for profile in profiles if str(profile.get("name", "") or "").strip()]
+        if names:
+            selected, ok = QInputDialog.getItem(
+                self,
+                "Tab-Profil speichern",
+                "Bestehendes Profil ersetzen oder neuen Namen eingeben:",
+                names,
+                0,
+                True,
+            )
+            if ok and str(selected or "").strip():
+                return str(selected).strip()
+            return ""
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Tab-Profil speichern",
+            "Profilname:",
+            text=str(default_name or "Profil"),
+        )
+        return str(name or "").strip() if ok else ""
+
     def save_current_tab_as_profile(self):
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab):
@@ -1499,13 +1548,8 @@ class TerminalWindow(QMainWindow):
             return
 
         default_name = tab.custom_title or tab.title or self.shell_backend_label(tab.shell_type)
-        name, ok = QInputDialog.getText(
-            self,
-            "Tab-Profil speichern",
-            "Profilname:",
-            text=default_name,
-        )
-        if not ok or not name.strip():
+        name = self.choose_profile_save_name(default_name)
+        if not name:
             return
 
         startup_command, ok = QInputDialog.getText(
@@ -1619,14 +1663,33 @@ class TerminalWindow(QMainWindow):
             action.triggered.connect(lambda checked=False, w=workspace: self.load_workspace(w))
             self.workspaces_menu.addAction(action)
 
-    def save_current_workspace(self):
+    def choose_workspace_save_name(self, default_name):
+        workspaces = normalize_workspaces(self.workspaces)
+        names = [str(workspace.get("name", "") or "").strip() for workspace in workspaces if str(workspace.get("name", "") or "").strip()]
+        if names:
+            selected, ok = QInputDialog.getItem(
+                self,
+                "Workspace speichern",
+                "Bestehenden Workspace ersetzen oder neuen Namen eingeben:",
+                names,
+                0,
+                True,
+            )
+            if ok and str(selected or "").strip():
+                return str(selected).strip()
+            return ""
+
         name, ok = QInputDialog.getText(
             self,
             "Workspace speichern",
             "Workspace-Name:",
-            text="ShellDeck Workspace",
+            text=str(default_name or "ShellDeck Workspace"),
         )
-        if not ok or not name.strip():
+        return str(name or "").strip() if ok else ""
+
+    def save_current_workspace(self):
+        name = self.choose_workspace_save_name("ShellDeck Workspace")
+        if not name:
             return
 
         workspace = workspace_from_tabs(
@@ -3353,7 +3416,7 @@ Hinweise
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends, "
             "gespeicherten Ordnerpfaden, Tab-Profilen, Workspaces, Befehlspalette "
-            "und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts.</p>"
+            "und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts und Codeblock-Kopierfunktion.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
             "<p>Modulare Helferdateien: shelldeck_profiles.py, "
