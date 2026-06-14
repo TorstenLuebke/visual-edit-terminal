@@ -23,6 +23,8 @@ from PySide6.QtGui import (
 
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
+APP_NAME = "PathForge Terminal"
+APP_VERSION = "0.6.0"
 
 
 def install_crash_logging():
@@ -427,7 +429,7 @@ class TerminalTab(QWidget):
 class TerminalWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Terminal Emulator")
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.history = []
         self.default_command = ""
         self.color_scheme_name = "Dunkel"
@@ -503,6 +505,17 @@ class TerminalWindow(QMainWindow):
         shell_action = QAction("Shell-Backend", self)
         shell_action.triggered.connect(self.select_shell)
         settings_menu.addAction(shell_action)
+
+        help_menu = menubar.addMenu("&Hilfe")
+
+        help_action = QAction("Funktionen und Tastenkürzel", self)
+        help_action.setShortcut("F1")
+        help_action.triggered.connect(self.show_help_dialog)
+        help_menu.addAction(help_action)
+
+        about_action = QAction("Über", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
 
         central_widget = QWidget()
         self.central_widget = central_widget
@@ -1495,6 +1508,105 @@ class TerminalWindow(QMainWindow):
             self.history = self.history[-self.max_history_size:]
             self.save_history()
             self.save_settings()
+
+    def help_text(self):
+        return f"""{APP_NAME} {APP_VERSION}
+
+Übersicht
+- Mehrere Terminal-Tabs mit eigenem Shell-Prozess je Tab.
+- Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
+- Tab-Namen, Shell-Typen und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
+- Gemeinsame Befehlshistorie für alle Tabs.
+- Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz und Hintergrund-Deckkraft.
+- Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
+
+Datei-Menü
+- Neuer Tab: öffnet einen neuen Terminal-Tab.
+- Aktuellen Tab schließen: beendet den Prozess des aktuellen Tabs und schließt den Tab.
+- Tab duplizieren: öffnet einen neuen Tab mit gleichem Shell-Backend und ähnlichem Namen.
+- Tab umbenennen: vergibt einen eigenen Tab-Namen.
+- Beenden: speichert Einstellungen und beendet alle laufenden Shell-Prozesse sauber.
+
+Pfade-Menü
+- Aktuellen Ordner speichern: speichert den zuletzt erkannten Arbeitsordner des aktuellen Tabs.
+- Ordnerpfad manuell speichern: wählt oder tippt einen Ordnerpfad und speichert ihn unter einem Namen.
+- Gespeicherten Pfad löschen: entfernt einen gespeicherten Schnellzugriff.
+- Gespeicherte Pfade: führen im aktuellen Tab automatisch cd "..." aus.
+- Windows-Pfade werden für WSL und Git Bash möglichst passend umgewandelt.
+
+Einstellungen-Menü
+- Schriftart: setzt die Terminal-Schrift für alle Tabs.
+- Farbschema: wechselt zwischen Dunkel, Hell und Hoher Kontrast.
+- Design anpassen: bearbeitet Akzent, Hintergrund, Textfarbe, Eingabefeld, Kontrast, Hintergrund-Deckkraft und Fenster-Transparenz.
+- Design auf Standard zurücksetzen: stellt die Standardfarben wieder her.
+- Standardbefehl: Befehl, der beim Start eines neuen Tabs automatisch ausgeführt wird.
+- History-Größe: maximale Anzahl gespeicherter Befehle.
+- Shell-Backend: wechselt das Shell-Backend des aktuellen Tabs.
+
+Kontextmenüs
+- Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, aktuellen Tab schließen.
+- Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Ausgabe leeren, Neuer Tab, aktuellen Tab schließen.
+- Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, aktuellen Tab schließen.
+
+Tastenkürzel
+- F1: Hilfe öffnen.
+- Ctrl+T: Neuer Tab.
+- Ctrl+W: Aktuellen Tab schließen.
+- Ctrl+D: Aktuellen Tab duplizieren.
+- F2: Aktuellen Tab umbenennen.
+- Ctrl+Q: App beenden.
+- Ctrl+C: laufenden Befehl im aktuellen Tab unterbrechen.
+- Enter: Befehl ausführen.
+- Ctrl+Enter: neue Zeile im Eingabefeld einfügen.
+- Pfeil hoch: vorherigen Befehl aus der History laden, Cursor ans Ende setzen.
+- Pfeil runter: nächsten Befehl aus der History laden, Cursor ans Ende setzen.
+
+Hinweise
+- Die App ist eine eigene Terminal-Oberfläche. Die Ausführung der Befehle erfolgt über das gewählte Shell-Backend.
+- Unter Linux funktioniert die App grundsätzlich mit PySide6 und verfügbaren Shells wie bash, zsh, fish oder sh.
+- Welche Backends angeboten werden, hängt davon ab, was auf dem System installiert ist.
+"""
+
+    def show_help_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Hilfe — {APP_NAME}")
+        dialog.resize(760, 620)
+        layout = QVBoxLayout(dialog)
+
+        text = QTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setPlainText(self.help_text())
+        layout.addWidget(text)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def show_about_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Über {APP_NAME}")
+        dialog.resize(520, 300)
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel(
+            f"<h2>{APP_NAME}</h2>"
+            f"<p><b>Version:</b> {APP_VERSION}</p>"
+            "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends "
+            "und gespeicherten Ordnerpfaden.</p>"
+            "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
+            "jeweils ausgewählte Shell-Backend ausgeführt.</p>",
+            dialog,
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def closeEvent(self, event):
         self.save_settings()
