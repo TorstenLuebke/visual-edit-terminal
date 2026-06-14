@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "PathForge Terminal"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 
 def install_crash_logging():
@@ -158,6 +158,8 @@ class TerminalTab(QWidget):
         self.ollama_worker = None
         self.client_process = None
         self.direct_client_exit_command = "exit"
+        self.direct_client_label = "Client"
+        self.direct_client_start_error_reported = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -535,6 +537,8 @@ class TerminalTab(QWidget):
         if self.client_process is not None:
             self.stop_client_process()
 
+        self.direct_client_label = label
+        self.direct_client_start_error_reported = False
         self.client_process = QProcess(self)
         self.client_process.readyReadStandardOutput.connect(self.handle_client_stdout)
         self.client_process.readyReadStandardError.connect(self.handle_client_stderr)
@@ -547,7 +551,8 @@ class TerminalTab(QWidget):
         self.client_process.start(program, args)
         if not self.client_process.waitForStarted(2500):
             error_text = self.client_process.errorString() if self.client_process is not None else "Unbekannter Fehler"
-            self.output_area.append(f"\n[{label} konnte nicht gestartet werden: {error_text}]\n")
+            self.direct_client_start_error_reported = True
+            self.output_area.append(self.direct_client_start_error_message(label, program, error_text))
             self.client_process.deleteLater()
             self.client_process = None
             return False
@@ -560,6 +565,26 @@ class TerminalTab(QWidget):
         )
         self.set_client_mode(True, label, kind="direct_process")
         return True
+
+    def direct_client_start_error_message(self, label, program, error_text):
+        label = str(label or "Client").strip() or "Client"
+        program = str(program or "").strip()
+        error_text = str(error_text or "Unbekannter Fehler").strip()
+        lower_label = label.lower()
+        lower_program = Path(program).name.lower()
+
+        hint = ""
+        if lower_label == "sqlite" or lower_program in {"sqlite3", "sqlite3.exe"}:
+            hint = (
+                "\nHinweis: sqlite3.exe wurde nicht gefunden. Installiere das SQLite-CLI-Tool "
+                "oder teste SQLite über Python mit dem Modul sqlite3."
+            )
+        elif lower_label == "python" or lower_program in {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}:
+            hint = "\nHinweis: Prüfe mit 'python --version' oder 'py --version', ob Python im PATH gefunden wird."
+        elif lower_label == "node.js" or lower_program in {"node", "node.exe"}:
+            hint = "\nHinweis: Prüfe mit 'node --version', ob Node.js im PATH gefunden wird."
+
+        return f"\n[Client-Fehler] {label} konnte nicht gestartet werden: {error_text}{hint}\n"
 
     def stop_client_process(self):
         if self.client_process is None:
@@ -627,9 +652,11 @@ class TerminalTab(QWidget):
             self.set_client_mode(False)
 
     def handle_client_error(self, error):
-        label = self.client_mode_name or "Client"
+        if self.direct_client_start_error_reported:
+            return
+        label = self.client_mode_name or self.direct_client_label or "Client"
         message = self.client_process.errorString() if self.client_process is not None else "Unbekannter Fehler"
-        self.output_area.append(f"\n[{label}-Client-Fehler] {message}\n")
+        self.output_area.append(self.direct_client_start_error_message(label, "", message))
         if self.client_mode_kind == "direct_process":
             self.set_client_mode(False)
 
@@ -1430,14 +1457,26 @@ class TerminalWindow(QMainWindow):
             result = subprocess.run(
                 [executable, *args],
                 capture_output=True,
-                text=True,
                 timeout=2,
-                encoding="utf-8",
-                errors="replace",
             )
         except Exception:
             return ""
-        return (result.stdout or result.stderr or "").strip().splitlines()[0] if (result.stdout or result.stderr) else ""
+
+        raw = result.stdout or result.stderr or b""
+        if isinstance(raw, bytes):
+            for encoding in ("utf-16", "utf-8", "cp850", "cp1252", "latin-1"):
+                try:
+                    text = raw.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                text = raw.decode("utf-8", errors="replace")
+        else:
+            text = str(raw)
+
+        text = text.replace("\x00", "").strip()
+        return text.splitlines()[0].strip() if text else ""
 
     def available_shell_backends(self):
         options = []
@@ -1462,7 +1501,9 @@ class TerminalWindow(QMainWindow):
             if git_bash:
                 add("git_bash", "Git Bash", git_bash, ["--version"])
             if shutil.which("wsl.exe"):
-                add("wsl", "WSL", "wsl.exe", ["--version"])
+                # WSL --version can return UTF-16/NUL-filled output on some systems.
+                # The backend chooser only needs a clean, stable label here.
+                add("wsl", "WSL", "wsl.exe", None)
         else:
             for shell_id, label in (("bash", "Bash"), ("zsh", "Z Shell"), ("fish", "Fish"), ("sh", "sh")):
                 executable = shutil.which(shell_id)
