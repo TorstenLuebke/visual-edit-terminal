@@ -6,10 +6,12 @@ import traceback
 import faulthandler
 import shutil
 from pathlib import Path
-from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget, 
-    QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
+    QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
+    QDialog, QFormLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
+    QDialogButtonBox, QCheckBox)
 from PySide6.QtCore import Qt, QProcess, QEvent
-from PySide6.QtGui import QTextCursor, QFont, QTextCharFormat, QColor, QSyntaxHighlighter, QAction, QShortcut
+from PySide6.QtGui import QTextCursor, QFont, QTextCharFormat, QColor, QSyntaxHighlighter, QAction, QShortcut, QPalette
 
 
 LOG_FILE = Path.home() / "TerminalApp.log"
@@ -76,6 +78,9 @@ class TerminalWindow(QMainWindow):
         self.current_command = ""
         self.default_command = ""
         self.color_scheme_name = "Dunkel"
+        self.theme_mode = "dark"
+        self.window_opacity = 100
+        self.theme_config = self.default_theme_config()
         self.shell_type = "cmd"
         self.max_history_size = 1000
         self.history_file = Path.home() / ".visual_edit_terminal_history"
@@ -105,6 +110,15 @@ class TerminalWindow(QMainWindow):
         color_action = QAction("Farbschema", self)
         color_action.triggered.connect(self.show_color_dialog)
         settings_menu.addAction(color_action)
+
+        # Add detailed theme settings action
+        theme_action = QAction("Design anpassen", self)
+        theme_action.triggered.connect(self.show_theme_dialog)
+        settings_menu.addAction(theme_action)
+
+        reset_theme_action = QAction("Design auf Standard zurücksetzen", self)
+        reset_theme_action.triggered.connect(self.reset_theme_defaults)
+        settings_menu.addAction(reset_theme_action)
         
         # Add default command action
         cmd_action = QAction("Standardbefehl", self)
@@ -122,6 +136,7 @@ class TerminalWindow(QMainWindow):
         settings_menu.addAction(shell_action)
         
         central_widget = QWidget()
+        self.central_widget = central_widget
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         
@@ -139,6 +154,10 @@ class TerminalWindow(QMainWindow):
         self.input_line.setMaximumHeight(110)
         self.input_line.installEventFilter(self)
         layout.addWidget(self.input_line)
+        # Create execution button
+        self.execute_button = QPushButton("Befehl ausführen")
+        self.execute_button.clicked.connect(self.execute_command)
+        layout.addWidget(self.execute_button)
 
         # Apply persisted settings only after the widgets they touch exist.
         self.load_settings()
@@ -154,7 +173,7 @@ class TerminalWindow(QMainWindow):
         self.start_shell()
         # Connect Ctrl+C shortcut to stop_process
         self.shortcut_stop = QShortcut("Ctrl+C", self)
-        self.shortcut_stop.activated.connect(self.stop_process)
+        self.shortcut_stop.activated.connect(self.interrupt_current_command)
 
         if self.default_command and self.process.waitForStarted(2000):
             self.process.write(self.default_command.encode() + b"\n")
@@ -165,6 +184,12 @@ class TerminalWindow(QMainWindow):
             if not self.process.waitForFinished(3000):
                 self.process.kill()
                 self.process.waitForFinished(1000)
+    def interrupt_current_command(self):
+        if self.process and self.process.state() == QProcess.Running:
+            self.process.write(b"\x03")
+            self.process.waitForBytesWritten(1000)
+        else:
+            self.output_area.append("Kein laufender Prozess zum Unterbrechen.")
     def select_shell(self):
         shells = ["cmd", "powershell"]
         if shutil.which("pwsh.exe") is not None:
@@ -191,6 +216,7 @@ class TerminalWindow(QMainWindow):
                     shell_path = fallback
                     break
         self.process.start(shell_path)
+        self.display_shell_status(shell_path)
 
     def restart_shell(self):
         if hasattr(self, "process") and self.process.state() == QProcess.Running:
@@ -216,6 +242,17 @@ class TerminalWindow(QMainWindow):
             if shutil.which(fallback) is not None:
                 return fallback
         return "cmd.exe"
+    def display_shell_status(self, shell_path=None):
+        shell_label = str(shell_path or self.system_shell() or "unknown")
+        shell_name = shell_label.replace("\\", "/").rsplit("/", 1)[-1]
+        if shell_name.lower().endswith(".exe"):
+            shell_name = shell_name[:-4]
+        message = f"Shell: {shell_name}"
+        try:
+            self.statusBar().showMessage(message)
+        except Exception:
+            if hasattr(self, "output_area"):
+                self.output_area.append(message)
     def load_history(self):
         if self.history_file.exists():
             try:
@@ -237,6 +274,98 @@ class TerminalWindow(QMainWindow):
         except Exception:
             pass
 
+    def default_theme_config(self):
+        return {
+            "light": {
+                "accent": "#339CFF",
+                "background": "#FFFFFF",
+                "foreground": "#1A1C1F",
+                "input_background": "#F3F3F3",
+                "background_opacity": 100,
+                "contrast": 45,
+                "transparent_sidebar": True,
+                "ui_font": "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
+                "code_font": "ui-monospace, SFMono-Regular, Consolas, monospace",
+            },
+            "dark": {
+                "accent": "#339CFF",
+                "background": "#181818",
+                "foreground": "#FFFFFF",
+                "input_background": "#202020",
+                "background_opacity": 100,
+                "contrast": 60,
+                "transparent_sidebar": True,
+                "ui_font": "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
+                "code_font": "ui-monospace, SFMono-Regular, Consolas, monospace",
+            },
+        }
+
+    def merge_theme_config(self, loaded_config):
+        merged = self.default_theme_config()
+        if not isinstance(loaded_config, dict):
+            return merged
+
+        for mode in ("light", "dark"):
+            values = loaded_config.get(mode)
+            if isinstance(values, dict):
+                merged[mode].update(values)
+                merged[mode]["accent"] = self.normalize_hex_color(
+                    merged[mode].get("accent"), merged[mode]["accent"]
+                )
+                merged[mode]["background"] = self.normalize_hex_color(
+                    merged[mode].get("background"), merged[mode]["background"]
+                )
+                merged[mode]["foreground"] = self.normalize_hex_color(
+                    merged[mode].get("foreground"), merged[mode]["foreground"]
+                )
+                merged[mode]["input_background"] = self.normalize_hex_color(
+                    merged[mode].get("input_background"), merged[mode]["input_background"]
+                )
+                try:
+                    merged[mode]["background_opacity"] = max(0, min(100, int(merged[mode].get("background_opacity", 100))))
+                except (TypeError, ValueError):
+                    merged[mode]["background_opacity"] = self.default_theme_config()[mode].get("background_opacity", 100)
+                try:
+                    merged[mode]["contrast"] = max(0, min(100, int(merged[mode].get("contrast", 50))))
+                except (TypeError, ValueError):
+                    merged[mode]["contrast"] = self.default_theme_config()[mode]["contrast"]
+                merged[mode]["transparent_sidebar"] = bool(merged[mode].get("transparent_sidebar", True))
+        return merged
+
+    def normalize_hex_color(self, value, fallback):
+        text = str(value or "").strip()
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", text):
+            return text.upper()
+        if re.fullmatch(r"[0-9a-fA-F]{6}", text):
+            return f"#{text.upper()}"
+        return fallback
+
+    def theme_key_from_scheme(self, scheme_name=None):
+        name = str(scheme_name or self.color_scheme_name or "Dunkel").strip().lower()
+        if name == "hell":
+            return "light"
+        return "dark"
+
+    def current_theme_key(self):
+        if self.theme_mode == "system":
+            try:
+                palette_color = QApplication.palette().color(QPalette.ColorRole.Window)
+                brightness = (
+                    palette_color.red() * 0.299
+                    + palette_color.green() * 0.587
+                    + palette_color.blue() * 0.114
+                )
+                return "dark" if brightness < 128 else "light"
+            except Exception:
+                return self.theme_key_from_scheme()
+        if self.theme_mode in ("light", "dark"):
+            return self.theme_mode
+        return self.theme_key_from_scheme()
+
+    def active_theme(self):
+        key = self.current_theme_key()
+        return self.theme_config.get(key, self.default_theme_config()[key])
+
     def load_settings(self):
         if not self.settings_file.exists():
             return
@@ -255,6 +384,20 @@ class TerminalWindow(QMainWindow):
 
         self.default_command = str(settings.get("default_command", self.default_command or "") or "")
         self.color_scheme_name = str(settings.get("color_scheme_name", self.color_scheme_name or "Dunkel") or "Dunkel")
+        self.theme_config = self.merge_theme_config(settings.get("theme_config", self.theme_config))
+
+        loaded_theme_mode = str(settings.get("theme_mode", "") or "").lower().strip()
+        if loaded_theme_mode in ("light", "dark", "system"):
+            self.theme_mode = loaded_theme_mode
+        else:
+            self.theme_mode = self.theme_key_from_scheme(self.color_scheme_name)
+
+        try:
+            self.window_opacity = max(20, min(100, int(settings.get("window_opacity", self.window_opacity))))
+        except (TypeError, ValueError):
+            self.window_opacity = 100
+
+        self.migrate_unreadable_theme_settings()
 
         try:
             self.max_history_size = max(1, int(settings.get("max_history_size", self.max_history_size)))
@@ -273,6 +416,9 @@ class TerminalWindow(QMainWindow):
         settings = {
             "font": self.output_area.font().toString(),
             "color_scheme_name": self.color_scheme_name,
+            "theme_mode": self.theme_mode,
+            "theme_config": self.theme_config,
+            "window_opacity": self.window_opacity,
             "default_command": self.default_command,
             "max_history_size": self.max_history_size,
             "shell_type": self.shell_type,
@@ -286,35 +432,137 @@ class TerminalWindow(QMainWindow):
         except OSError:
             pass
 
+    def migrate_unreadable_theme_settings(self):
+        defaults = self.default_theme_config()
+        for mode in ("light", "dark"):
+            theme = self.theme_config.setdefault(mode, defaults[mode].copy())
+            accent = self.normalize_hex_color(theme.get("accent"), defaults[mode]["accent"])
+            background = self.normalize_hex_color(theme.get("background"), defaults[mode]["background"])
+            input_background = self.normalize_hex_color(
+                theme.get("input_background"), defaults[mode]["input_background"]
+            )
+            foreground = self.normalize_hex_color(theme.get("foreground"), defaults[mode]["foreground"])
+            try:
+                contrast = max(0, min(100, int(theme.get("contrast", defaults[mode]["contrast"]))))
+            except (TypeError, ValueError):
+                contrast = defaults[mode]["contrast"]
+
+            old_high_contrast = (
+                mode == "dark"
+                and accent == "#FFFF00"
+                and background == "#000000"
+                and input_background == "#000000"
+                and contrast >= 90
+            )
+            if accent == "#FFFF00":
+                theme["accent"] = defaults[mode]["accent"]
+            if old_high_contrast:
+                theme.update(defaults["dark"])
+            elif foreground == "#FFFF00":
+                theme["foreground"] = defaults[mode]["foreground"]
+
+    def reset_theme_defaults(self):
+        self.theme_config = self.default_theme_config()
+        self.theme_mode = "dark"
+        self.color_scheme_name = "Dunkel"
+        self.window_opacity = 100
+        self.apply_color_scheme()
+        self.save_settings()
+
+    def readable_border_color(self, background):
+        color = QColor(background)
+        if not color.isValid():
+            return "#3A3A3A"
+        brightness = color.red() * 0.299 + color.green() * 0.587 + color.blue() * 0.114
+        return "#D0D0D0" if brightness >= 128 else "#3A3A3A"
+
+    def rgba_color(self, hex_color, opacity_percent):
+        color = QColor(hex_color)
+        if not color.isValid():
+            color = QColor("#181818")
+        try:
+            opacity = max(0, min(100, int(opacity_percent)))
+        except (TypeError, ValueError):
+            opacity = 100
+        return f"rgba({color.red()}, {color.green()}, {color.blue()}, {opacity / 100.0:.2f})"
+
     def apply_color_scheme(self):
-        schemes = {
-            "Dunkel": {
-                "output_bg": "#1e1e1e",
-                "output_fg": "#d4d4d4",
-                "input_bg": "#252526",
-                "input_fg": "#ffffff",
-            },
-            "Hell": {
-                "output_bg": "#ffffff",
-                "output_fg": "#202020",
-                "input_bg": "#f3f3f3",
-                "input_fg": "#202020",
-            },
-            "Hoher Kontrast": {
-                "output_bg": "#000000",
-                "output_fg": "#ffffff",
-                "input_bg": "#000000",
-                "input_fg": "#ffff00",
-            },
-        }
-        scheme = schemes.get(self.color_scheme_name, schemes["Dunkel"])
+        theme = self.active_theme()
+        background = self.normalize_hex_color(theme.get("background"), "#181818")
+        foreground = self.normalize_hex_color(theme.get("foreground"), "#FFFFFF")
+        input_background = self.normalize_hex_color(theme.get("input_background"), background)
+        accent = self.normalize_hex_color(theme.get("accent"), "#339CFF")
+        try:
+            background_opacity = max(0, min(100, int(theme.get("background_opacity", 100))))
+        except (TypeError, ValueError):
+            background_opacity = 100
+        try:
+            contrast = max(0, min(100, int(theme.get("contrast", 60))))
+        except (TypeError, ValueError):
+            contrast = 60
+
+        background_rgba = self.rgba_color(background, background_opacity)
+        input_background_rgba = self.rgba_color(input_background, background_opacity)
+
+        border_width = 1 if contrast < 85 else 2
+        radius = 8 if bool(theme.get("transparent_sidebar", True)) else 2
+        border_color = self.readable_border_color(background)
+        input_border_color = self.readable_border_color(input_background)
+
         self.output_area.setStyleSheet(
-            f"QTextEdit {{ background-color: {scheme['output_bg']}; color: {scheme['output_fg']}; }}"
+            "QTextEdit {"
+            f" background-color: {background_rgba};"
+            f" color: {foreground};"
+            f" border: {border_width}px solid {border_color};"
+            f" border-radius: {radius}px;"
+            " padding: 8px;"
+            " selection-background-color: #2D5F93;"
+            "}"
+            "QTextEdit:focus {"
+            f" border: {border_width}px solid {accent};"
+            "}"
         )
-        self.output_area.setTextColor(QColor(scheme["output_fg"]))
+        self.output_area.setTextColor(QColor(foreground))
         self.input_line.setStyleSheet(
-            f"QPlainTextEdit {{ background-color: {scheme['input_bg']}; color: {scheme['input_fg']}; }}"
+            "QPlainTextEdit {"
+            f" background-color: {input_background_rgba};"
+            f" color: {foreground};"
+            f" border: {border_width}px solid {input_border_color};"
+            f" border-radius: {radius}px;"
+            " padding: 6px;"
+            " selection-background-color: #2D5F93;"
+            "}"
+            "QPlainTextEdit:focus {"
+            f" border: {border_width}px solid {accent};"
+            "}"
         )
+        self.execute_button.setStyleSheet(
+            "QPushButton {"
+            f" background-color: {accent};"
+            " color: white;"
+            " border: none;"
+            " border-radius: 6px;"
+            " padding: 7px 12px;"
+            "}"
+            "QPushButton:hover {"
+            " background-color: #4AA8FF;"
+            "}"
+            "QPushButton:pressed {"
+            " background-color: #1E7FCC;"
+            "}"
+        )
+        try:
+            translucent = background_opacity < 100
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
+            if hasattr(self, "central_widget"):
+                self.central_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
+                self.central_widget.setStyleSheet("background: transparent;" if translucent else "")
+        except Exception:
+            pass
+        try:
+            self.setWindowOpacity(max(0.2, min(1.0, self.window_opacity / 100.0)))
+        except Exception:
+            pass
     def eventFilter(self, source, event):
         if source is self.input_line and event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ControlModifier):
@@ -380,8 +628,219 @@ class TerminalWindow(QMainWindow):
         )
         if ok and scheme:
             self.color_scheme_name = scheme
+            if scheme == "Hell":
+                self.theme_mode = "light"
+            elif scheme == "Hoher Kontrast":
+                self.theme_mode = "dark"
+                self.theme_config["dark"].update({
+                    "background": "#101010",
+                    "foreground": "#FFFFFF",
+                    "input_background": "#181818",
+                    "accent": "#339CFF",
+                    "contrast": 85,
+                })
+            else:
+                self.theme_mode = "dark"
             self.apply_color_scheme()
             self.save_settings()
+
+    def show_theme_dialog(self):
+        original_theme_mode = self.theme_mode
+        original_theme_config = json.loads(json.dumps(self.theme_config))
+        original_window_opacity = self.window_opacity
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Design anpassen")
+        layout = QFormLayout(dialog)
+
+        mode_combo = QComboBox(dialog)
+        mode_combo.addItem("Hell", "light")
+        mode_combo.addItem("Dunkel", "dark")
+        mode_combo.addItem("System", "system")
+        mode_index = mode_combo.findData(self.theme_mode)
+        mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 1)
+        layout.addRow("Motiv:", mode_combo)
+
+        preview_label = QLabel(dialog)
+        preview_label.setText("Vorschau: Terminal-Design")
+        preview_label.setMinimumHeight(34)
+        layout.addRow("Vorschau:", preview_label)
+
+        def selected_theme_key():
+            value = mode_combo.currentData()
+            if value == "light":
+                return "light"
+            if value == "system":
+                return self.current_theme_key()
+            return "dark"
+
+        def update_button_style(button, color):
+            button.setText(color)
+            button.setStyleSheet(
+                "QPushButton {"
+                f" background-color: {color};"
+                f" color: {'#000000' if QColor(color).lightness() > 150 else '#FFFFFF'};"
+                " border: 1px solid #666666;"
+                " border-radius: 5px;"
+                " padding: 5px 10px;"
+                "}"
+            )
+
+        def make_color_row(label, key):
+            button = QPushButton(dialog)
+
+            def choose_color():
+                theme_key = selected_theme_key()
+                current = QColor(self.theme_config[theme_key].get(key, "#000000"))
+                color = QColorDialog.getColor(current, self, label)
+                if color.isValid():
+                    self.theme_config[theme_key][key] = color.name().upper()
+                    refresh_controls_from_theme()
+                    self.apply_color_scheme()
+
+            button.clicked.connect(choose_color)
+            layout.addRow(f"{label}:", button)
+            return button
+
+        accent_button = make_color_row("Akzent", "accent")
+        background_button = make_color_row("Hintergrund", "background")
+        foreground_button = make_color_row("Vordergrund", "foreground")
+        input_button = make_color_row("Eingabefeld", "input_background")
+
+        contrast_row = QWidget(dialog)
+        contrast_layout = QHBoxLayout(contrast_row)
+        contrast_layout.setContentsMargins(0, 0, 0, 0)
+        contrast_slider = QSlider(Qt.Horizontal, dialog)
+        contrast_slider.setRange(0, 100)
+        contrast_slider.setSingleStep(5)
+        contrast_slider.setPageStep(5)
+        contrast_value = QLabel(dialog)
+        contrast_layout.addWidget(contrast_slider)
+        contrast_layout.addWidget(contrast_value)
+        layout.addRow("Kontrast:", contrast_row)
+
+        background_opacity_row = QWidget(dialog)
+        background_opacity_layout = QHBoxLayout(background_opacity_row)
+        background_opacity_layout.setContentsMargins(0, 0, 0, 0)
+        background_opacity_slider = QSlider(Qt.Horizontal, dialog)
+        background_opacity_slider.setRange(0, 100)
+        background_opacity_slider.setSingleStep(5)
+        background_opacity_slider.setPageStep(5)
+        background_opacity_slider.setTickInterval(5)
+        background_opacity_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        background_opacity_value = QLabel(dialog)
+        background_opacity_layout.addWidget(background_opacity_slider)
+        background_opacity_layout.addWidget(background_opacity_value)
+        layout.addRow("Hintergrund-Deckkraft:", background_opacity_row)
+
+        opacity_row = QWidget(dialog)
+        opacity_layout = QHBoxLayout(opacity_row)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_slider = QSlider(Qt.Horizontal, dialog)
+        opacity_slider.setRange(20, 100)
+        opacity_slider.setSingleStep(5)
+        opacity_slider.setPageStep(5)
+        opacity_slider.setTickInterval(5)
+        opacity_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        opacity_value = QLabel(dialog)
+        opacity_layout.addWidget(opacity_slider)
+        opacity_layout.addWidget(opacity_value)
+        layout.addRow("Fenster-Transparenz:", opacity_row)
+
+        transparent_check = QCheckBox("abgerundete/leichte Oberfläche verwenden", dialog)
+        layout.addRow("Transparente Oberfläche:", transparent_check)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            dialog,
+        )
+        layout.addRow(buttons)
+
+        def refresh_controls_from_theme():
+            theme = self.theme_config[selected_theme_key()]
+            update_button_style(accent_button, self.normalize_hex_color(theme.get("accent"), "#339CFF"))
+            update_button_style(background_button, self.normalize_hex_color(theme.get("background"), "#181818"))
+            update_button_style(foreground_button, self.normalize_hex_color(theme.get("foreground"), "#FFFFFF"))
+            update_button_style(input_button, self.normalize_hex_color(theme.get("input_background"), "#202020"))
+            contrast_slider.blockSignals(True)
+            background_opacity_slider.blockSignals(True)
+            transparent_check.blockSignals(True)
+            contrast_slider.setValue(max(0, min(100, int(theme.get("contrast", 60)))))
+            background_opacity_slider.setValue(max(0, min(100, int(theme.get("background_opacity", 100)))))
+            contrast_value.setText(str(contrast_slider.value()))
+            background_opacity_value.setText(f"{background_opacity_slider.value()} %")
+            transparent_check.setChecked(bool(theme.get("transparent_sidebar", True)))
+            contrast_slider.blockSignals(False)
+            background_opacity_slider.blockSignals(False)
+            transparent_check.blockSignals(False)
+            preview_label.setStyleSheet(
+                "QLabel {"
+                f" background-color: {self.rgba_color(theme.get('background', '#181818'), theme.get('background_opacity', 100))};"
+                f" color: {theme.get('foreground', '#FFFFFF')};"
+                f" border: 1px solid {theme.get('accent', '#339CFF')};"
+                " border-radius: 6px;"
+                " padding: 6px;"
+                "}"
+            )
+
+        def mode_changed():
+            self.theme_mode = str(mode_combo.currentData() or "dark")
+            refresh_controls_from_theme()
+            self.apply_color_scheme()
+
+        def contrast_changed(value):
+            self.theme_config[selected_theme_key()]["contrast"] = int(value)
+            contrast_value.setText(str(value))
+            self.apply_color_scheme()
+
+        def background_opacity_changed(value):
+            snapped = max(0, min(100, int(round(value / 5) * 5)))
+            if snapped != value:
+                background_opacity_slider.blockSignals(True)
+                background_opacity_slider.setValue(snapped)
+                background_opacity_slider.blockSignals(False)
+            self.theme_config[selected_theme_key()]["background_opacity"] = snapped
+            background_opacity_value.setText(f"{snapped} %")
+            refresh_controls_from_theme()
+            self.apply_color_scheme()
+
+        def opacity_changed(value):
+            snapped = max(20, min(100, int(round(value / 5) * 5)))
+            if snapped != value:
+                opacity_slider.blockSignals(True)
+                opacity_slider.setValue(snapped)
+                opacity_slider.blockSignals(False)
+            self.window_opacity = snapped
+            opacity_value.setText(f"{snapped} %")
+            self.apply_color_scheme()
+
+        def transparent_changed(checked):
+            self.theme_config[selected_theme_key()]["transparent_sidebar"] = bool(checked)
+            self.apply_color_scheme()
+
+        mode_combo.currentIndexChanged.connect(mode_changed)
+        contrast_slider.valueChanged.connect(contrast_changed)
+        background_opacity_slider.valueChanged.connect(background_opacity_changed)
+        opacity_slider.valueChanged.connect(opacity_changed)
+        transparent_check.toggled.connect(transparent_changed)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        opacity_slider.setValue(self.window_opacity)
+        opacity_value.setText(f"{self.window_opacity} %")
+        refresh_controls_from_theme()
+
+        if dialog.exec() == QDialog.Accepted:
+            if self.theme_mode == "light":
+                self.color_scheme_name = "Hell"
+            elif self.theme_mode == "dark":
+                self.color_scheme_name = "Dunkel"
+            self.save_settings()
+        else:
+            self.theme_mode = original_theme_mode
+            self.theme_config = original_theme_config
+            self.window_opacity = original_window_opacity
+            self.apply_color_scheme()
 
     def show_command_dialog(self):
         text, ok = QInputDialog.getText(
@@ -405,20 +864,24 @@ class TerminalWindow(QMainWindow):
 
     def execute_command(self):
         command_text = self.input_line.toPlainText().strip()
-        commands = [line.strip() for line in command_text.splitlines() if line.strip()]
+        commands = [
+            cmd.strip()
+            for line in command_text.splitlines()
+            for cmd in line.split(';')
+            if cmd.strip()
+        ]
         if not commands:
             return
 
-        # Add each command to history if not duplicate of previous command
-        for cmd in commands:
-            # A valid command is non-empty, not only whitespace, and not identical to the previous entry
-            if cmd.strip() and (not self.history or self.history[-1] != cmd):
-                self.history.append(cmd)
+        # Add original input block to history so grouped commands can be recalled together
+        history_entry = command_text
+        if history_entry and (not self.history or self.history[-1] != history_entry):
+            self.history.append(history_entry)
         self.save_history()
         self.history_index = -1
         self.current_command = ""
-        
-        # Process each non-empty line without displaying in output
+
+        # Process each non-empty command without displaying in output
         for command in commands:
             if command.lower() in ("cls", "clear"):
                 self.output_area.clear()
@@ -450,7 +913,7 @@ class TerminalWindow(QMainWindow):
         self.output_area.moveCursor(QTextCursor.End)
         self.output_area.setTextColor(Qt.red)
         self.output_area.insertPlainText(data)
-        self.output_area.setTextColor(QColor("#d4d4d4"))
+        self.output_area.setTextColor(QColor(self.active_theme().get("foreground", "#d4d4d4")))
         self.output_area.moveCursor(QTextCursor.End)
         self.output_area.ensureCursorVisible()    
     def handle_finished(self, exit_code, exit_status):
