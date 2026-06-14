@@ -24,7 +24,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "PathForge Terminal"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 
 def install_crash_logging():
@@ -77,11 +77,13 @@ class TerminalHighlighter(QSyntaxHighlighter):
 
 
 class TerminalTab(QWidget):
-    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None):
+    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None):
         super().__init__(window)
         self.window = window
         self.shell_type = shell_type or window.shell_type
         self.custom_title = custom_title or ""
+        self.start_directory = self.normalize_start_directory(start_directory)
+        self.current_working_directory = self.start_directory or str(Path.cwd())
         self.title = title
         self.history_index = -1
         self.current_command = ""
@@ -122,6 +124,24 @@ class TerminalTab(QWidget):
 
         if self.window.default_command and self.process.waitForStarted(2000):
             self.process.write(self.window.default_command.encode() + b"\n")
+
+    def normalize_start_directory(self, directory):
+        text = str(directory or "").strip().strip('"')
+        if not text:
+            return ""
+        try:
+            path = Path(text).expanduser()
+            if path.exists() and path.is_dir():
+                return str(path)
+        except OSError:
+            pass
+        return ""
+
+    def refresh_current_working_directory(self):
+        directory = self.guess_current_directory()
+        if directory:
+            self.current_working_directory = directory
+        return self.current_working_directory
 
     def show_terminal_context_menu(self, pos):
         sender = self.sender()
@@ -179,6 +199,10 @@ class TerminalTab(QWidget):
         rename_tab_action.triggered.connect(self.window.rename_current_tab)
         menu.addAction(rename_tab_action)
 
+        update_directory_action = QAction("Tab-Ordner aktualisieren", self)
+        update_directory_action.triggered.connect(self.window.update_current_tab_directory)
+        menu.addAction(update_directory_action)
+
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.window.close_current_tab)
         menu.addAction(close_tab_action)
@@ -215,12 +239,19 @@ class TerminalTab(QWidget):
         working_dir = self.process.workingDirectory()
         if working_dir and Path(working_dir).exists():
             return working_dir
+        if self.current_working_directory and Path(self.current_working_directory).exists():
+            return self.current_working_directory
         return str(Path.cwd())
 
     def start_shell(self):
         shell_path = self.window.system_shell(self.shell_type)
         if not shell_path:
             shell_path = self.window.system_shell("powershell" if sys.platform == "win32" else "bash")
+        if self.start_directory:
+            try:
+                self.process.setWorkingDirectory(self.start_directory)
+            except Exception:
+                pass
         self.process.start(shell_path)
         self.display_shell_status(shell_path)
 
@@ -540,8 +571,13 @@ class TerminalWindow(QMainWindow):
         self.shortcut_stop = QShortcut("Ctrl+C", self)
         self.shortcut_stop.activated.connect(self.interrupt_current_command)
 
-    def new_tab(self, shell_type=None, title=None):
-        tab = TerminalTab(self, shell_type=shell_type or self.shell_type, custom_title=title)
+    def new_tab(self, shell_type=None, title=None, start_directory=None):
+        tab = TerminalTab(
+            self,
+            shell_type=shell_type or self.shell_type,
+            custom_title=title,
+            start_directory=start_directory,
+        )
         index = self.tab_widget.addTab(tab, tab.title or f"Terminal {self.tab_widget.count() + 1}")
         self.tab_widget.setCurrentIndex(index)
         self.apply_color_scheme()
@@ -680,7 +716,17 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab):
             tab = self.new_tab()
+        shell_path = self.path_for_shell(path, tab.shell_type)
+        tab.current_working_directory = str(path).strip().strip('"') or tab.current_working_directory
         tab.run_text_command(self.cd_command_for_path(path, tab.shell_type))
+
+    def update_current_tab_directory(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        directory = tab.refresh_current_working_directory()
+        self.statusBar().showMessage(f"Tab-Ordner gespeichert: {directory}")
+        self.save_settings()
 
     def current_terminal(self):
         widget = self.tab_widget.currentWidget() if hasattr(self, "tab_widget") else None
@@ -716,6 +762,10 @@ class TerminalWindow(QMainWindow):
         rename_tab_action = QAction("Tab umbenennen", self)
         rename_tab_action.triggered.connect(self.rename_current_tab)
         menu.addAction(rename_tab_action)
+
+        update_directory_action = QAction("Tab-Ordner aktualisieren", self)
+        update_directory_action.triggered.connect(self.update_current_tab_directory)
+        menu.addAction(update_directory_action)
 
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.close_current_tab)
@@ -800,7 +850,11 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if isinstance(tab, TerminalTab):
             title = f"{tab.custom_title or self.shell_backend_label(tab.shell_type)} Kopie"
-            self.new_tab(shell_type=tab.shell_type, title=title)
+            self.new_tab(
+                shell_type=tab.shell_type,
+                title=title,
+                start_directory=tab.refresh_current_working_directory(),
+            )
 
     def restore_tabs_from_settings(self):
         restored = False
@@ -811,7 +865,8 @@ class TerminalWindow(QMainWindow):
             if not self.system_shell(shell_type):
                 shell_type = self.shell_type
             title = str(item.get("title", "") or "")
-            self.new_tab(shell_type=shell_type, title=title)
+            working_directory = str(item.get("working_directory", "") or "")
+            self.new_tab(shell_type=shell_type, title=title, start_directory=working_directory)
             restored = True
         if not restored:
             self.new_tab()
@@ -826,6 +881,7 @@ class TerminalWindow(QMainWindow):
                 tabs.append({
                     "shell_type": tab.shell_type,
                     "title": tab.custom_title,
+                    "working_directory": tab.refresh_current_working_directory(),
                 })
         return tabs
 
@@ -1515,7 +1571,7 @@ class TerminalWindow(QMainWindow):
 Übersicht
 - Mehrere Terminal-Tabs mit eigenem Shell-Prozess je Tab.
 - Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
-- Tab-Namen, Shell-Typen und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
+- Tab-Namen, Shell-Typen, Arbeitsordner je Tab und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
 - Gemeinsame Befehlshistorie für alle Tabs.
 - Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz und Hintergrund-Deckkraft.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
@@ -1544,9 +1600,9 @@ Einstellungen-Menü
 - Shell-Backend: wechselt das Shell-Backend des aktuellen Tabs.
 
 Kontextmenüs
-- Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, aktuellen Tab schließen.
-- Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Ausgabe leeren, Neuer Tab, aktuellen Tab schließen.
-- Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, aktuellen Tab schließen.
+- Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
+- Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Ausgabe leeren, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
+- Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 
 Tastenkürzel
 - F1: Hilfe öffnen.
