@@ -6,12 +6,13 @@ import os
 import traceback
 import faulthandler
 import shutil
+import subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
     QDialog, QFormLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
-    QDialogButtonBox, QCheckBox, QTabWidget, QMenu
+    QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog
 )
 from PySide6.QtCore import Qt, QProcess, QEvent
 from PySide6.QtGui import (
@@ -74,9 +75,11 @@ class TerminalHighlighter(QSyntaxHighlighter):
 
 
 class TerminalTab(QWidget):
-    def __init__(self, window, title="Terminal"):
+    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None):
         super().__init__(window)
         self.window = window
+        self.shell_type = shell_type or window.shell_type
+        self.custom_title = custom_title or ""
         self.title = title
         self.history_index = -1
         self.current_command = ""
@@ -166,6 +169,14 @@ class TerminalTab(QWidget):
         new_tab_action.triggered.connect(self.window.new_tab)
         menu.addAction(new_tab_action)
 
+        duplicate_tab_action = QAction("Tab duplizieren", self)
+        duplicate_tab_action.triggered.connect(self.window.duplicate_current_tab)
+        menu.addAction(duplicate_tab_action)
+
+        rename_tab_action = QAction("Tab umbenennen", self)
+        rename_tab_action.triggered.connect(self.window.rename_current_tab)
+        menu.addAction(rename_tab_action)
+
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.window.close_current_tab)
         menu.addAction(close_tab_action)
@@ -176,13 +187,38 @@ class TerminalTab(QWidget):
         self.output_area.selectAll()
         self.output_area.copy()
 
+    def run_text_command(self, command):
+        self.input_line.setPlainText(command)
+        self.input_line.moveCursor(QTextCursor.MoveOperation.End)
+        self.execute_command()
+
+    def guess_current_directory(self):
+        text = self.output_area.toPlainText()
+        patterns = [
+            r"PS\s+([^>]+)>\s*$",
+            r"^([A-Za-z]:\\[^>]+)>\s*$",
+            r"^([A-Za-z]:/[^>]+)>\s*$",
+            r"^[^@\s]+@[^:]+:([^#$]+)[#$]\s*$",
+        ]
+        for line in reversed(text.splitlines()):
+            stripped = line.strip()
+            for pattern in patterns:
+                match = re.search(pattern, stripped)
+                if match:
+                    candidate = match.group(1).strip().replace("\\", os.sep)
+                    if candidate.startswith("~"):
+                        candidate = os.path.expanduser(candidate)
+                    if Path(candidate).exists():
+                        return str(Path(candidate))
+        working_dir = self.process.workingDirectory()
+        if working_dir and Path(working_dir).exists():
+            return working_dir
+        return str(Path.cwd())
+
     def start_shell(self):
-        shell_path = self.window.system_shell()
-        if not shutil.which(shell_path) and sys.platform == "win32":
-            for fallback in ["cmd.exe", "powershell.exe"]:
-                if shutil.which(fallback):
-                    shell_path = fallback
-                    break
+        shell_path = self.window.system_shell(self.shell_type)
+        if not shell_path:
+            shell_path = self.window.system_shell("powershell" if sys.platform == "win32" else "bash")
         self.process.start(shell_path)
         self.display_shell_status(shell_path)
 
@@ -209,13 +245,10 @@ class TerminalTab(QWidget):
             self.output_area.append("Kein laufender Prozess zum Unterbrechen.")
 
     def display_shell_status(self, shell_path=None):
-        shell_label = str(shell_path or self.window.system_shell() or "unknown")
-        shell_name = shell_label.replace("\\", "/").rsplit("/", 1)[-1]
-        if shell_name.lower().endswith(".exe"):
-            shell_name = shell_name[:-4]
-        self.title = self.window.shell_backend_label(shell_name)
+        backend_label = self.window.shell_backend_label(self.shell_type)
+        self.title = self.custom_title or backend_label
         self.window.update_tab_title(self)
-        self.window.statusBar().showMessage(f"Shell-Backend: {self.title}")
+        self.window.statusBar().showMessage(f"Shell-Backend: {backend_label}")
 
     def eventFilter(self, source, event):
         if source is self.input_line and event.type() == QEvent.Type.KeyPress:
@@ -404,6 +437,8 @@ class TerminalWindow(QMainWindow):
         self.shell_type = "cmd"
         self.max_history_size = 1000
         self.terminal_font = QFont("Courier New", 10)
+        self.saved_tabs = []
+        self.saved_paths = []
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
         self.load_history()
@@ -420,12 +455,24 @@ class TerminalWindow(QMainWindow):
         close_tab_action.setShortcut("Ctrl+W")
         close_tab_action.triggered.connect(self.close_current_tab)
         self.file_menu.addAction(close_tab_action)
+
+        duplicate_tab_action = QAction("Tab duplizieren", self)
+        duplicate_tab_action.setShortcut("Ctrl+D")
+        duplicate_tab_action.triggered.connect(self.duplicate_current_tab)
+        self.file_menu.addAction(duplicate_tab_action)
+
+        rename_tab_action = QAction("Tab umbenennen", self)
+        rename_tab_action.setShortcut("F2")
+        rename_tab_action.triggered.connect(self.rename_current_tab)
+        self.file_menu.addAction(rename_tab_action)
         self.file_menu.addSeparator()
 
         exit_action = QAction("&Beenden", self)
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
         self.file_menu.addAction(exit_action)
+
+        self.paths_menu = menubar.addMenu("&Pfade")
 
         settings_menu = menubar.addMenu("&Einstellungen")
 
@@ -473,14 +520,15 @@ class TerminalWindow(QMainWindow):
         layout.addWidget(self.tab_widget)
 
         self.load_settings()
+        self.rebuild_saved_paths_menu()
         self.apply_color_scheme()
-        self.new_tab()
+        self.restore_tabs_from_settings()
 
         self.shortcut_stop = QShortcut("Ctrl+C", self)
         self.shortcut_stop.activated.connect(self.interrupt_current_command)
 
-    def new_tab(self):
-        tab = TerminalTab(self)
+    def new_tab(self, shell_type=None, title=None):
+        tab = TerminalTab(self, shell_type=shell_type or self.shell_type, custom_title=title)
         index = self.tab_widget.addTab(tab, tab.title or f"Terminal {self.tab_widget.count() + 1}")
         self.tab_widget.setCurrentIndex(index)
         self.apply_color_scheme()
@@ -492,10 +540,134 @@ class TerminalWindow(QMainWindow):
             base = tab.title or "Terminal"
             existing_same_title = sum(
                 1 for i in range(self.tab_widget.count())
-                if i != index and self.tab_widget.widget(i).title == base
+                if i != index and isinstance(self.tab_widget.widget(i), TerminalTab) and self.tab_widget.widget(i).title == base
             )
-            title = f"{base} {index + 1}" if existing_same_title else base
-            self.tab_widget.setTabText(index, title)
+            title = f"{base} {index + 1}" if existing_same_title and not tab.custom_title else base
+            icon = self.shell_backend_icon(tab.shell_type)
+            self.tab_widget.setTabText(index, f"{icon} {title}".strip())
+            self.tab_widget.tabBar().setTabTextColor(index, QColor(self.shell_backend_color(tab.shell_type)))
+
+    def rebuild_saved_paths_menu(self):
+        self.paths_menu.clear()
+
+        save_current_action = QAction("Aktuellen Ordner speichern", self)
+        save_current_action.triggered.connect(self.save_current_path)
+        self.paths_menu.addAction(save_current_action)
+
+        add_manual_action = QAction("Ordnerpfad manuell speichern", self)
+        add_manual_action.triggered.connect(self.save_manual_path)
+        self.paths_menu.addAction(add_manual_action)
+
+        delete_action = QAction("Gespeicherten Pfad löschen", self)
+        delete_action.triggered.connect(self.delete_saved_path)
+        delete_action.setEnabled(bool(self.saved_paths))
+        self.paths_menu.addAction(delete_action)
+
+        self.paths_menu.addSeparator()
+
+        if not self.saved_paths:
+            empty_action = QAction("Keine gespeicherten Pfade", self)
+            empty_action.setEnabled(False)
+            self.paths_menu.addAction(empty_action)
+            return
+
+        for item in self.saved_paths:
+            name = str(item.get("name", "") or item.get("path", ""))
+            path = str(item.get("path", "") or "")
+            if not path:
+                continue
+            action = QAction(name, self)
+            action.setToolTip(path)
+            action.triggered.connect(lambda checked=False, p=path: self.open_saved_path(p))
+            self.paths_menu.addAction(action)
+
+    def _normalize_saved_path_item(self, name, path):
+        clean_path = str(path or "").strip().strip('"')
+        clean_name = str(name or "").strip() or Path(clean_path).name or clean_path
+        return {"name": clean_name, "path": clean_path}
+
+    def add_saved_path(self, name, path):
+        item = self._normalize_saved_path_item(name, path)
+        if not item["path"]:
+            return
+        self.saved_paths = [entry for entry in self.saved_paths if str(entry.get("path", "")) != item["path"]]
+        self.saved_paths.append(item)
+        self.rebuild_saved_paths_menu()
+        self.save_settings()
+
+    def save_current_path(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        current_path = tab.guess_current_directory()
+        name, ok = QInputDialog.getText(
+            self,
+            "Aktuellen Ordner speichern",
+            "Name für diesen Ordnerpfad:",
+            text=Path(current_path).name or current_path,
+        )
+        if ok:
+            self.add_saved_path(name, current_path)
+
+    def save_manual_path(self):
+        path = QFileDialog.getExistingDirectory(self, "Ordnerpfad speichern", str(Path.cwd()))
+        if not path:
+            text, ok = QInputDialog.getText(self, "Ordnerpfad manuell speichern", "Ordnerpfad:")
+            if not ok or not text.strip():
+                return
+            path = text.strip()
+        name, ok = QInputDialog.getText(
+            self,
+            "Ordnerpfad speichern",
+            "Name für diesen Ordnerpfad:",
+            text=Path(path).name or path,
+        )
+        if ok:
+            self.add_saved_path(name, path)
+
+    def delete_saved_path(self):
+        if not self.saved_paths:
+            return
+        labels = [f"{item.get('name', item.get('path', ''))} — {item.get('path', '')}" for item in self.saved_paths]
+        selected, ok = QInputDialog.getItem(
+            self,
+            "Gespeicherten Pfad löschen",
+            "Pfad auswählen:",
+            labels,
+            0,
+            False,
+        )
+        if ok and selected in labels:
+            index = labels.index(selected)
+            self.saved_paths.pop(index)
+            self.rebuild_saved_paths_menu()
+            self.save_settings()
+
+    def path_for_shell(self, path, shell_type):
+        text = str(path or "").strip()
+        match = re.match(r"^([A-Za-z]):[\\/](.*)$", text)
+        if sys.platform == "win32" and match:
+            drive = match.group(1).lower()
+            rest = match.group(2).replace("\\", "/")
+            lower_shell = str(shell_type or "").lower()
+            if lower_shell == "wsl":
+                return f"/mnt/{drive}/{rest}"
+            if lower_shell in ("git_bash", "bash", "zsh", "fish", "sh"):
+                return f"/{drive}/{rest}"
+        return text
+
+    def quote_path_for_shell(self, path):
+        return '"' + str(path).replace('"', '\"') + '"'
+
+    def cd_command_for_path(self, path, shell_type):
+        shell_path = self.path_for_shell(path, shell_type)
+        return f"cd {self.quote_path_for_shell(shell_path)}"
+
+    def open_saved_path(self, path):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            tab = self.new_tab()
+        tab.run_text_command(self.cd_command_for_path(path, tab.shell_type))
 
     def current_terminal(self):
         widget = self.tab_widget.currentWidget() if hasattr(self, "tab_widget") else None
@@ -523,6 +695,15 @@ class TerminalWindow(QMainWindow):
         new_tab_action = QAction("Neuer Tab", self)
         new_tab_action.triggered.connect(self.new_tab)
         menu.addAction(new_tab_action)
+
+        duplicate_tab_action = QAction("Tab duplizieren", self)
+        duplicate_tab_action.triggered.connect(self.duplicate_current_tab)
+        menu.addAction(duplicate_tab_action)
+
+        rename_tab_action = QAction("Tab umbenennen", self)
+        rename_tab_action.triggered.connect(self.rename_current_tab)
+        menu.addAction(rename_tab_action)
+
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.close_current_tab)
         menu.addAction(close_tab_action)
@@ -531,7 +712,7 @@ class TerminalWindow(QMainWindow):
     def current_tab_changed(self, index):
         tab = self.current_terminal()
         if tab is not None:
-            self.statusBar().showMessage(f"Shell-Backend: {tab.title}")
+            self.statusBar().showMessage(f"Shell-Backend: {self.shell_backend_label(tab.shell_type)}")
 
     def stop_process(self):
         tab = self.current_terminal()
@@ -548,37 +729,154 @@ class TerminalWindow(QMainWindow):
         if tab is not None:
             tab.execute_command()
 
-    def restart_shell(self):
+    def restart_shell(self, only_current=False):
+        if only_current:
+            tab = self.current_terminal()
+            if isinstance(tab, TerminalTab):
+                tab.restart_shell()
+            return
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
             if isinstance(tab, TerminalTab):
                 tab.restart_shell()
 
     def select_shell(self):
-        shells = ["cmd", "powershell"]
-        if shutil.which("pwsh.exe") is not None:
-            shells.append("pwsh")
-        if shutil.which("bash.exe") is not None:
-            shells.append("bash")
-        if shutil.which("wsl.exe") is not None:
-            shells.append("wsl")
-        if sys.platform != "win32":
-            for shell_name in ("bash", "zsh", "fish", "sh"):
-                if shutil.which(shell_name) is not None and shell_name not in shells:
-                    shells.append(shell_name)
-        current_index = shells.index(self.shell_type) if self.shell_type in shells else 0
-        selected, ok = QInputDialog.getItem(
+        options = self.available_shell_backends()
+        if not options:
+            return
+        labels = [item["label"] for item in options]
+        ids = [item["id"] for item in options]
+        current_tab = self.current_terminal()
+        current_shell = current_tab.shell_type if isinstance(current_tab, TerminalTab) else self.shell_type
+        current_index = ids.index(current_shell) if current_shell in ids else 0
+        selected_label, ok = QInputDialog.getItem(
             self,
             "Shell-Backend auswählen",
-            "Shell-Backend wählen:",
-            shells,
+            "Shell-Backend für aktuellen Tab wählen:",
+            labels,
             current_index,
             False,
         )
-        if ok and selected:
-            self.shell_type = selected
-            self.restart_shell()
+        if ok and selected_label:
+            selected_index = labels.index(selected_label)
+            selected_shell = ids[selected_index]
+            self.shell_type = selected_shell
+            if isinstance(current_tab, TerminalTab):
+                current_tab.shell_type = selected_shell
+                current_tab.custom_title = ""
+                current_tab.restart_shell()
             self.save_settings()
+
+    def rename_current_tab(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        text, ok = QInputDialog.getText(
+            self,
+            "Tab umbenennen",
+            "Neuer Tab-Name:",
+            text=tab.custom_title or tab.title,
+        )
+        if ok:
+            tab.custom_title = text.strip()
+            tab.title = tab.custom_title or self.shell_backend_label(tab.shell_type)
+            self.update_tab_title(tab)
+            self.save_settings()
+
+    def duplicate_current_tab(self):
+        tab = self.current_terminal()
+        if isinstance(tab, TerminalTab):
+            title = f"{tab.custom_title or self.shell_backend_label(tab.shell_type)} Kopie"
+            self.new_tab(shell_type=tab.shell_type, title=title)
+
+    def restore_tabs_from_settings(self):
+        restored = False
+        for item in getattr(self, "saved_tabs", []):
+            if not isinstance(item, dict):
+                continue
+            shell_type = str(item.get("shell_type", self.shell_type) or self.shell_type)
+            if not self.system_shell(shell_type):
+                shell_type = self.shell_type
+            title = str(item.get("title", "") or "")
+            self.new_tab(shell_type=shell_type, title=title)
+            restored = True
+        if not restored:
+            self.new_tab()
+
+    def collect_tab_settings(self):
+        tabs = []
+        if not hasattr(self, "tab_widget"):
+            return tabs
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if isinstance(tab, TerminalTab):
+                tabs.append({
+                    "shell_type": tab.shell_type,
+                    "title": tab.custom_title,
+                })
+        return tabs
+
+    def find_git_bash(self):
+        candidates = [
+            shutil.which("bash.exe"),
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
+
+    def _command_version_text(self, executable, args):
+        try:
+            result = subprocess.run(
+                [executable, *args],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception:
+            return ""
+        return (result.stdout or result.stderr or "").strip().splitlines()[0] if (result.stdout or result.stderr) else ""
+
+    def available_shell_backends(self):
+        options = []
+
+        def add(shell_id, label, executable=None, args=None):
+            executable = executable or self.system_shell(shell_id)
+            if not executable:
+                return
+            version = self._command_version_text(executable, args or ["--version"]) if args is not None else ""
+            full_label = f"{label} — {version}" if version else label
+            if shell_id not in [item["id"] for item in options]:
+                options.append({"id": shell_id, "label": full_label, "executable": executable})
+
+        if sys.platform == "win32":
+            if shutil.which("powershell.exe"):
+                add("powershell", "PowerShell", "powershell.exe", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"] )
+            if shutil.which("pwsh.exe"):
+                add("pwsh", "PowerShell 7", "pwsh.exe", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"] )
+            if shutil.which("cmd.exe"):
+                add("cmd", "CMD", "cmd.exe", None)
+            git_bash = self.find_git_bash()
+            if git_bash:
+                add("git_bash", "Git Bash", git_bash, ["--version"])
+            if shutil.which("wsl.exe"):
+                add("wsl", "WSL", "wsl.exe", ["--version"])
+        else:
+            for shell_id, label in (("bash", "Bash"), ("zsh", "Z Shell"), ("fish", "Fish"), ("sh", "sh")):
+                executable = shutil.which(shell_id)
+                if executable:
+                    add(shell_id, label, executable, ["--version"] if shell_id != "sh" else None)
+
+        if not options:
+            fallback = "cmd" if sys.platform == "win32" else "sh"
+            options.append({"id": fallback, "label": self.shell_backend_label(fallback), "executable": self.system_shell(fallback) or fallback})
+        return options
 
     def shell_backend_label(self, shell_name=None) -> str:
         name = str(shell_name or self.shell_type or "Terminal").strip()
@@ -589,6 +887,8 @@ class TerminalWindow(QMainWindow):
             return "PowerShell 7"
         if lower in ("cmd", "cmd.exe"):
             return "CMD"
+        if lower in ("git_bash", "git bash"):
+            return "Git Bash"
         if lower in ("bash", "bash.exe"):
             return "Bash"
         if lower in ("zsh",):
@@ -597,25 +897,56 @@ class TerminalWindow(QMainWindow):
             return "Fish"
         if lower in ("wsl", "wsl.exe"):
             return "WSL"
+        if lower in ("sh",):
+            return "sh"
         return name or "Terminal"
 
-    def system_shell(self) -> str:
+    def shell_backend_icon(self, shell_type=None) -> str:
+        lower = str(shell_type or self.shell_type or "").lower()
+        return {
+            "powershell": "⚡",
+            "pwsh": "⚡",
+            "cmd": "▣",
+            "git_bash": "🟧",
+            "wsl": "🐧",
+            "bash": "🐚",
+            "zsh": "🐚",
+            "fish": "🐟",
+            "sh": "🐚",
+        }.get(lower, "▸")
+
+    def shell_backend_color(self, shell_type=None) -> str:
+        lower = str(shell_type or self.shell_type or "").lower()
+        return {
+            "powershell": "#7DD3FC",
+            "pwsh": "#60A5FA",
+            "cmd": "#D1D5DB",
+            "git_bash": "#F59E0B",
+            "wsl": "#86EFAC",
+            "bash": "#34D399",
+            "zsh": "#C084FC",
+            "fish": "#67E8F9",
+            "sh": "#A3A3A3",
+        }.get(lower, "#FFFFFF")
+
+    def system_shell(self, shell_type=None) -> str:
+        shell_type = shell_type or self.shell_type
         if sys.platform != "win32":
-            return os.environ.get("SHELL") or "bash"
+            if shell_type in ("bash", "zsh", "fish", "sh"):
+                return shutil.which(shell_type) or shell_type
+            return os.environ.get("SHELL") or shutil.which("bash") or "sh"
         shell_map = {
             "cmd": "cmd.exe",
             "powershell": "powershell.exe",
             "pwsh": "pwsh.exe",
-            "bash": "bash.exe" if sys.platform == "win32" else "bash",
             "wsl": "wsl.exe",
-            "zsh": "zsh",
-            "fish": "fish",
-            "sh": "sh",
         }
-        executable = shell_map.get(self.shell_type, "cmd.exe")
+        if shell_type == "git_bash":
+            return self.find_git_bash() or "bash.exe"
+        executable = shell_map.get(shell_type, "cmd.exe")
         if shutil.which(executable) is not None:
             return executable
-        for fallback in ("powershell.exe", "cmd.exe"):
+        for fallback in ("pwsh.exe", "powershell.exe", "cmd.exe"):
             if shutil.which(fallback) is not None:
                 return fallback
         return "cmd.exe"
@@ -762,10 +1093,19 @@ class TerminalWindow(QMainWindow):
         self.history = self.history[-self.max_history_size:]
 
         shell_type_val = str(settings.get("shell_type", self.shell_type or "cmd") or "cmd")
-        if shell_type_val in ("cmd", "powershell"):
+        known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh"}
+        if shell_type_val in known_shells and self.system_shell(shell_type_val):
             self.shell_type = shell_type_val
-        elif shell_type_val == "pwsh" and shutil.which("pwsh.exe") is not None:
-            self.shell_type = "pwsh"
+
+        saved_tabs = settings.get("tabs", [])
+        self.saved_tabs = saved_tabs if isinstance(saved_tabs, list) else []
+
+        saved_paths = settings.get("saved_paths", [])
+        self.saved_paths = [
+            self._normalize_saved_path_item(item.get("name", ""), item.get("path", ""))
+            for item in saved_paths
+            if isinstance(item, dict) and str(item.get("path", "")).strip()
+        ] if isinstance(saved_paths, list) else []
 
     def save_settings(self):
         settings = {
@@ -777,6 +1117,8 @@ class TerminalWindow(QMainWindow):
             "default_command": self.default_command,
             "max_history_size": self.max_history_size,
             "shell_type": self.shell_type,
+            "tabs": self.collect_tab_settings(),
+            "saved_paths": self.saved_paths,
         }
 
         try:
