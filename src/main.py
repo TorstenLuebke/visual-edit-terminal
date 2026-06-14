@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
     QDialog, QFormLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
-    QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog
+    QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog,
+    QLineEdit, QListWidget, QListWidgetItem
 )
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal
 from PySide6.QtGui import (
@@ -27,7 +28,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 
 def install_crash_logging():
@@ -310,6 +311,11 @@ class TerminalTab(QWidget):
         rename_tab_action = QAction("Tab umbenennen", self)
         rename_tab_action.triggered.connect(self.window.rename_current_tab)
         menu.addAction(rename_tab_action)
+
+        command_palette_action = QAction("Befehlspalette", self)
+        command_palette_action.setShortcut("Ctrl+Shift+P")
+        command_palette_action.triggered.connect(self.window.show_command_palette)
+        menu.addAction(command_palette_action)
 
         update_directory_action = QAction("Tab-Ordner aktualisieren", self)
         update_directory_action.triggered.connect(self.window.update_current_tab_directory)
@@ -1269,6 +1275,9 @@ class TerminalWindow(QMainWindow):
         self.shortcut_find_previous = QShortcut("Shift+F3", self)
         self.shortcut_find_previous.activated.connect(self.find_previous_current_output)
 
+        self.shortcut_command_palette = QShortcut("Ctrl+Shift+P", self)
+        self.shortcut_command_palette.activated.connect(self.show_command_palette)
+
     def new_tab(self, shell_type=None, title=None, start_directory=None):
         effective_start_directory = start_directory
         if effective_start_directory is None:
@@ -1557,6 +1566,96 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if isinstance(tab, TerminalTab):
             tab.find_output_text(backward=True)
+
+    def clear_current_output(self):
+        tab = self.current_terminal()
+        if isinstance(tab, TerminalTab):
+            tab.output_area.clear()
+            self.show_status("Ausgabe geleert")
+
+    def command_palette_entries(self):
+        entries = [
+            ("Neuer Tab", self.new_tab),
+            ("Backend wechseln", self.select_shell),
+            ("Ausgabe durchsuchen", self.search_current_output),
+            ("Nächster Suchtreffer", self.find_next_current_output),
+            ("Vorheriger Suchtreffer", self.find_previous_current_output),
+            ("Ausgabe leeren", self.clear_current_output),
+            ("Ausgabe speichern", self.save_current_output),
+            ("Design anpassen", self.show_theme_dialog),
+            ("Hilfe öffnen", self.show_help_dialog),
+            ("Ollama: Neuer Chat", self.new_ollama_chat_tab),
+            ("Ollama: Modell wählen", self.select_ollama_model),
+            ("Ollama: Gespräch löschen", self.clear_current_ollama_chat),
+        ]
+
+        for backend in self.available_shell_backends():
+            shell_id = str(backend.get("id", "") or "")
+            label = str(backend.get("label", "") or self.shell_backend_label(shell_id))
+            entries.append((f"Neuer Tab: {label}", lambda s=shell_id: self.new_tab_with_backend(s)))
+
+        for item in self.saved_paths:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or item.get("path", "") or "").strip()
+            path = str(item.get("path", "") or "").strip()
+            if not path:
+                continue
+            entries.append((f"Pfad öffnen: {name}", lambda p=path: self.open_saved_path(p)))
+            entries.append((f"Pfad in neuem Tab öffnen: {name}", lambda p=path: self.open_saved_path_in_new_tab(p)))
+
+        return entries
+
+    def show_command_palette(self):
+        entries = self.command_palette_entries()
+        if not entries:
+            self.show_status("Keine Aktionen verfügbar")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Befehlspalette")
+        dialog.resize(620, 460)
+        layout = QVBoxLayout(dialog)
+
+        search = QLineEdit(dialog)
+        search.setPlaceholderText("Aktion suchen, z. B. Tab, Pfad, Ollama, Suche ...")
+        layout.addWidget(search)
+
+        list_widget = QListWidget(dialog)
+        layout.addWidget(list_widget)
+
+        def refill():
+            query = search.text().strip().lower()
+            list_widget.clear()
+            for label, callback in entries:
+                if query and query not in label.lower():
+                    continue
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, callback)
+                list_widget.addItem(item)
+            if list_widget.count() > 0:
+                list_widget.setCurrentRow(0)
+
+        def run_current():
+            item = list_widget.currentItem()
+            if item is None:
+                return
+            callback = item.data(Qt.ItemDataRole.UserRole)
+            dialog.accept()
+            if callable(callback):
+                callback()
+
+        search.textChanged.connect(refill)
+        search.returnPressed.connect(run_current)
+        list_widget.itemActivated.connect(lambda item: run_current())
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel, dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        refill()
+        search.setFocus()
+        dialog.exec()
 
     def stop_process(self):
         tab = self.current_terminal()
@@ -2648,6 +2747,7 @@ class TerminalWindow(QMainWindow):
 - Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
 - Ausgabe kann als Markdown oder Text gespeichert und ohne Steuerzeichen kopiert werden.
+- Befehlspalette mit Suchfeld für Tabs, Backends, Pfade, KI, Ausgabe und Suche.
 
 Datei-Menü
 - Neuer Tab: öffnet einen neuen Terminal-Tab.
@@ -2683,7 +2783,7 @@ Interaktiver Client-Modus
 
 Kontextmenüs
 - Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
-- Rechtsklick im Ausgabefeld: Kopieren, Kopieren ohne Steuerzeichen, Alles kopieren, Ausgabe speichern, Ausgabe als Markdown/Text speichern, Ausgabe leeren, Suchen, nächster/vorheriger Treffer, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
+- Rechtsklick im Ausgabefeld: Kopieren, Kopieren ohne Steuerzeichen, Alles kopieren, Ausgabe speichern, Ausgabe als Markdown/Text speichern, Ausgabe leeren, Suchen, nächster/vorheriger Treffer, Befehlspalette, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 - Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 
 Tastenkürzel
@@ -2694,6 +2794,7 @@ Tastenkürzel
 - F2: Aktuellen Tab umbenennen.
 - Ctrl+Q: App beenden.
 - Ctrl+F: Ausgabe im aktuellen Tab durchsuchen.
+- Ctrl+Shift+P: Befehlspalette öffnen.
 - F3: nächsten Suchtreffer anzeigen.
 - Shift+F3: vorherigen Suchtreffer anzeigen.
 - Ctrl+C: laufenden Befehl oder aktiven Client im aktuellen Tab unterbrechen.
@@ -2736,7 +2837,7 @@ Hinweise
             f"<h2>{APP_NAME}</h2>"
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends "
-            "gespeicherten Ordnerpfaden und interaktivem Client-Modus.</p>"
+            "gespeicherten Ordnerpfaden, Befehlspalette und interaktivem Client-Modus.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>",
             dialog,
