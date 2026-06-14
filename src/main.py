@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 
 
 def install_crash_logging():
@@ -994,6 +994,18 @@ class TerminalTab(QWidget):
         self.client_mode_active = bool(active)
         self.client_mode_name = str(name or "").strip()
         self.client_mode_kind = str(kind or "").strip() if self.client_mode_active else ""
+
+        # Ollama-Antworten enthalten formatiertes HTML und Codeblöcke.
+        # Der Terminal-Syntaxhighlighter würde diese HTML-Formatierung teilweise
+        # überschreiben und erzeugt dann unruhige Zeilenfarben. Deshalb wird er
+        # nur für echte Shell-/Client-Ausgaben verwendet, nicht im Ollama-Chat.
+        if self.client_mode_active and self.client_mode_kind == "ollama_api":
+            if self.highlighter.document() is not None:
+                self.highlighter.setDocument(None)
+        elif self.highlighter.document() is None:
+            self.highlighter.setDocument(self.output_area.document())
+            self.highlighter.set_terminal_colors(self.window.terminal_colors())
+
         if self.client_mode_active:
             label = self.client_mode_name or "interaktiver Client"
             self.execute_button.setText(self.client_send_button_text())
@@ -3416,7 +3428,7 @@ Hinweise
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends, "
             "gespeicherten Ordnerpfaden, Tab-Profilen, Workspaces, Befehlspalette "
-            "und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts und Codeblock-Kopierfunktion.</p>"
+            "und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts und Chat-artigen Codeblöcken.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
             "<p>Modulare Helferdateien: shelldeck_profiles.py, "

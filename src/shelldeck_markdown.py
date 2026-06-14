@@ -70,35 +70,56 @@ def markdown_to_html(markdown_text: Any) -> str:
     for match in _CODE_FENCE_RE.finditer(text):
         before = text[last:match.start()]
         if before.strip():
-            parts.append(f"<p style='margin:6px 0;'>{_paragraph_html(before.strip())}</p>")
+            parts.append(
+                "<div style='margin:8px 0 10px 0; color:#E5E7EB; font-size:10.5pt; line-height:1.35;'>"
+                f"{_paragraph_html(before.strip())}"
+                "</div>"
+            )
 
         language = normalize_language(match.group(1))
         code = str(match.group(2) or "").strip("\n")
         safe_code = html.escape(code)
         safe_language = html.escape(language)
-        copy_href = f"shelldeck-copy-code:{code_index}"
+        copy_href = html.escape(f"shelldeck-copy-code:{code_index}")
         parts.append(
-            "<div style='margin:10px 0; border:1px solid #334155; "
-            "border-radius:9px; background-color:#0F172A;'>"
-            "<div style='padding:7px 10px; background-color:#1E293B; "
-            "color:#E5E7EB; font-weight:bold;'>"
-            f"<span>{safe_language}</span>"
-            f"<a href='{copy_href}' style='float:right; color:#93C5FD; "
-            "text-decoration:none; font-weight:bold;'>Kopieren</a>"
-            "</div>"
-            "<pre style='margin:0; padding:12px; color:#F8FAFC; "
-            "font-family:Consolas, Courier New, monospace; font-size:10pt; "
-            "line-height:1.25; white-space:pre-wrap;'>"
+            "<table width='100%' cellspacing='0' cellpadding='0' "
+            "style='margin:12px 0; border-collapse:separate; border-spacing:0;'>"
+            "<tr>"
+            "<td style='background-color:#111827; border:1px solid #374151; "
+            "border-bottom:0; border-top-left-radius:10px; border-top-right-radius:10px; "
+            "padding:7px 10px;'>"
+            "<table width='100%' cellspacing='0' cellpadding='0'><tr>"
+            f"<td style='color:#D1D5DB; font-weight:bold; font-size:9.5pt;'>{safe_language}</td>"
+            "<td align='right'>"
+            f"<a href='{copy_href}' style='background-color:#263244; color:#BFDBFE; "
+            "border:1px solid #475569; border-radius:6px; padding:3px 9px; "
+            "text-decoration:none; font-weight:bold; font-size:9pt;'>Kopieren</a>"
+            "</td>"
+            "</tr></table>"
+            "</td>"
+            "</tr>"
+            "<tr>"
+            "<td style='background-color:#0B1220; border:1px solid #374151; "
+            "border-top:0; border-bottom-left-radius:10px; border-bottom-right-radius:10px; "
+            "padding:12px;'>"
+            "<pre style='margin:0; color:#F8FAFC; font-family:Consolas, Courier New, monospace; "
+            "font-size:10pt; line-height:1.32; white-space:pre-wrap;'>"
             f"{safe_code}"
             "</pre>"
-            "</div>"
+            "</td>"
+            "</tr>"
+            "</table>"
         )
         code_index += 1
         last = match.end()
 
     rest = text[last:]
     if rest.strip():
-        parts.append(f"<p style='margin:6px 0;'>{_paragraph_html(rest.strip())}</p>")
+        parts.append(
+            "<div style='margin:8px 0 10px 0; color:#E5E7EB; font-size:10.5pt; line-height:1.35;'>"
+            f"{_paragraph_html(rest.strip())}"
+            "</div>"
+        )
 
     if not parts:
         return ""
@@ -110,7 +131,7 @@ def ollama_answer_to_html(answer: Any) -> str:
     if not body:
         return ""
     return (
-        "<div style='margin-top:10px; margin-bottom:6px;'>"
+        "<div style='margin-top:12px; margin-bottom:6px; color:#F9FAFB; font-size:10.5pt;'>"
         "<b>Ollama →</b>"
         "</div>"
         f"{body}"
