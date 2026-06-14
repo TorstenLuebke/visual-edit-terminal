@@ -14,6 +14,7 @@ from pathlib import Path
 from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
 from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
+from shelldeck_file_context import append_file_context_to_prompt, build_file_context_block, read_text_file_context
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
@@ -31,7 +32,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
 
 def install_crash_logging():
