@@ -11,7 +11,7 @@ import shlex
 import urllib.error
 import urllib.request
 from pathlib import Path
-from shelldeck_profiles import normalize_profiles
+from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
@@ -29,7 +29,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 
 def install_crash_logging():
@@ -1186,6 +1186,8 @@ class TerminalWindow(QMainWindow):
 
         self.paths_menu = menubar.addMenu("&Pfade")
 
+        self.profiles_menu = menubar.addMenu("&Profile")
+
         settings_menu = menubar.addMenu("&Einstellungen")
 
         font_action = QAction("Schriftart", self)
@@ -1262,6 +1264,7 @@ class TerminalWindow(QMainWindow):
 
         self.load_settings()
         self.rebuild_saved_paths_menu()
+        self.rebuild_profiles_menu()
         self.apply_color_scheme()
         self.restore_tabs_from_settings()
 
@@ -1381,6 +1384,138 @@ class TerminalWindow(QMainWindow):
             default_action.setToolTip(path)
             default_action.triggered.connect(lambda checked=False, p=path: self.set_default_start_directory(p))
             submenu.addAction(default_action)
+
+    def rebuild_profiles_menu(self):
+        if not hasattr(self, "profiles_menu"):
+            return
+
+        self.profiles_menu.clear()
+
+        save_action = QAction("Aktuellen Tab als Profil speichern", self)
+        save_action.triggered.connect(self.save_current_tab_as_profile)
+        self.profiles_menu.addAction(save_action)
+
+        open_action = QAction("Profil in neuem Tab öffnen", self)
+        open_action.triggered.connect(self.open_profile_dialog)
+        open_action.setEnabled(bool(self.tab_profiles))
+        self.profiles_menu.addAction(open_action)
+
+        delete_action = QAction("Profil löschen", self)
+        delete_action.triggered.connect(self.delete_profile_dialog)
+        delete_action.setEnabled(bool(self.tab_profiles))
+        self.profiles_menu.addAction(delete_action)
+
+        self.profiles_menu.addSeparator()
+
+        if not self.tab_profiles:
+            empty_action = QAction("Keine Profile gespeichert", self)
+            empty_action.setEnabled(False)
+            self.profiles_menu.addAction(empty_action)
+            return
+
+        for profile in self.tab_profiles:
+            normalized = normalize_profile(profile)
+            action = QAction(profile_display_label(normalized), self)
+            action.triggered.connect(lambda checked=False, p=normalized: self.open_profile_in_new_tab(p))
+            self.profiles_menu.addAction(action)
+
+    def save_current_tab_as_profile(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            self.show_status("Kein aktiver Terminal-Tab")
+            return
+
+        default_name = tab.custom_title or tab.title or self.shell_backend_label(tab.shell_type)
+        name, ok = QInputDialog.getText(
+            self,
+            "Tab-Profil speichern",
+            "Profilname:",
+            text=default_name,
+        )
+        if not ok or not name.strip():
+            return
+
+        startup_command, ok = QInputDialog.getText(
+            self,
+            "Optionaler Startbefehl",
+            "Startbefehl beim Öffnen dieses Profils (leer lassen für keinen):",
+            text="",
+        )
+        if not ok:
+            return
+
+        profile = profile_from_tab(tab, name=name.strip(), startup_command=startup_command.strip())
+        self.tab_profiles = [
+            item for item in normalize_profiles(self.tab_profiles)
+            if str(item.get("name", "")).strip().lower() != profile["name"].strip().lower()
+        ]
+        self.tab_profiles.append(profile)
+        self.rebuild_profiles_menu()
+        self.save_settings()
+        self.show_status(f"Profil gespeichert: {profile['name']}")
+
+    def profile_choice(self, title):
+        profiles = normalize_profiles(self.tab_profiles)
+        if not profiles:
+            self.show_status("Keine Profile gespeichert")
+            return None
+
+        labels = [profile_display_label(profile) for profile in profiles]
+        selected, ok = QInputDialog.getItem(
+            self,
+            title,
+            "Profil auswählen:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or selected not in labels:
+            return None
+        return profiles[labels.index(selected)]
+
+    def open_profile_dialog(self):
+        profile = self.profile_choice("Profil öffnen")
+        if profile:
+            self.open_profile_in_new_tab(profile)
+
+    def delete_profile_dialog(self):
+        profile = self.profile_choice("Profil löschen")
+        if not profile:
+            return
+        name = str(profile.get("name", "") or "").strip().lower()
+        self.tab_profiles = [
+            item for item in normalize_profiles(self.tab_profiles)
+            if str(item.get("name", "") or "").strip().lower() != name
+        ]
+        self.rebuild_profiles_menu()
+        self.save_settings()
+        self.show_status(f"Profil gelöscht: {profile.get('name', '')}")
+
+    def open_profile_in_new_tab(self, profile):
+        profile = normalize_profile(profile)
+        shell_type = profile.get("shell_type") or self.shell_type
+        title = profile.get("title") or profile.get("name") or self.shell_backend_label(shell_type)
+        working_directory = profile.get("working_directory") or None
+
+        tab = self.new_tab(
+            shell_type=shell_type,
+            title=title,
+            start_directory=working_directory,
+        )
+        if not isinstance(tab, TerminalTab):
+            return
+
+        ollama_model = str(profile.get("ollama_model", "") or "").strip()
+        startup_command = str(profile.get("startup_command", "") or "").strip()
+
+        if ollama_model:
+            tab.start_ollama_prompt_mode(ollama_model)
+        elif startup_command:
+            tab.run_text_command(startup_command)
+
+        tab.input_line.setFocus()
+        self.show_status(f"Profil geöffnet: {profile.get('name', title)}")
+
 
     def _normalize_saved_path_item(self, name, path):
         clean_path = str(path or "").strip().strip('"')
@@ -1589,6 +1724,9 @@ class TerminalWindow(QMainWindow):
             ("Ollama: Neuer Chat", self.new_ollama_chat_tab),
             ("Ollama: Modell wählen", self.select_ollama_model),
             ("Ollama: Gespräch löschen", self.clear_current_ollama_chat),
+            ("Profil: Aktuellen Tab speichern", self.save_current_tab_as_profile),
+            ("Profil: Öffnen", self.open_profile_dialog),
+            ("Profil: Löschen", self.delete_profile_dialog),
         ]
 
         for backend in self.available_shell_backends():
@@ -1605,6 +1743,10 @@ class TerminalWindow(QMainWindow):
                 continue
             entries.append((f"Pfad öffnen: {name}", lambda p=path: self.open_saved_path(p)))
             entries.append((f"Pfad in neuem Tab öffnen: {name}", lambda p=path: self.open_saved_path_in_new_tab(p)))
+
+        for profile in normalize_profiles(self.tab_profiles):
+            label = profile_display_label(profile)
+            entries.append((f"Profil öffnen: {label}", lambda p=profile: self.open_profile_in_new_tab(p)))
 
         return entries
 
@@ -2751,7 +2893,8 @@ class TerminalWindow(QMainWindow):
 - Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
 - Ausgabe kann als Markdown oder Text gespeichert und ohne Steuerzeichen kopiert werden.
-- Befehlspalette mit Suchfeld für Tabs, Backends, Pfade, KI, Ausgabe und Suche.
+- Befehlspalette mit Suchfeld für Tabs, Backends, Pfade, Profile, KI, Ausgabe und Suche.
+- Tab-Profile speichern Backend, Titel, Arbeitsordner, optionalen Startbefehl und Ollama-Modell.
 
 Datei-Menü
 - Neuer Tab: öffnet einen neuen Terminal-Tab.
@@ -2767,6 +2910,12 @@ Pfade-Menü
 - Gespeicherten Pfad löschen: entfernt einen gespeicherten Schnellzugriff.
 - Gespeicherte Pfade: führen im aktuellen Tab automatisch cd "..." aus.
 - Windows-Pfade werden für WSL und Git Bash möglichst passend umgewandelt.
+
+Profile-Menü
+- Aktuellen Tab als Profil speichern: speichert Backend, Tab-Name, Arbeitsordner und optionalen Startbefehl.
+- Profil in neuem Tab öffnen: startet ein gespeichertes Profil.
+- Profil löschen: entfernt gespeicherte Profile.
+- Ollama-Tabs merken zusätzlich das verwendete Modell.
 
 Einstellungen-Menü
 - Schriftart: setzt die Terminal-Schrift für alle Tabs.
@@ -2841,7 +2990,7 @@ Hinweise
             f"<h2>{APP_NAME}</h2>"
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends "
-            "gespeicherten Ordnerpfaden, Befehlspalette und interaktivem Client-Modus.</p>"
+            "gespeicherten Ordnerpfaden, Tab-Profilen, Befehlspalette und interaktivem Client-Modus.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>",
             dialog,
