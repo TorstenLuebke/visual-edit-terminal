@@ -30,7 +30,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 def install_crash_logging():
@@ -1147,6 +1147,7 @@ class TerminalWindow(QMainWindow):
         self.saved_tabs = []
         self.saved_paths = []
         self.tab_profiles = []
+        self.workspaces = []
         self.default_start_directory = ""
         self.selected_ollama_model = ""
         self.history_file = Path.home() / ".visual_edit_terminal_history"
@@ -1188,6 +1189,8 @@ class TerminalWindow(QMainWindow):
         self.paths_menu = menubar.addMenu("&Pfade")
 
         self.profiles_menu = menubar.addMenu("&Profile")
+
+        self.workspaces_menu = menubar.addMenu("&Workspaces")
 
         settings_menu = menubar.addMenu("&Einstellungen")
 
@@ -1266,6 +1269,7 @@ class TerminalWindow(QMainWindow):
         self.load_settings()
         self.rebuild_saved_paths_menu()
         self.rebuild_profiles_menu()
+        self.rebuild_workspaces_menu()
         self.apply_color_scheme()
         self.restore_tabs_from_settings()
 
@@ -1514,6 +1518,142 @@ class TerminalWindow(QMainWindow):
         elif startup_command:
             tab.run_text_command(startup_command)
 
+    def rebuild_workspaces_menu(self):
+        if not hasattr(self, "workspaces_menu"):
+            return
+
+        self.workspaces_menu.clear()
+
+        save_action = QAction("Aktuellen Workspace speichern", self)
+        save_action.triggered.connect(self.save_current_workspace)
+        self.workspaces_menu.addAction(save_action)
+
+        load_action = QAction("Workspace laden", self)
+        load_action.triggered.connect(self.load_workspace_dialog)
+        load_action.setEnabled(bool(self.workspaces))
+        self.workspaces_menu.addAction(load_action)
+
+        delete_action = QAction("Workspace löschen", self)
+        delete_action.triggered.connect(self.delete_workspace_dialog)
+        delete_action.setEnabled(bool(self.workspaces))
+        self.workspaces_menu.addAction(delete_action)
+
+        self.workspaces_menu.addSeparator()
+
+        if not self.workspaces:
+            empty_action = QAction("Keine Workspaces gespeichert", self)
+            empty_action.setEnabled(False)
+            self.workspaces_menu.addAction(empty_action)
+            return
+
+        for workspace in normalize_workspaces(self.workspaces):
+            action = QAction(workspace_display_label(workspace), self)
+            action.triggered.connect(lambda checked=False, w=workspace: self.load_workspace(w))
+            self.workspaces_menu.addAction(action)
+
+    def save_current_workspace(self):
+        name, ok = QInputDialog.getText(
+            self,
+            "Workspace speichern",
+            "Workspace-Name:",
+            text="ShellDeck Workspace",
+        )
+        if not ok or not name.strip():
+            return
+
+        workspace = workspace_from_tabs(
+            self.collect_tab_settings(),
+            name=name.strip(),
+            default_start_directory=self.default_start_directory,
+            selected_ollama_model=self.selected_ollama_model,
+            shell_type=self.shell_type,
+        )
+        self.workspaces = [
+            item for item in normalize_workspaces(self.workspaces)
+            if str(item.get("name", "") or "").strip().lower() != workspace["name"].strip().lower()
+        ]
+        self.workspaces.append(workspace)
+        self.rebuild_workspaces_menu()
+        self.save_settings()
+        self.show_status(f"Workspace gespeichert: {workspace['name']}")
+
+    def workspace_choice(self, title):
+        workspaces = normalize_workspaces(self.workspaces)
+        if not workspaces:
+            self.show_status("Keine Workspaces gespeichert")
+            return None
+
+        labels = [workspace_display_label(workspace) for workspace in workspaces]
+        selected, ok = QInputDialog.getItem(
+            self,
+            title,
+            "Workspace auswählen:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or selected not in labels:
+            return None
+        return workspaces[labels.index(selected)]
+
+    def load_workspace_dialog(self):
+        workspace = self.workspace_choice("Workspace laden")
+        if workspace:
+            self.load_workspace(workspace)
+
+    def delete_workspace_dialog(self):
+        workspace = self.workspace_choice("Workspace löschen")
+        if not workspace:
+            return
+        name = str(workspace.get("name", "") or "").strip().lower()
+        self.workspaces = [
+            item for item in normalize_workspaces(self.workspaces)
+            if str(item.get("name", "") or "").strip().lower() != name
+        ]
+        self.rebuild_workspaces_menu()
+        self.save_settings()
+        self.show_status(f"Workspace gelöscht: {workspace.get('name', '')}")
+
+    def clear_all_tabs_for_workspace_load(self):
+        while self.tab_widget.count() > 0:
+            tab = self.tab_widget.widget(0)
+            if isinstance(tab, TerminalTab):
+                tab.stop_process()
+            self.tab_widget.removeTab(0)
+            if tab is not None:
+                tab.deleteLater()
+
+    def load_workspace(self, workspace):
+        workspace = normalize_workspace(workspace)
+        self.default_start_directory = workspace.get("default_start_directory", "")
+        self.selected_ollama_model = workspace.get("selected_ollama_model", "")
+        shell_type = workspace.get("shell_type", "")
+        if shell_type and self.system_shell(shell_type):
+            self.shell_type = shell_type
+
+        self.clear_all_tabs_for_workspace_load()
+
+        restored = False
+        for item in workspace.get("tabs", []):
+            if not isinstance(item, dict):
+                continue
+            tab_shell = str(item.get("shell_type", self.shell_type) or self.shell_type)
+            if not self.system_shell(tab_shell):
+                tab_shell = self.shell_type
+            self.new_tab(
+                shell_type=tab_shell,
+                title=str(item.get("title", "") or ""),
+                start_directory=str(item.get("working_directory", "") or ""),
+            )
+            restored = True
+
+        if not restored:
+            self.new_tab()
+
+        self.rebuild_saved_paths_menu()
+        self.save_settings()
+        self.show_status(f"Workspace geladen: {workspace.get('name', '')}")
+
         tab.input_line.setFocus()
         self.show_status(f"Profil geöffnet: {profile.get('name', title)}")
 
@@ -1728,6 +1868,9 @@ class TerminalWindow(QMainWindow):
             ("Profil: Aktuellen Tab speichern", self.save_current_tab_as_profile),
             ("Profil: Öffnen", self.open_profile_dialog),
             ("Profil: Löschen", self.delete_profile_dialog),
+            ("Workspace: Aktuellen Workspace speichern", self.save_current_workspace),
+            ("Workspace: Laden", self.load_workspace_dialog),
+            ("Workspace: Löschen", self.delete_workspace_dialog),
         ]
 
         for backend in self.available_shell_backends():
@@ -1748,6 +1891,10 @@ class TerminalWindow(QMainWindow):
         for profile in normalize_profiles(self.tab_profiles):
             label = profile_display_label(profile)
             entries.append((f"Profil öffnen: {label}", lambda p=profile: self.open_profile_in_new_tab(p)))
+
+        for workspace in normalize_workspaces(self.workspaces):
+            label = workspace_display_label(workspace)
+            entries.append((f"Workspace laden: {label}", lambda w=workspace: self.load_workspace(w)))
 
         return entries
 
@@ -2319,6 +2466,7 @@ class TerminalWindow(QMainWindow):
         self.default_start_directory = str(settings.get("default_start_directory", self.default_start_directory or "") or "")
         self.selected_ollama_model = str(settings.get("selected_ollama_model", self.selected_ollama_model or "") or "")
         self.tab_profiles = normalize_profiles(settings.get("tab_profiles", self.tab_profiles))
+        self.workspaces = normalize_workspaces(settings.get("workspaces", self.workspaces))
 
     def save_settings(self):
         settings = {
@@ -2335,6 +2483,7 @@ class TerminalWindow(QMainWindow):
             "default_start_directory": self.default_start_directory,
             "selected_ollama_model": self.selected_ollama_model,
             "tab_profiles": normalize_profiles(self.tab_profiles),
+            "workspaces": normalize_workspaces(self.workspaces),
         }
 
         try:
