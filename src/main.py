@@ -7,6 +7,9 @@ import traceback
 import faulthandler
 import shutil
 import subprocess
+import shlex
+import urllib.error
+import urllib.request
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
@@ -14,7 +17,7 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
     QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog
 )
-from PySide6.QtCore import Qt, QProcess, QEvent
+from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal
 from PySide6.QtGui import (
     QTextCursor, QFont, QTextCharFormat, QColor, QSyntaxHighlighter,
     QAction, QShortcut, QPalette
@@ -24,7 +27,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "PathForge Terminal"
-APP_VERSION = "0.8.0"
+APP_VERSION = "1.0.0"
 
 
 def install_crash_logging():
@@ -89,6 +92,53 @@ class TerminalHighlighter(QSyntaxHighlighter):
                 self.setFormat(start, length, fmt)
 
 
+class OllamaApiWorker(QThread):
+    response_ready = Signal(str, object)
+    error_ready = Signal(str)
+
+    def __init__(self, model, prompt, context=None, parent=None):
+        super().__init__(parent)
+        self.model = str(model or "").strip()
+        self.prompt = str(prompt or "")
+        self.context = context if isinstance(context, list) else []
+
+    def run(self):
+        payload = {
+            "model": self.model,
+            "prompt": self.prompt,
+            "stream": False,
+        }
+        if self.context:
+            payload["context"] = self.context
+
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            "http://127.0.0.1:11434/api/generate",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+            result = json.loads(raw)
+            if "error" in result:
+                self.error_ready.emit(str(result.get("error") or "Unbekannter Ollama-Fehler"))
+                return
+            answer = str(result.get("response", "") or "")
+            context = result.get("context")
+            self.response_ready.emit(answer, context if isinstance(context, list) else None)
+        except urllib.error.URLError as exc:
+            self.error_ready.emit(
+                "Ollama ist nicht erreichbar. Prüfe, ob Ollama läuft "
+                "(normalerweise http://127.0.0.1:11434). Details: "
+                f"{exc}"
+            )
+        except Exception as exc:
+            self.error_ready.emit(f"Ollama-API-Fehler: {exc}")
+
+
 class TerminalTab(QWidget):
     def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None):
         super().__init__(window)
@@ -100,6 +150,12 @@ class TerminalTab(QWidget):
         self.title = title
         self.history_index = -1
         self.current_command = ""
+        self.client_mode_active = False
+        self.client_mode_name = ""
+        self.client_mode_kind = ""
+        self.ollama_model = ""
+        self.ollama_context = []
+        self.ollama_worker = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -216,6 +272,11 @@ class TerminalTab(QWidget):
         update_directory_action.triggered.connect(self.window.update_current_tab_directory)
         menu.addAction(update_directory_action)
 
+        if self.client_mode_active:
+            stop_client_action = QAction("Client-Modus beenden", self)
+            stop_client_action.triggered.connect(self.exit_client_mode)
+            menu.addAction(stop_client_action)
+
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.window.close_current_tab)
         menu.addAction(close_tab_action)
@@ -284,9 +345,15 @@ class TerminalTab(QWidget):
                 self.process.waitForFinished(1000)
 
     def interrupt_current_command(self):
+        if self.client_mode_active and self.client_mode_kind == "ollama_api":
+            self.output_area.append("\n[Ollama-API-Modus beendet]\n")
+            self.set_client_mode(False)
+            return
         if self.process and self.process.state() == QProcess.ProcessState.Running:
             self.process.write(b"\x03")
             self.process.waitForBytesWritten(1000)
+            if self.client_mode_active:
+                self.set_client_mode(False)
         else:
             self.output_area.append("Kein laufender Prozess zum Unterbrechen.")
 
@@ -335,8 +402,214 @@ class TerminalTab(QWidget):
             self.input_line.setPlainText(self.current_command)
             self.input_line.moveCursor(QTextCursor.MoveOperation.End)
 
+    def parse_ollama_run_model(self, command):
+        text = str(command or "").strip()
+        if not text:
+            return ""
+        try:
+            parts = shlex.split(text, posix=False)
+        except ValueError:
+            parts = text.split()
+        if len(parts) == 3 and Path(str(parts[0]).strip('"')).name.lower() == "ollama" and str(parts[1]).lower() == "run":
+            return str(parts[2]).strip('"')
+        return ""
+
+    def quote_argument_for_shell(self, text):
+        value = str(text or "")
+        lower_shell = str(self.shell_type or "").lower()
+        if sys.platform == "win32" and lower_shell in {"powershell", "pwsh"}:
+            return "'" + value.replace("'", "''") + "'"
+        if sys.platform == "win32" and lower_shell == "cmd":
+            return '"' + value.replace('"', '\\"') + '"'
+        return "'" + value.replace("'", "'\\''") + "'"
+
+    def start_ollama_prompt_mode(self, model_name):
+        self.ollama_model = str(model_name or "").strip()
+        self.ollama_context = []
+        if not self.ollama_model:
+            return False
+        self.output_area.append(
+            f"\n[Ollama-API-Modus aktiv: {self.ollama_model}] "
+            "Eingaben unten werden direkt an die lokale Ollama-API gesendet. "
+            "/bye, exit oder quit beendet den Modus.\n"
+        )
+        self.set_client_mode(True, f"Ollama: {self.ollama_model}", kind="ollama_api")
+        return True
+
+    def send_ollama_prompt(self, text):
+        prompt = str(text or "").strip()
+        if not prompt:
+            return
+        if self.is_client_exit_command(prompt):
+            self.input_line.clear()
+            self.output_area.append("\n[Ollama-API-Modus beendet]\n")
+            self.set_client_mode(False)
+            return
+        if self.ollama_worker is not None and self.ollama_worker.isRunning():
+            self.output_area.append("\n[Ollama verarbeitet noch eine Anfrage. Bitte kurz warten.]\n")
+            return
+        if prompt and (not self.window.history or self.window.history[-1] != prompt):
+            self.window.history.append(prompt)
+            self.window.save_history()
+        self.history_index = -1
+        self.current_command = ""
+        self.output_area.append(f"\nDu → {prompt}\n")
+        self.input_line.clear()
+        self.execute_button.setEnabled(False)
+        self.execute_button.setText("Ollama antwortet …")
+        self.window.statusBar().showMessage(f"Ollama antwortet: {self.ollama_model}")
+
+        self.ollama_worker = OllamaApiWorker(
+            self.ollama_model,
+            prompt,
+            context=self.ollama_context,
+            parent=self,
+        )
+        self.ollama_worker.response_ready.connect(self.handle_ollama_response)
+        self.ollama_worker.error_ready.connect(self.handle_ollama_error)
+        self.ollama_worker.finished.connect(self.handle_ollama_finished)
+        self.ollama_worker.start()
+
+    def handle_ollama_response(self, answer, context):
+        if isinstance(context, list):
+            self.ollama_context = context
+        text = str(answer or "").strip()
+        if text:
+            self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+            self.output_area.insertPlainText(f"\nOllama → {text}\n")
+            self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+            self.output_area.ensureCursorVisible()
+        else:
+            self.output_area.append("\n[Ollama hat keine sichtbare Antwort geliefert.]\n")
+
+    def handle_ollama_error(self, message):
+        self.output_area.append(f"\n[Ollama-Fehler] {message}\n")
+
+    def handle_ollama_finished(self):
+        if self.client_mode_active and self.client_mode_kind == "ollama_api":
+            self.execute_button.setEnabled(True)
+            self.execute_button.setText("An Client senden")
+            self.window.statusBar().showMessage(f"Client-Modus aktiv: Ollama: {self.ollama_model}")
+        else:
+            self.execute_button.setEnabled(True)
+            self.execute_button.setText("Befehl ausführen")
+        if self.ollama_worker is not None:
+            self.ollama_worker.deleteLater()
+            self.ollama_worker = None
+
+    def is_client_exit_command(self, text):
+        command = str(text or "").strip().lower()
+        return command in {"/bye", "/exit", "exit", "quit", ".exit"}
+
+    def detect_client_mode_name(self, command):
+        text = str(command or "").strip()
+        if not text:
+            return ""
+
+        try:
+            parts = shlex.split(text, posix=False)
+        except ValueError:
+            parts = text.split()
+
+        if not parts:
+            return ""
+
+        executable = Path(str(parts[0]).strip('"')).name.lower()
+        lower_text = text.lower()
+
+        if executable == "ollama" and len(parts) >= 3 and str(parts[1]).lower() == "run":
+            # "ollama run <model> <prompt>" is usually a one-shot request.
+            # "ollama run <model>" starts an interactive client.
+            if len(parts) <= 3:
+                model_name = str(parts[2]).strip('"')
+                return f"Ollama: {model_name}"
+            return ""
+
+        if executable in {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}:
+            if len(parts) == 1 or any(str(part).lower() == "-i" for part in parts[1:]):
+                return "Python"
+
+        if executable in {"node", "node.exe"}:
+            if len(parts) == 1:
+                return "Node.js"
+
+        sql_clients = {
+            "sqlite3": "SQLite",
+            "sqlite3.exe": "SQLite",
+            "psql": "PostgreSQL",
+            "psql.exe": "PostgreSQL",
+            "mysql": "MySQL",
+            "mysql.exe": "MySQL",
+            "mariadb": "MariaDB",
+            "mariadb.exe": "MariaDB",
+        }
+        if executable in sql_clients:
+            return sql_clients[executable]
+
+        if lower_text.startswith("sqlcmd"):
+            return "SQL"
+
+        return ""
+
+    def set_client_mode(self, active, name="", kind=""):
+        self.client_mode_active = bool(active)
+        self.client_mode_name = str(name or "").strip()
+        self.client_mode_kind = str(kind or "").strip() if self.client_mode_active else ""
+        if self.client_mode_active:
+            label = self.client_mode_name or "interaktiver Client"
+            self.execute_button.setText("An Client senden")
+            self.input_line.setPlaceholderText(f"Eingabe an {label} …  /bye, exit oder quit beendet")
+            self.window.statusBar().showMessage(f"Client-Modus aktiv: {label}")
+        else:
+            self.client_mode_name = ""
+            self.client_mode_kind = ""
+            self.ollama_model = ""
+            self.ollama_context = []
+            self.execute_button.setEnabled(True)
+            self.execute_button.setText("Befehl ausführen")
+            self.input_line.setPlaceholderText("")
+            self.window.statusBar().showMessage(f"Shell-Backend: {self.window.shell_backend_label(self.shell_type)}")
+
+    def send_client_input(self, text):
+        if self.client_mode_kind in {"ollama_prompt", "ollama_api"}:
+            self.send_ollama_prompt(text)
+            return
+
+        payload = str(text or "").rstrip("\n")
+        if not payload:
+            return
+
+        if self.process.state() != QProcess.ProcessState.Running:
+            self.output_area.append(
+                f"Shell ist nicht aktiv: {self.process.errorString() or 'Prozess wurde beendet.'}"
+            )
+            self.set_client_mode(False)
+            return
+
+        if self.is_client_exit_command(payload):
+            self.process.write(payload.encode() + b"\n")
+            self.input_line.clear()
+            self.set_client_mode(False)
+            return
+
+        if payload and (not self.window.history or self.window.history[-1] != payload):
+            self.window.history.append(payload)
+            self.window.save_history()
+
+        self.history_index = -1
+        self.current_command = ""
+        self.process.write(payload.encode() + b"\n")
+        self.input_line.clear()
+
     def execute_command(self):
         command_text = self.input_line.toPlainText().strip()
+        if not command_text:
+            return
+
+        if self.client_mode_active:
+            self.send_client_input(command_text)
+            return
+
         commands = [
             cmd.strip()
             for line in command_text.splitlines()
@@ -354,6 +627,10 @@ class TerminalTab(QWidget):
         self.current_command = ""
 
         for command in commands:
+            ollama_model = self.parse_ollama_run_model(command)
+            if ollama_model:
+                self.start_ollama_prompt_mode(ollama_model)
+                continue
             if command.lower() in ("cls", "clear"):
                 self.output_area.clear()
             elif self.process.state() != QProcess.ProcessState.Running:
@@ -363,6 +640,9 @@ class TerminalTab(QWidget):
                 break
             else:
                 self.process.write(command.encode() + b"\n")
+                client_name = self.detect_client_mode_name(command)
+                if client_name:
+                    self.set_client_mode(True, client_name)
         self.input_line.clear()
 
     def _decode_process_output(self, raw) -> str:
@@ -391,9 +671,11 @@ class TerminalTab(QWidget):
         self.output_area.ensureCursorVisible()
 
     def handle_finished(self, exit_code, exit_status):
+        self.set_client_mode(False)
         self.output_area.append(f"\nProcess finished with exit code {exit_code}")
 
     def handle_process_error(self, error):
+        self.set_client_mode(False)
         self.output_area.append(f"\nShell konnte nicht gestartet werden: {self.process.errorString()}")
 
     def set_terminal_font(self, font):
@@ -1679,6 +1961,7 @@ class TerminalWindow(QMainWindow):
 - Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
 - Tab-Namen, Shell-Typen, Arbeitsordner je Tab und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
 - Gemeinsame Befehlshistorie für alle Tabs.
+- Ollama-API-Modus sowie interaktiver Roh-Client-Modus für Python, Node.js und SQL-Clients.
 - Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
 
@@ -1705,6 +1988,14 @@ Einstellungen-Menü
 - History-Größe: maximale Anzahl gespeicherter Befehle.
 - Shell-Backend: wechselt das Shell-Backend des aktuellen Tabs.
 
+Interaktiver Client-Modus
+- ollama run <modell> aktiviert einen stabilen Ollama-Prompt-Modus ohne echten PTY-Zwang.
+- Jede Eingabe unten wird als einzelner Prompt an das gewählte Ollama-Modell gesendet; die Antwort erscheint oben.
+- Andere interaktive Clients wie python, node, sqlite3, psql oder mysql senden rohe Zeilen direkt an den laufenden Client.
+- Im Client-Modus wird der Button zu „An Client senden“ und die Statuszeile zeigt den aktiven Client.
+- /bye, exit, quit oder Ctrl+C verlassen den Client-Modus.
+- Normale Befehlsfunktionen wie Semikolon-Aufteilung und cls/clear werden im Client-Modus bewusst nicht angewendet.
+
 Kontextmenüs
 - Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 - Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Ausgabe leeren, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
@@ -1717,8 +2008,8 @@ Tastenkürzel
 - Ctrl+D: Aktuellen Tab duplizieren.
 - F2: Aktuellen Tab umbenennen.
 - Ctrl+Q: App beenden.
-- Ctrl+C: laufenden Befehl im aktuellen Tab unterbrechen.
-- Enter: Befehl ausführen.
+- Ctrl+C: laufenden Befehl oder aktiven Client im aktuellen Tab unterbrechen.
+- Enter: Befehl ausführen oder Eingabe an aktiven Client senden.
 - Ctrl+Enter: neue Zeile im Eingabefeld einfügen.
 - Pfeil hoch: vorherigen Befehl aus der History laden, Cursor ans Ende setzen.
 - Pfeil runter: nächsten Befehl aus der History laden, Cursor ans Ende setzen.
@@ -1727,6 +2018,7 @@ Hinweise
 - Die App ist eine eigene Terminal-Oberfläche. Die Ausführung der Befehle erfolgt über das gewählte Shell-Backend.
 - Unter Linux funktioniert die App grundsätzlich mit PySide6 und verfügbaren Shells wie bash, zsh, fish oder sh.
 - Welche Backends angeboten werden, hängt davon ab, was auf dem System installiert ist.
+- Für Programme mit eigener Vollbild- oder Spezial-Terminalsteuerung kann später ein echter PTY/ConPTY-Modus ergänzt werden.
 """
 
     def show_help_dialog(self):
@@ -1756,7 +2048,7 @@ Hinweise
             f"<h2>{APP_NAME}</h2>"
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends "
-            "und gespeicherten Ordnerpfaden.</p>"
+            "gespeicherten Ordnerpfaden und interaktivem Client-Modus.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>",
             dialog,
