@@ -357,6 +357,30 @@ class TerminalTab(QWidget):
         else:
             self.output_area.append("Kein laufender Prozess zum Unterbrechen.")
 
+    def exit_client_mode(self):
+        if not self.client_mode_active:
+            return
+
+        if self.client_mode_kind in {"ollama_prompt", "ollama_api"}:
+            self.output_area.append("\n[Ollama-Modus beendet]\n")
+            self.set_client_mode(False)
+            return
+
+        label = self.client_mode_name.lower()
+        exit_command = "exit"
+        if "sqlite" in label or "node" in label:
+            exit_command = ".exit"
+        elif "postgres" in label or "psql" in label:
+            exit_command = "\\q"
+        elif "sql" in label and "sqlcmd" in label:
+            exit_command = "exit"
+
+        if self.process and self.process.state() == QProcess.ProcessState.Running:
+            self.process.write(exit_command.encode() + b"\n")
+            self.process.waitForBytesWritten(1000)
+
+        self.set_client_mode(False)
+
     def display_shell_status(self, shell_path=None):
         backend_label = self.window.shell_backend_label(self.shell_type)
         self.title = self.custom_title or backend_label
