@@ -26,8 +26,8 @@ from PySide6.QtGui import (
 
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
-APP_NAME = "PathForge Terminal"
-APP_VERSION = "1.1.2"
+APP_NAME = "ShellDeck Terminal"
+APP_VERSION = "1.2.0"
 
 
 def install_crash_logging():
@@ -330,7 +330,8 @@ class TerminalTab(QWidget):
                 self.process.setWorkingDirectory(self.start_directory)
             except Exception:
                 pass
-        self.process.start(shell_path)
+        shell_args = self.window.shell_start_args(self.shell_type)
+        self.process.start(shell_path, shell_args)
         self.display_shell_status(shell_path)
 
     def restart_shell(self):
@@ -734,7 +735,7 @@ class TerminalTab(QWidget):
     def handle_ollama_finished(self):
         if self.client_mode_active and self.client_mode_kind == "ollama_api":
             self.execute_button.setEnabled(True)
-            self.execute_button.setText("An Client senden")
+            self.execute_button.setText(self.client_send_button_text())
             self.window.statusBar().showMessage(f"Client-Modus aktiv: Ollama: {self.ollama_model}")
         else:
             self.execute_button.setEnabled(True)
@@ -798,13 +799,23 @@ class TerminalTab(QWidget):
 
         return ""
 
+    def client_send_button_text(self):
+        label = (self.client_mode_name or "Client").strip()
+        kind = (self.client_mode_kind or "").strip()
+        if kind in {"ollama_prompt", "ollama_api"}:
+            return "An Ollama senden"
+        if kind == "direct_process":
+            clean = label.replace(":", "").strip() or "Client"
+            return f"An {clean} senden"
+        return "An Client senden"
+
     def set_client_mode(self, active, name="", kind=""):
         self.client_mode_active = bool(active)
         self.client_mode_name = str(name or "").strip()
         self.client_mode_kind = str(kind or "").strip() if self.client_mode_active else ""
         if self.client_mode_active:
             label = self.client_mode_name or "interaktiver Client"
-            self.execute_button.setText("An Client senden")
+            self.execute_button.setText(self.client_send_button_text())
             self.input_line.setPlaceholderText(f"Eingabe an {label} …  /bye, exit oder quit beendet")
             self.window.statusBar().showMessage(f"Client-Modus aktiv: {label}")
         else:
@@ -1037,6 +1048,9 @@ class TerminalWindow(QMainWindow):
         new_tab_action.setShortcut("Ctrl+T")
         new_tab_action.triggered.connect(self.new_tab)
         self.file_menu.addAction(new_tab_action)
+
+        self.new_backend_tab_menu = self.file_menu.addMenu("Neuer Tab mit Backend")
+        self.new_backend_tab_menu.aboutToShow.connect(self.rebuild_new_backend_tab_menu)
 
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.setShortcut("Ctrl+W")
@@ -1612,6 +1626,32 @@ class TerminalWindow(QMainWindow):
             if shutil.which(fallback) is not None:
                 return fallback
         return "cmd.exe"
+
+    def shell_start_args(self, shell_type=None):
+        lower = str(shell_type or self.shell_type or "").lower()
+        if sys.platform == "win32":
+            if lower in {"powershell", "pwsh"}:
+                return ["-NoLogo"]
+        return []
+
+    def new_tab_with_backend(self, shell_type):
+        self.new_tab(shell_type=shell_type)
+
+    def rebuild_new_backend_tab_menu(self):
+        if not hasattr(self, "new_backend_tab_menu"):
+            return
+        self.new_backend_tab_menu.clear()
+        for item in self.available_shell_backends():
+            shell_id = str(item.get("id", "") or "")
+            label = str(item.get("label", "") or self.shell_backend_label(shell_id))
+            icon = self.shell_backend_icon(shell_id)
+            action = QAction(f"{icon} {label}".strip(), self)
+            action.triggered.connect(lambda checked=False, s=shell_id: self.new_tab_with_backend(s))
+            self.new_backend_tab_menu.addAction(action)
+        if not self.new_backend_tab_menu.actions():
+            action = QAction("Keine Backends gefunden", self)
+            action.setEnabled(False)
+            self.new_backend_tab_menu.addAction(action)
 
     def load_history(self):
         if self.history_file.exists():
@@ -2251,6 +2291,7 @@ class TerminalWindow(QMainWindow):
 
 Übersicht
 - Mehrere Terminal-Tabs mit eigenem Shell-Prozess je Tab.
+- Schnellstart-Menü für neue Tabs mit bestimmtem Backend.
 - Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
 - Tab-Namen, Shell-Typen, Arbeitsordner je Tab und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
 - Gemeinsame Befehlshistorie für alle Tabs.
@@ -2260,6 +2301,7 @@ class TerminalWindow(QMainWindow):
 
 Datei-Menü
 - Neuer Tab: öffnet einen neuen Terminal-Tab.
+- Neuer Tab mit Backend: öffnet direkt PowerShell, CMD, Git Bash, WSL oder ein anderes erkanntes Backend.
 - Aktuellen Tab schließen: beendet den Prozess des aktuellen Tabs und schließt den Tab.
 - Tab duplizieren: öffnet einen neuen Tab mit gleichem Shell-Backend und ähnlichem Namen.
 - Tab umbenennen: vergibt einen eigenen Tab-Namen.
