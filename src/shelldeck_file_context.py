@@ -93,7 +93,4 @@ def append_file_context_to_prompt(prompt: Any, file_context: Dict[str, Any]) -> 
     block = build_file_context_block(file_context)
     if base:
         return base + block
-    return (
-        "Stelle deine Frage zu der angehängten Datei oberhalb dieses Kontextblocks."
-        + block
-    )
+    return block.lstrip()

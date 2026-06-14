@@ -15,6 +15,7 @@ from shelldeck_profiles import normalize_profile, normalize_profiles, profile_di
 from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
 from shelldeck_file_context import append_file_context_to_prompt, build_file_context_block, read_text_file_context
+from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
@@ -32,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 
 
 def install_crash_logging():
@@ -1707,11 +1708,19 @@ class TerminalWindow(QMainWindow):
             tab_shell = str(item.get("shell_type", self.shell_type) or self.shell_type)
             if not self.system_shell(tab_shell):
                 tab_shell = self.shell_type
-            self.new_tab(
+            tab = self.new_tab(
                 shell_type=tab_shell,
                 title=str(item.get("title", "") or ""),
                 start_directory=str(item.get("working_directory", "") or ""),
             )
+            if isinstance(tab, TerminalTab):
+                ollama_model = str(item.get("ollama_model", "") or "").strip()
+                client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
+                if ollama_model or client_kind == "ollama_api":
+                    tab.start_ollama_prompt_mode(
+                        ollama_model or self.selected_ollama_model,
+                        system_prompt=str(item.get("ollama_system_prompt", "") or ""),
+                    )
             restored = True
 
         if not restored:
@@ -2047,6 +2056,8 @@ class TerminalWindow(QMainWindow):
         combined_prompt = append_file_context_to_prompt(current_prompt, file_context)
         tab.input_line.setPlainText(combined_prompt)
         tab.input_line.moveCursor(QTextCursor.MoveOperation.Start)
+        if not str(current_prompt or "").strip():
+            tab.input_line.setPlaceholderText("Frage zur angehängten Datei oberhalb des Kontextblocks eingeben …")
         tab.input_line.setFocus()
         self.show_status(f"Datei angehängt: {file_context.get('name', path)}")
 
@@ -2139,7 +2150,15 @@ class TerminalWindow(QMainWindow):
                 shell_type = self.shell_type
             title = str(item.get("title", "") or "")
             working_directory = str(item.get("working_directory", "") or "")
-            self.new_tab(shell_type=shell_type, title=title, start_directory=working_directory)
+            tab = self.new_tab(shell_type=shell_type, title=title, start_directory=working_directory)
+            if isinstance(tab, TerminalTab):
+                ollama_model = str(item.get("ollama_model", "") or "").strip()
+                client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
+                if ollama_model or client_kind == "ollama_api":
+                    tab.start_ollama_prompt_mode(
+                        ollama_model or self.selected_ollama_model,
+                        system_prompt=str(item.get("ollama_system_prompt", "") or ""),
+                    )
             restored = True
         if not restored:
             self.new_tab()
@@ -2151,11 +2170,18 @@ class TerminalWindow(QMainWindow):
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
             if isinstance(tab, TerminalTab):
-                tabs.append({
+                item = {
                     "shell_type": tab.shell_type,
                     "title": tab.custom_title,
                     "working_directory": tab.refresh_current_working_directory(),
-                })
+                }
+                if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
+                    item.update({
+                        "client_mode_kind": "ollama_api",
+                        "ollama_model": tab.ollama_model,
+                        "ollama_system_prompt": tab.ollama_system_prompt,
+                    })
+                tabs.append(item)
         return tabs
 
     def find_git_bash(self):
