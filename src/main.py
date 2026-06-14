@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "PathForge Terminal"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 def install_crash_logging():
@@ -156,6 +156,8 @@ class TerminalTab(QWidget):
         self.ollama_model = ""
         self.ollama_context = []
         self.ollama_worker = None
+        self.client_process = None
+        self.direct_client_exit_command = "exit"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -338,6 +340,7 @@ class TerminalTab(QWidget):
         self.start_shell()
 
     def stop_process(self):
+        self.stop_client_process()
         if self.process and self.process.state() == QProcess.ProcessState.Running:
             self.process.terminate()
             if not self.process.waitForFinished(3000):
@@ -347,6 +350,11 @@ class TerminalTab(QWidget):
     def interrupt_current_command(self):
         if self.client_mode_active and self.client_mode_kind == "ollama_api":
             self.output_area.append("\n[Ollama-API-Modus beendet]\n")
+            self.set_client_mode(False)
+            return
+        if self.client_mode_active and self.client_mode_kind == "direct_process":
+            self.output_area.append(f"\n[{self.client_mode_name or 'Client'} wird unterbrochen]\n")
+            self.stop_client_process()
             self.set_client_mode(False)
             return
         if self.process and self.process.state() == QProcess.ProcessState.Running:
@@ -364,6 +372,15 @@ class TerminalTab(QWidget):
         if self.client_mode_kind in {"ollama_prompt", "ollama_api"}:
             self.output_area.append("\n[Ollama-Modus beendet]\n")
             self.set_client_mode(False)
+            return
+
+        if self.client_mode_kind == "direct_process":
+            if self.client_process is not None and self.client_process.state() == QProcess.ProcessState.Running:
+                exit_command = getattr(self, "direct_client_exit_command", "exit") or "exit"
+                self.client_process.write(exit_command.encode() + b"\n")
+                self.client_process.waitForBytesWritten(1000)
+            else:
+                self.set_client_mode(False)
             return
 
         label = self.client_mode_name.lower()
@@ -437,6 +454,184 @@ class TerminalTab(QWidget):
         if len(parts) == 3 and Path(str(parts[0]).strip('"')).name.lower() == "ollama" and str(parts[1]).lower() == "run":
             return str(parts[2]).strip('"')
         return ""
+
+    def parse_direct_client_command(self, command):
+        text = str(command or "").strip()
+        if not text:
+            return None
+        try:
+            parts = shlex.split(text, posix=False)
+        except ValueError:
+            parts = text.split()
+        if not parts:
+            return None
+
+        executable_text = str(parts[0]).strip('"')
+        executable_name = Path(executable_text).name.lower()
+        args = [str(part).strip('"') for part in parts[1:]]
+
+        def resolved_program(name):
+            return shutil.which(executable_text) or shutil.which(name) or executable_text
+
+        python_names = {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+        if executable_name in python_names:
+            interactive = len(args) == 0 or any(arg.lower() == "-i" for arg in args)
+            if not interactive:
+                return None
+            normalized_args = list(args)
+            if not any(arg.lower() == "-i" for arg in normalized_args):
+                normalized_args.insert(0, "-i")
+            if executable_name not in {"py", "py.exe"} and not any(arg.lower() == "-u" for arg in normalized_args):
+                normalized_args.insert(0, "-u")
+            return {
+                "program": resolved_program(executable_name),
+                "args": normalized_args,
+                "label": "Python",
+                "exit_command": "exit()",
+            }
+
+        if executable_name in {"node", "node.exe"}:
+            if args:
+                return None
+            return {
+                "program": resolved_program(executable_name),
+                "args": [],
+                "label": "Node.js",
+                "exit_command": ".exit",
+            }
+
+        sql_clients = {
+            "sqlite3": ("SQLite", ".exit"),
+            "sqlite3.exe": ("SQLite", ".exit"),
+            "psql": ("PostgreSQL", "\\q"),
+            "psql.exe": ("PostgreSQL", "\\q"),
+            "mysql": ("MySQL", "quit"),
+            "mysql.exe": ("MySQL", "quit"),
+            "mariadb": ("MariaDB", "quit"),
+            "mariadb.exe": ("MariaDB", "quit"),
+            "sqlcmd": ("SQLCMD", "exit"),
+            "sqlcmd.exe": ("SQLCMD", "exit"),
+        }
+        if executable_name in sql_clients:
+            label, exit_command = sql_clients[executable_name]
+            return {
+                "program": resolved_program(executable_name),
+                "args": args,
+                "label": label,
+                "exit_command": exit_command,
+            }
+
+        return None
+
+    def start_direct_client_process(self, client_info):
+        if not isinstance(client_info, dict):
+            return False
+        program = str(client_info.get("program", "") or "").strip()
+        args = list(client_info.get("args", []) or [])
+        label = str(client_info.get("label", "Client") or "Client")
+        if not program:
+            return False
+
+        if self.client_process is not None:
+            self.stop_client_process()
+
+        self.client_process = QProcess(self)
+        self.client_process.readyReadStandardOutput.connect(self.handle_client_stdout)
+        self.client_process.readyReadStandardError.connect(self.handle_client_stderr)
+        self.client_process.finished.connect(self.handle_client_finished)
+        self.client_process.errorOccurred.connect(self.handle_client_error)
+        working_dir = self.refresh_current_working_directory()
+        if working_dir and Path(working_dir).exists():
+            self.client_process.setWorkingDirectory(working_dir)
+
+        self.client_process.start(program, args)
+        if not self.client_process.waitForStarted(2500):
+            error_text = self.client_process.errorString() if self.client_process is not None else "Unbekannter Fehler"
+            self.output_area.append(f"\n[{label} konnte nicht gestartet werden: {error_text}]\n")
+            self.client_process.deleteLater()
+            self.client_process = None
+            return False
+
+        self.direct_client_exit_command = str(client_info.get("exit_command", "exit") or "exit")
+        self.output_area.append(
+            f"\n[{label}-Client direkt gestartet] "
+            "Eingaben unten werden direkt an diesen Prozess gesendet. "
+            "/bye, exit oder quit beendet den Modus.\n"
+        )
+        self.set_client_mode(True, label, kind="direct_process")
+        return True
+
+    def stop_client_process(self):
+        if self.client_process is None:
+            return
+        if self.client_process.state() == QProcess.ProcessState.Running:
+            self.client_process.terminate()
+            if not self.client_process.waitForFinished(2000):
+                self.client_process.kill()
+                self.client_process.waitForFinished(1000)
+        self.client_process.deleteLater()
+        self.client_process = None
+
+    def send_direct_client_input(self, text):
+        payload = str(text or "").rstrip("\n")
+        if not payload:
+            return
+        if self.client_process is None or self.client_process.state() != QProcess.ProcessState.Running:
+            self.output_area.append("\n[Der direkte Client-Prozess läuft nicht mehr.]\n")
+            self.set_client_mode(False)
+            return
+
+        if self.is_client_exit_command(payload):
+            exit_command = getattr(self, "direct_client_exit_command", "exit") or "exit"
+            self.client_process.write(exit_command.encode() + b"\n")
+            self.client_process.waitForBytesWritten(1000)
+            self.input_line.clear()
+            return
+
+        if payload and (not self.window.history or self.window.history[-1] != payload):
+            self.window.history.append(payload)
+            self.window.save_history()
+        self.history_index = -1
+        self.current_command = ""
+        self.client_process.write(payload.encode() + b"\n")
+        self.client_process.waitForBytesWritten(1000)
+        self.input_line.clear()
+
+    def handle_client_stdout(self):
+        if self.client_process is None:
+            return
+        data = self._decode_process_output(self.client_process.readAllStandardOutput())
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.insertPlainText(data)
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.ensureCursorVisible()
+
+    def handle_client_stderr(self):
+        if self.client_process is None:
+            return
+        data = self._decode_process_output(self.client_process.readAllStandardError())
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.setTextColor(QColor(self.window.terminal_color("stderr", "#FCA5A5")))
+        self.output_area.insertPlainText(data)
+        self.output_area.setTextColor(QColor(self.window.terminal_color("stdout", "#FFFFFF")))
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.ensureCursorVisible()
+
+    def handle_client_finished(self, exit_code, exit_status):
+        label = self.client_mode_name or "Client"
+        self.output_area.append(f"\n[{label}-Client beendet, Exitcode {exit_code}]\n")
+        if self.client_process is not None:
+            self.client_process.deleteLater()
+            self.client_process = None
+        if self.client_mode_kind == "direct_process":
+            self.set_client_mode(False)
+
+    def handle_client_error(self, error):
+        label = self.client_mode_name or "Client"
+        message = self.client_process.errorString() if self.client_process is not None else "Unbekannter Fehler"
+        self.output_area.append(f"\n[{label}-Client-Fehler] {message}\n")
+        if self.client_mode_kind == "direct_process":
+            self.set_client_mode(False)
 
     def quote_argument_for_shell(self, text):
         value = str(text or "")
@@ -520,6 +715,7 @@ class TerminalTab(QWidget):
         if self.ollama_worker is not None:
             self.ollama_worker.deleteLater()
             self.ollama_worker = None
+        self.client_process = None
 
     def is_client_exit_command(self, text):
         command = str(text or "").strip().lower()
@@ -598,6 +794,9 @@ class TerminalTab(QWidget):
         if self.client_mode_kind in {"ollama_prompt", "ollama_api"}:
             self.send_ollama_prompt(text)
             return
+        if self.client_mode_kind == "direct_process":
+            self.send_direct_client_input(text)
+            return
 
         payload = str(text or "").rstrip("\n")
         if not payload:
@@ -654,6 +853,10 @@ class TerminalTab(QWidget):
             ollama_model = self.parse_ollama_run_model(command)
             if ollama_model:
                 self.start_ollama_prompt_mode(ollama_model)
+                continue
+            direct_client = self.parse_direct_client_command(command)
+            if direct_client:
+                self.start_direct_client_process(direct_client)
                 continue
             if command.lower() in ("cls", "clear"):
                 self.output_area.clear()
@@ -1985,7 +2188,7 @@ class TerminalWindow(QMainWindow):
 - Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
 - Tab-Namen, Shell-Typen, Arbeitsordner je Tab und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
 - Gemeinsame Befehlshistorie für alle Tabs.
-- Ollama-API-Modus sowie interaktiver Roh-Client-Modus für Python, Node.js und SQL-Clients.
+- Ollama-API-Modus sowie direkte Client-Prozesse für Python, Node.js und SQL-Clients.
 - Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
 
