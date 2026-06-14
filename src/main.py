@@ -24,7 +24,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "PathForge Terminal"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 
 def install_crash_logging():
@@ -48,25 +48,38 @@ def install_crash_logging():
 
 
 class TerminalHighlighter(QSyntaxHighlighter):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, colors=None):
         super().__init__(parent)
+        self.colors = dict(colors or {})
+        self.rebuild_rules()
+
+    def color_value(self, key, fallback):
+        value = str(self.colors.get(key, fallback) or fallback).strip()
+        return value.upper() if re.fullmatch(r"#[0-9a-fA-F]{6}", value) else fallback
+
+    def rebuild_rules(self):
         self.highlighting_rules = []
 
         error_format = QTextCharFormat()
-        error_format.setForeground(QColor("#ff6b6b"))
+        error_format.setForeground(QColor(self.color_value("error_word", "#FCA5A5")))
         self.highlighting_rules.append((re.compile(r"error", re.IGNORECASE), error_format))
 
         command_format = QTextCharFormat()
-        command_format.setForeground(QColor("#7dd3fc"))
-        self.highlighting_rules.append((re.compile(r"\b(cd|ls|pwd|mkdir|rm|cp|mv|grep|find|cat|echo|exit)\b"), command_format))
+        command_format.setForeground(QColor(self.color_value("command", "#7DD3FC")))
+        self.highlighting_rules.append((re.compile(r"\b(cd|ls|pwd|mkdir|rm|cp|mv|grep|find|cat|echo|exit|git|python|pip|ollama)\b"), command_format))
 
         path_format = QTextCharFormat()
-        path_format.setForeground(QColor("#86efac"))
+        path_format.setForeground(QColor(self.color_value("path", "#86EFAC")))
         self.highlighting_rules.append((re.compile(r"[\w\-\_/\.]+[/\\]"), path_format))
 
         number_format = QTextCharFormat()
-        number_format.setForeground(QColor("#c084fc"))
+        number_format.setForeground(QColor(self.color_value("number", "#C084FC")))
         self.highlighting_rules.append((re.compile(r"\b\d+\b"), number_format))
+
+    def set_terminal_colors(self, colors):
+        self.colors = dict(colors or {})
+        self.rebuild_rules()
+        self.rehighlight()
 
     def highlightBlock(self, text):
         for pattern, fmt in self.highlighting_rules:
@@ -99,7 +112,7 @@ class TerminalTab(QWidget):
         self.output_area.customContextMenuRequested.connect(self.show_terminal_context_menu)
         layout.addWidget(self.output_area)
 
-        self.highlighter = TerminalHighlighter(self.output_area.document())
+        self.highlighter = TerminalHighlighter(self.output_area.document(), self.window.terminal_colors())
 
         self.input_line = QPlainTextEdit()
         self.input_line.setMaximumHeight(110)
@@ -371,9 +384,9 @@ class TerminalTab(QWidget):
     def handle_stderr(self):
         data = self._decode_process_output(self.process.readAllStandardError())
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.setTextColor(Qt.GlobalColor.red)
+        self.output_area.setTextColor(QColor(self.window.terminal_color("stderr", "#FCA5A5")))
         self.output_area.insertPlainText(data)
-        self.output_area.setTextColor(QColor(self.window.active_theme().get("foreground", "#d4d4d4")))
+        self.output_area.setTextColor(QColor(self.window.terminal_color("stdout", "#FFFFFF")))
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.ensureCursorVisible()
 
@@ -393,6 +406,10 @@ class TerminalTab(QWidget):
         foreground = self.window.normalize_hex_color(theme.get("foreground"), "#FFFFFF")
         input_background = self.window.normalize_hex_color(theme.get("input_background"), background)
         accent = self.window.normalize_hex_color(theme.get("accent"), "#339CFF")
+        terminal_colors = self.window.terminal_colors()
+        stdout_color = self.window.normalize_hex_color(terminal_colors.get("stdout"), foreground)
+        input_text_color = self.window.normalize_hex_color(terminal_colors.get("input_text"), foreground)
+        selection_color = self.window.normalize_hex_color(terminal_colors.get("selection"), "#2D5F93")
         try:
             background_opacity = max(0, min(100, int(theme.get("background_opacity", 100))))
         except (TypeError, ValueError):
@@ -416,25 +433,26 @@ class TerminalTab(QWidget):
         self.output_area.setStyleSheet(
             "QTextEdit {"
             f" background-color: {background_rgba};"
-            f" color: {foreground};"
+            f" color: {stdout_color};"
             f" border: {border_width}px solid {border_color};"
             f" border-radius: {radius}px;"
             " padding: 8px;"
-            " selection-background-color: #2D5F93;"
+            f" selection-background-color: {selection_color};"
             "}"
             "QTextEdit:focus {"
             f" border: {border_width}px solid {accent};"
             "}"
         )
-        self.output_area.setTextColor(QColor(foreground))
+        self.output_area.setTextColor(QColor(stdout_color))
+        self.highlighter.set_terminal_colors(terminal_colors)
         self.input_line.setStyleSheet(
             "QPlainTextEdit {"
             f" background-color: {input_background_rgba};"
-            f" color: {foreground};"
+            f" color: {input_text_color};"
             f" border: {border_width}px solid {input_border_color};"
             f" border-radius: {radius}px;"
             " padding: 6px;"
-            " selection-background-color: #2D5F93;"
+            f" selection-background-color: {selection_color};"
             "}"
             "QPlainTextEdit:focus {"
             f" border: {border_width}px solid {accent};"
@@ -1045,6 +1063,16 @@ class TerminalWindow(QMainWindow):
                 "background": "#FFFFFF",
                 "foreground": "#1A1C1F",
                 "input_background": "#F3F3F3",
+                "terminal_colors": {
+                    "stdout": "#1A1C1F",
+                    "stderr": "#B42318",
+                    "input_text": "#1A1C1F",
+                    "command": "#2563EB",
+                    "path": "#15803D",
+                    "number": "#7C3AED",
+                    "error_word": "#B42318",
+                    "selection": "#BBD7FF",
+                },
                 "background_opacity": 100,
                 "contrast": 45,
                 "transparent_sidebar": True,
@@ -1056,6 +1084,16 @@ class TerminalWindow(QMainWindow):
                 "background": "#181818",
                 "foreground": "#FFFFFF",
                 "input_background": "#202020",
+                "terminal_colors": {
+                    "stdout": "#FFFFFF",
+                    "stderr": "#FCA5A5",
+                    "input_text": "#FFFFFF",
+                    "command": "#7DD3FC",
+                    "path": "#86EFAC",
+                    "number": "#C084FC",
+                    "error_word": "#FCA5A5",
+                    "selection": "#2D5F93",
+                },
                 "background_opacity": 100,
                 "contrast": 60,
                 "transparent_sidebar": True,
@@ -1077,6 +1115,10 @@ class TerminalWindow(QMainWindow):
                 merged[mode]["background"] = self.normalize_hex_color(merged[mode].get("background"), merged[mode]["background"])
                 merged[mode]["foreground"] = self.normalize_hex_color(merged[mode].get("foreground"), merged[mode]["foreground"])
                 merged[mode]["input_background"] = self.normalize_hex_color(merged[mode].get("input_background"), merged[mode]["input_background"])
+                merged[mode]["terminal_colors"] = self.merge_terminal_colors(
+                    merged[mode].get("terminal_colors"),
+                    self.default_theme_config()[mode].get("terminal_colors", {}),
+                )
                 try:
                     merged[mode]["background_opacity"] = max(0, min(100, int(merged[mode].get("background_opacity", 100))))
                 except (TypeError, ValueError):
@@ -1121,6 +1163,32 @@ class TerminalWindow(QMainWindow):
     def active_theme(self):
         key = self.current_theme_key()
         return self.theme_config.get(key, self.default_theme_config()[key])
+
+    def default_terminal_colors(self):
+        return self.default_theme_config()[self.current_theme_key()].get("terminal_colors", {}).copy()
+
+    def merge_terminal_colors(self, loaded_colors, defaults=None):
+        merged = dict(defaults or {
+            "stdout": "#FFFFFF",
+            "stderr": "#FCA5A5",
+            "input_text": "#FFFFFF",
+            "command": "#7DD3FC",
+            "path": "#86EFAC",
+            "number": "#C084FC",
+            "error_word": "#FCA5A5",
+            "selection": "#2D5F93",
+        })
+        if isinstance(loaded_colors, dict):
+            for key in list(merged.keys()):
+                merged[key] = self.normalize_hex_color(loaded_colors.get(key), merged[key])
+        return merged
+
+    def terminal_colors(self):
+        theme = self.active_theme()
+        return self.merge_terminal_colors(theme.get("terminal_colors"), self.default_terminal_colors())
+
+    def terminal_color(self, key, fallback):
+        return self.normalize_hex_color(self.terminal_colors().get(key), fallback)
 
     def load_settings(self):
         if not self.settings_file.exists():
@@ -1403,6 +1471,38 @@ class TerminalWindow(QMainWindow):
         foreground_button = make_color_row("Vordergrund", "foreground")
         input_button = make_color_row("Eingabefeld", "input_background")
 
+        terminal_color_buttons = {}
+
+        def make_terminal_color_row(label, key):
+            button = QPushButton(dialog)
+
+            def choose_color():
+                theme_key = selected_theme_key()
+                terminal_colors = self.theme_config[theme_key].setdefault(
+                    "terminal_colors",
+                    self.default_theme_config()[theme_key].get("terminal_colors", {}).copy(),
+                )
+                current = QColor(terminal_colors.get(key, "#FFFFFF"))
+                color = QColorDialog.getColor(current, self, label)
+                if color.isValid():
+                    terminal_colors[key] = color.name().upper()
+                    refresh_controls_from_theme()
+                    self.apply_color_scheme()
+
+            button.clicked.connect(choose_color)
+            layout.addRow(f"{label}:", button)
+            terminal_color_buttons[key] = button
+            return button
+
+        make_terminal_color_row("Standardausgabe", "stdout")
+        make_terminal_color_row("Fehlerausgabe", "stderr")
+        make_terminal_color_row("Eingabetext", "input_text")
+        make_terminal_color_row("Befehle", "command")
+        make_terminal_color_row("Pfade", "path")
+        make_terminal_color_row("Zahlen", "number")
+        make_terminal_color_row("Fehler-Wörter", "error_word")
+        make_terminal_color_row("Auswahl-Markierung", "selection")
+
         contrast_row = QWidget(dialog)
         contrast_layout = QHBoxLayout(contrast_row)
         contrast_layout.setContentsMargins(0, 0, 0, 0)
@@ -1458,6 +1558,12 @@ class TerminalWindow(QMainWindow):
             update_button_style(background_button, self.normalize_hex_color(theme.get("background"), "#181818"))
             update_button_style(foreground_button, self.normalize_hex_color(theme.get("foreground"), "#FFFFFF"))
             update_button_style(input_button, self.normalize_hex_color(theme.get("input_background"), "#202020"))
+            terminal_colors = self.merge_terminal_colors(
+                theme.get("terminal_colors"),
+                self.default_theme_config()[selected_theme_key()].get("terminal_colors", {}),
+            )
+            for key, button in terminal_color_buttons.items():
+                update_button_style(button, terminal_colors.get(key, "#FFFFFF"))
             contrast_slider.blockSignals(True)
             background_opacity_slider.blockSignals(True)
             transparent_check.blockSignals(True)
@@ -1573,7 +1679,7 @@ class TerminalWindow(QMainWindow):
 - Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
 - Tab-Namen, Shell-Typen, Arbeitsordner je Tab und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
 - Gemeinsame Befehlshistorie für alle Tabs.
-- Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz und Hintergrund-Deckkraft.
+- Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
 
 Datei-Menü
@@ -1593,7 +1699,7 @@ Pfade-Menü
 Einstellungen-Menü
 - Schriftart: setzt die Terminal-Schrift für alle Tabs.
 - Farbschema: wechselt zwischen Dunkel, Hell und Hoher Kontrast.
-- Design anpassen: bearbeitet Akzent, Hintergrund, Textfarbe, Eingabefeld, Kontrast, Hintergrund-Deckkraft und Fenster-Transparenz.
+- Design anpassen: bearbeitet Akzent, Hintergrund, Textfarbe, Eingabefeld, Terminal-Farben, Kontrast, Hintergrund-Deckkraft und Fenster-Transparenz.
 - Design auf Standard zurücksetzen: stellt die Standardfarben wieder her.
 - Standardbefehl: Befehl, der beim Start eines neuen Tabs automatisch ausgeführt wird.
 - History-Größe: maximale Anzahl gespeicherter Befehle.
