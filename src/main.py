@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
 from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
+from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
@@ -30,7 +31,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 
 def install_crash_logging():
@@ -106,14 +107,11 @@ class OllamaApiWorker(QThread):
         self.context = context if isinstance(context, list) else []
 
     def run(self):
-        payload = {
-            "model": self.model,
-            "prompt": self.prompt,
-            "stream": False,
-        }
-        if self.context:
-            payload["context"] = self.context
-
+        payload = build_generate_payload(
+            self.model,
+            self.prompt,
+            context=self.context,
+        )
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             "http://127.0.0.1:11434/api/generate",
@@ -125,21 +123,10 @@ class OllamaApiWorker(QThread):
         try:
             with urllib.request.urlopen(request, timeout=180) as response:
                 raw = response.read().decode("utf-8", errors="replace")
-            result = json.loads(raw)
-            if "error" in result:
-                self.error_ready.emit(str(result.get("error") or "Unbekannter Ollama-Fehler"))
-                return
-            answer = str(result.get("response", "") or "")
-            context = result.get("context")
-            self.response_ready.emit(answer, context if isinstance(context, list) else None)
-        except urllib.error.URLError as exc:
-            self.error_ready.emit(
-                "Ollama ist nicht erreichbar. Prüfe, ob Ollama läuft "
-                "(normalerweise http://127.0.0.1:11434). Details: "
-                f"{exc}"
-            )
+            answer, context = extract_generate_response(raw)
+            self.response_ready.emit(answer, context)
         except Exception as exc:
-            self.error_ready.emit(f"Ollama-API-Fehler: {exc}")
+            self.error_ready.emit(ollama_api_error_message(exc))
 
 
 class TerminalTab(QWidget):
@@ -1652,10 +1639,10 @@ class TerminalWindow(QMainWindow):
 
         self.rebuild_saved_paths_menu()
         self.save_settings()
+        current_tab = self.current_terminal()
+        if isinstance(current_tab, TerminalTab):
+            current_tab.input_line.setFocus()
         self.show_status(f"Workspace geladen: {workspace.get('name', '')}")
-
-        tab.input_line.setFocus()
-        self.show_status(f"Profil geöffnet: {profile.get('name', title)}")
 
 
     def _normalize_saved_path_item(self, name, path):
@@ -2900,27 +2887,7 @@ class TerminalWindow(QMainWindow):
             self.save_settings()
 
     def ollama_models(self):
-        executable = shutil.which("ollama")
-        if not executable:
-            return []
-        try:
-            result = subprocess.run(
-                [executable, "list"],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except Exception:
-            return []
-        output = result.stdout or ""
-        models = []
-        for line in output.splitlines()[1:]:
-            parts = line.split()
-            if parts:
-                models.append(parts[0])
-        return models
+        return list_ollama_models()
 
     def choose_ollama_model(self):
         models = self.ollama_models()
@@ -3037,14 +3004,15 @@ class TerminalWindow(QMainWindow):
 - Mehrere Terminal-Tabs mit eigenem Shell-Prozess je Tab.
 - Schnellstart-Menü für neue Tabs mit bestimmtem Backend.
 - Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
-- Tab-Namen, Shell-Typen, Arbeitsordner je Tab und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
+- Tab-Namen, Shell-Typen, Arbeitsordner je Tab, Profile, Workspaces und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
 - Gemeinsame Befehlshistorie für alle Tabs.
 - Ollama-API-Modus sowie direkte Client-Prozesse für Python, Node.js und SQL-Clients.
 - Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
 - Ausgabe kann als Markdown oder Text gespeichert und ohne Steuerzeichen kopiert werden.
-- Befehlspalette mit Suchfeld für Tabs, Backends, Pfade, Profile, KI, Ausgabe und Suche.
+- Befehlspalette mit Suchfeld für Tabs, Backends, Pfade, Profile, Workspaces, KI, Ausgabe und Suche.
 - Tab-Profile speichern Backend, Titel, Arbeitsordner, optionalen Startbefehl und Ollama-Modell.
+- Workspaces speichern die komplette Tab-Zusammenstellung mit Backends, Titeln, Arbeitsordnern und Standardordner.
 
 Datei-Menü
 - Neuer Tab: öffnet einen neuen Terminal-Tab.
@@ -3058,14 +3026,29 @@ Pfade-Menü
 - Aktuellen Ordner speichern: speichert den zuletzt erkannten Arbeitsordner des aktuellen Tabs.
 - Ordnerpfad manuell speichern: wählt oder tippt einen Ordnerpfad und speichert ihn unter einem Namen.
 - Gespeicherten Pfad löschen: entfernt einen gespeicherten Schnellzugriff.
-- Gespeicherte Pfade: führen im aktuellen Tab automatisch cd "..." aus.
+- Standardordner für neue Tabs zurücksetzen: entfernt den festen Startordner für neue Tabs.
+- Gespeicherte Pfade können im aktuellen Tab, in einem neuen Tab oder in einem neuen Tab mit bestimmtem Backend geöffnet werden.
 - Windows-Pfade werden für WSL und Git Bash möglichst passend umgewandelt.
 
 Profile-Menü
 - Aktuellen Tab als Profil speichern: speichert Backend, Tab-Name, Arbeitsordner und optionalen Startbefehl.
-- Profil in neuem Tab öffnen: startet ein gespeichertes Profil.
+- Profil in neuem Tab öffnen: startet ein gespeichertes Profil in einem neuen Tab.
 - Profil löschen: entfernt gespeicherte Profile.
 - Ollama-Tabs merken zusätzlich das verwendete Modell.
+- Profile eignen sich für wiederkehrende Einzeltabs wie Projekt-Terminal, Python-REPL oder Ollama-Chat.
+
+Workspaces-Menü
+- Aktuellen Workspace speichern: speichert die aktuelle Tab-Zusammenstellung.
+- Workspace laden: ersetzt die aktuellen Tabs durch einen gespeicherten Workspace.
+- Workspace löschen: entfernt einen gespeicherten Workspace.
+- Gespeichert werden Tab-Titel, Shell-Backend, Arbeitsordner, Standardordner und ausgewähltes Ollama-Modell.
+- Workspaces eignen sich für komplette Arbeitsumgebungen, zum Beispiel Terminal-Projekt, Visual Edit und Ollama nebeneinander.
+
+KI-Menü
+- Neuer Ollama-Chat: startet einen neuen Ollama-API-Tab mit ausgewähltem Modell.
+- Ollama-Modell wählen: liest verfügbare Modelle über ollama list aus und merkt das bevorzugte Modell.
+- Ollama-Gespräch löschen: leert den Kontext des aktuellen Ollama-Tabs.
+- Aktuelle Ausgabe speichern: speichert die sichtbare Ausgabe des aktuellen Tabs.
 
 Einstellungen-Menü
 - Schriftart: setzt die Terminal-Schrift für alle Tabs.
@@ -3084,10 +3067,15 @@ Interaktiver Client-Modus
 - /bye, exit, quit oder Ctrl+C verlassen den Client-Modus.
 - Normale Befehlsfunktionen wie Semikolon-Aufteilung und cls/clear werden im Client-Modus bewusst nicht angewendet.
 
+Befehlspalette
+- Ctrl+Shift+P öffnet die Befehlspalette.
+- Aktionen lassen sich per Suchtext filtern, zum Beispiel Tab, Backend, Pfad, Profil, Workspace, Ollama oder Suche.
+- Profile und Workspaces erscheinen ebenfalls als Aktionen, sofern welche gespeichert sind.
+
 Kontextmenüs
 - Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 - Rechtsklick im Ausgabefeld: Kopieren, Kopieren ohne Steuerzeichen, Alles kopieren, Ausgabe speichern, Ausgabe als Markdown/Text speichern, Ausgabe leeren, Suchen, nächster/vorheriger Treffer, Befehlspalette, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
-- Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
+- Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, Tab duplizieren, Tab umbenennen, Befehlspalette, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 
 Tastenkürzel
 - F1: Hilfe öffnen.
@@ -3105,6 +3093,12 @@ Tastenkürzel
 - Ctrl+Enter: neue Zeile im Eingabefeld einfügen.
 - Pfeil hoch: vorherigen Befehl aus der History laden, Cursor ans Ende setzen.
 - Pfeil runter: nächsten Befehl aus der History laden, Cursor ans Ende setzen.
+
+Modulare Dateien
+- src/main.py enthält aktuell noch die Hauptoberfläche und Terminal-Logik.
+- src/shelldeck_profiles.py enthält die Datenlogik für Tab-Profile.
+- src/shelldeck_workspaces.py enthält die Datenlogik für Workspaces.
+- Weitere Auslagerungen sollten schrittweise erfolgen, nicht als großer Komplettumbau.
 
 Hinweise
 - Die App ist eine eigene Terminal-Oberfläche. Die Ausführung der Befehle erfolgt über das gewählte Shell-Backend.
@@ -3139,10 +3133,13 @@ Hinweise
         label = QLabel(
             f"<h2>{APP_NAME}</h2>"
             f"<p><b>Version:</b> {APP_VERSION}</p>"
-            "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends "
-            "gespeicherten Ordnerpfaden, Tab-Profilen, Befehlspalette und interaktivem Client-Modus.</p>"
+            "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends, "
+            "gespeicherten Ordnerpfaden, Tab-Profilen, Workspaces, Befehlspalette "
+            "und interaktivem Client-Modus.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
-            "jeweils ausgewählte Shell-Backend ausgeführt.</p>",
+            "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
+            "<p>Modulare Helferdateien: shelldeck_profiles.py und "
+            "shelldeck_workspaces.py.</p>",
             dialog,
         )
         label.setWordWrap(True)
