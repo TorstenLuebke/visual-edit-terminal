@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 
 def install_crash_logging():
@@ -234,13 +234,30 @@ class TerminalTab(QWidget):
             copy_all_action.triggered.connect(self.copy_all_output)
             menu.addAction(copy_all_action)
 
+            copy_plain_action = QAction("Kopieren ohne Steuerzeichen", self)
+            copy_plain_action.setEnabled(bool(self.output_area.textCursor().hasSelection()))
+            copy_plain_action.triggered.connect(self.copy_output_plain_text)
+            menu.addAction(copy_plain_action)
+
+            copy_all_plain_action = QAction("Alles kopieren ohne Steuerzeichen", self)
+            copy_all_plain_action.triggered.connect(self.copy_all_output_plain_text)
+            menu.addAction(copy_all_plain_action)
+
             clear_action = QAction("Ausgabe leeren", self)
             clear_action.triggered.connect(self.output_area.clear)
             menu.addAction(clear_action)
 
-            save_output_action = QAction("Ausgabe speichern", self)
+            save_output_action = QAction("Ausgabe speichern...", self)
             save_output_action.triggered.connect(self.window.save_current_output)
             menu.addAction(save_output_action)
+
+            save_markdown_action = QAction("Ausgabe als Markdown speichern", self)
+            save_markdown_action.triggered.connect(lambda: self.window.save_current_output("md"))
+            menu.addAction(save_markdown_action)
+
+            save_text_action = QAction("Ausgabe als Text speichern", self)
+            save_text_action.triggered.connect(lambda: self.window.save_current_output("txt"))
+            menu.addAction(save_text_action)
 
             search_action = QAction("Suchen", self)
             search_action.setShortcut("Ctrl+F")
@@ -348,9 +365,32 @@ class TerminalTab(QWidget):
         else:
             self.window.statusBar().showMessage(f"Nicht gefunden: {query}")
 
+    def selected_output_text(self):
+        cursor = self.output_area.textCursor()
+        return cursor.selectedText().replace("\u2029", "\n") if cursor.hasSelection() else ""
+
+    def output_text_for_copy(self, selected_only=False):
+        if selected_only:
+            return self.selected_output_text()
+        return self.output_area.toPlainText()
+
     def copy_all_output(self):
         self.output_area.selectAll()
         self.output_area.copy()
+
+    def copy_output_plain_text(self):
+        text = self.output_text_for_copy(selected_only=True)
+        if not text:
+            return
+        QApplication.clipboard().setText(self.window.clean_output_text(text))
+        self.window.show_status("Auswahl ohne Steuerzeichen kopiert")
+
+    def copy_all_output_plain_text(self):
+        text = self.output_text_for_copy(selected_only=False)
+        if not text:
+            return
+        QApplication.clipboard().setText(self.window.clean_output_text(text))
+        self.window.show_status("Ausgabe ohne Steuerzeichen kopiert")
 
     def run_text_command(self, command):
         self.input_line.setPlainText(command)
@@ -2541,31 +2581,59 @@ class TerminalWindow(QMainWindow):
             tab.output_area.clear()
             self.statusBar().showMessage("Ausgabe gelöscht")
 
-    def save_current_output(self):
+    def show_status(self, message, timeout=5000):
+        self.statusBar().showMessage(str(message or ""), timeout)
+
+    def clean_output_text(self, text):
+        value = str(text or "")
+        value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+        value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+        return value.replace("\r\n", "\n").replace("\r", "\n")
+
+    def current_output_text(self, clean=False):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return ""
+        text = tab.output_area.toPlainText()
+        return self.clean_output_text(text) if clean else text
+
+    def save_current_output(self, forced_format=None):
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab):
             return
-        text = tab.output_area.toPlainText()
+        text = self.current_output_text(clean=True)
         if not text.strip():
-            self.statusBar().showMessage("Keine Ausgabe zum Speichern vorhanden")
+            self.show_status("Keine Ausgabe zum Speichern vorhanden")
             return
-        default_name = "shelldeck_output.md"
+
+        forced = str(forced_format or "").lower().strip()
+        default_suffix = ".md" if forced != "txt" else ".txt"
+        default_name = f"shelldeck_output{default_suffix}"
         if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
             safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", tab.ollama_model)
-            default_name = f"ollama_{safe_model}.md"
+            default_name = f"ollama_{safe_model}{default_suffix}"
+
+        if forced == "md":
+            file_filter = "Markdown (*.md);;Textdateien (*.txt);;Alle Dateien (*)"
+        elif forced == "txt":
+            file_filter = "Textdateien (*.txt);;Markdown (*.md);;Alle Dateien (*)"
+        else:
+            file_filter = "Markdown (*.md);;Textdateien (*.txt);;Alle Dateien (*)"
+
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Aktuelle Ausgabe speichern",
             str(Path.cwd() / default_name),
-            "Markdown (*.md);;Textdateien (*.txt);;Alle Dateien (*)",
+            file_filter,
         )
         if not path:
             return
+
         try:
-            Path(path).write_text(text, encoding="utf-8")
-            self.statusBar().showMessage(f"Ausgabe gespeichert: {path}")
+            Path(path).write_text(text, encoding="utf-8", newline="\n")
+            self.show_status(f"Ausgabe gespeichert: {path}")
         except OSError as exc:
-            self.statusBar().showMessage(f"Ausgabe konnte nicht gespeichert werden: {exc}")
+            self.show_status(f"Ausgabe konnte nicht gespeichert werden: {exc}")
 
     def help_text(self):
         return f"""{APP_NAME} {APP_VERSION}
@@ -2579,6 +2647,7 @@ class TerminalWindow(QMainWindow):
 - Ollama-API-Modus sowie direkte Client-Prozesse für Python, Node.js und SQL-Clients.
 - Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
+- Ausgabe kann als Markdown oder Text gespeichert und ohne Steuerzeichen kopiert werden.
 
 Datei-Menü
 - Neuer Tab: öffnet einen neuen Terminal-Tab.
@@ -2614,7 +2683,7 @@ Interaktiver Client-Modus
 
 Kontextmenüs
 - Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
-- Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Ausgabe speichern, Ausgabe leeren, Suchen, nächster/vorheriger Treffer, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
+- Rechtsklick im Ausgabefeld: Kopieren, Kopieren ohne Steuerzeichen, Alles kopieren, Ausgabe speichern, Ausgabe als Markdown/Text speichern, Ausgabe leeren, Suchen, nächster/vorheriger Treffer, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 - Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 
 Tastenkürzel
