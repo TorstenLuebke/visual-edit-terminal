@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal
 from PySide6.QtGui import (
-    QTextCursor, QFont, QTextCharFormat, QColor, QSyntaxHighlighter,
+    QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor, QSyntaxHighlighter,
     QAction, QShortcut, QPalette
 )
 
@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 
 def install_crash_logging():
@@ -160,6 +160,7 @@ class TerminalTab(QWidget):
         self.direct_client_exit_command = "exit"
         self.direct_client_label = "Client"
         self.direct_client_start_error_reported = False
+        self.output_search_text = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -237,6 +238,27 @@ class TerminalTab(QWidget):
             clear_action.triggered.connect(self.output_area.clear)
             menu.addAction(clear_action)
 
+            save_output_action = QAction("Ausgabe speichern", self)
+            save_output_action.triggered.connect(self.window.save_current_output)
+            menu.addAction(save_output_action)
+
+            search_action = QAction("Suchen", self)
+            search_action.setShortcut("Ctrl+F")
+            search_action.triggered.connect(self.show_output_search_dialog)
+            menu.addAction(search_action)
+
+            find_next_action = QAction("Nächster Treffer", self)
+            find_next_action.setShortcut("F3")
+            find_next_action.setEnabled(bool(self.output_search_text))
+            find_next_action.triggered.connect(lambda: self.find_output_text(backward=False))
+            menu.addAction(find_next_action)
+
+            find_previous_action = QAction("Vorheriger Treffer", self)
+            find_previous_action.setShortcut("Shift+F3")
+            find_previous_action.setEnabled(bool(self.output_search_text))
+            find_previous_action.triggered.connect(lambda: self.find_output_text(backward=True))
+            menu.addAction(find_previous_action)
+
             menu.addSeparator()
 
         elif sender is self.input_line:
@@ -286,6 +308,45 @@ class TerminalTab(QWidget):
         menu.addAction(close_tab_action)
 
         menu.exec(sender.mapToGlobal(pos))
+
+    def show_output_search_dialog(self):
+        text, ok = QInputDialog.getText(
+            self,
+            "Ausgabe durchsuchen",
+            "Suchtext:",
+            text=self.output_search_text,
+        )
+        if ok and text:
+            self.output_search_text = text
+            self.find_output_text(backward=False, restart=True)
+
+    def find_output_text(self, backward=False, restart=False):
+        query = str(self.output_search_text or "")
+        if not query:
+            self.show_output_search_dialog()
+            return
+
+        flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
+        if restart:
+            cursor = self.output_area.textCursor()
+            cursor.movePosition(
+                QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start
+            )
+            self.output_area.setTextCursor(cursor)
+
+        if self.output_area.find(query, flags):
+            self.window.statusBar().showMessage(f"Treffer: {query}")
+            return
+
+        cursor = self.output_area.textCursor()
+        cursor.movePosition(
+            QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start
+        )
+        self.output_area.setTextCursor(cursor)
+        if self.output_area.find(query, flags):
+            self.window.statusBar().showMessage(f"Treffer nach Umbruch: {query}")
+        else:
+            self.window.statusBar().showMessage(f"Nicht gefunden: {query}")
 
     def copy_all_output(self):
         self.output_area.selectAll()
@@ -1159,6 +1220,15 @@ class TerminalWindow(QMainWindow):
         self.shortcut_stop = QShortcut("Ctrl+C", self)
         self.shortcut_stop.activated.connect(self.interrupt_current_command)
 
+        self.shortcut_search = QShortcut("Ctrl+F", self)
+        self.shortcut_search.activated.connect(self.search_current_output)
+
+        self.shortcut_find_next = QShortcut("F3", self)
+        self.shortcut_find_next.activated.connect(self.find_next_current_output)
+
+        self.shortcut_find_previous = QShortcut("Shift+F3", self)
+        self.shortcut_find_previous.activated.connect(self.find_previous_current_output)
+
     def new_tab(self, shell_type=None, title=None, start_directory=None):
         effective_start_directory = start_directory
         if effective_start_directory is None:
@@ -1432,6 +1502,21 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if tab is not None:
             self.statusBar().showMessage(f"Shell-Backend: {self.shell_backend_label(tab.shell_type)}")
+
+    def search_current_output(self):
+        tab = self.current_terminal()
+        if isinstance(tab, TerminalTab):
+            tab.show_output_search_dialog()
+
+    def find_next_current_output(self):
+        tab = self.current_terminal()
+        if isinstance(tab, TerminalTab):
+            tab.find_output_text(backward=False)
+
+    def find_previous_current_output(self):
+        tab = self.current_terminal()
+        if isinstance(tab, TerminalTab):
+            tab.find_output_text(backward=True)
 
     def stop_process(self):
         tab = self.current_terminal()
@@ -2529,7 +2614,7 @@ Interaktiver Client-Modus
 
 Kontextmenüs
 - Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
-- Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Ausgabe leeren, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
+- Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Ausgabe speichern, Ausgabe leeren, Suchen, nächster/vorheriger Treffer, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 - Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
 
 Tastenkürzel
@@ -2539,6 +2624,9 @@ Tastenkürzel
 - Ctrl+D: Aktuellen Tab duplizieren.
 - F2: Aktuellen Tab umbenennen.
 - Ctrl+Q: App beenden.
+- Ctrl+F: Ausgabe im aktuellen Tab durchsuchen.
+- F3: nächsten Suchtreffer anzeigen.
+- Shift+F3: vorherigen Suchtreffer anzeigen.
 - Ctrl+C: laufenden Befehl oder aktiven Client im aktuellen Tab unterbrechen.
 - Enter: Befehl ausführen oder Eingabe an aktiven Client senden.
 - Ctrl+Enter: neue Zeile im Eingabefeld einfügen.
