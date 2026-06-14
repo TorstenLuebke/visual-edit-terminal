@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 
 def install_crash_logging():
@@ -1037,6 +1037,7 @@ class TerminalWindow(QMainWindow):
         self.terminal_font = QFont("Courier New", 10)
         self.saved_tabs = []
         self.saved_paths = []
+        self.default_start_directory = ""
         self.selected_ollama_model = ""
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
@@ -1159,11 +1160,14 @@ class TerminalWindow(QMainWindow):
         self.shortcut_stop.activated.connect(self.interrupt_current_command)
 
     def new_tab(self, shell_type=None, title=None, start_directory=None):
+        effective_start_directory = start_directory
+        if effective_start_directory is None:
+            effective_start_directory = self.default_start_directory
         tab = TerminalTab(
             self,
             shell_type=shell_type or self.shell_type,
             custom_title=title,
-            start_directory=start_directory,
+            start_directory=effective_start_directory,
         )
         index = self.tab_widget.addTab(tab, tab.title or f"Terminal {self.tab_widget.count() + 1}")
         self.tab_widget.setCurrentIndex(index)
@@ -1199,7 +1203,18 @@ class TerminalWindow(QMainWindow):
         delete_action.setEnabled(bool(self.saved_paths))
         self.paths_menu.addAction(delete_action)
 
+        clear_default_action = QAction("Standardordner für neue Tabs zurücksetzen", self)
+        clear_default_action.triggered.connect(self.clear_default_start_directory)
+        clear_default_action.setEnabled(bool(self.default_start_directory))
+        self.paths_menu.addAction(clear_default_action)
+
         self.paths_menu.addSeparator()
+
+        if self.default_start_directory:
+            default_action = QAction(f"Standardordner: {self.default_start_directory}", self)
+            default_action.setEnabled(False)
+            self.paths_menu.addAction(default_action)
+            self.paths_menu.addSeparator()
 
         if not self.saved_paths:
             empty_action = QAction("Keine gespeicherten Pfade", self)
@@ -1212,10 +1227,39 @@ class TerminalWindow(QMainWindow):
             path = str(item.get("path", "") or "")
             if not path:
                 continue
-            action = QAction(name, self)
-            action.setToolTip(path)
-            action.triggered.connect(lambda checked=False, p=path: self.open_saved_path(p))
-            self.paths_menu.addAction(action)
+
+            submenu = self.paths_menu.addMenu(name)
+            submenu.setToolTipsVisible(True)
+            submenu.setToolTip(path)
+
+            current_action = QAction("Im aktuellen Tab öffnen", self)
+            current_action.setToolTip(path)
+            current_action.triggered.connect(lambda checked=False, p=path: self.open_saved_path(p))
+            submenu.addAction(current_action)
+
+            new_tab_action = QAction("In neuem Tab öffnen", self)
+            new_tab_action.setToolTip(path)
+            new_tab_action.triggered.connect(lambda checked=False, p=path: self.open_saved_path_in_new_tab(p))
+            submenu.addAction(new_tab_action)
+
+            backend_menu = submenu.addMenu("In neuem Tab mit Backend öffnen")
+            for backend in self.available_shell_backends():
+                shell_id = str(backend.get("id", "") or "")
+                label = str(backend.get("label", "") or self.shell_backend_label(shell_id))
+                icon = self.shell_backend_icon(shell_id)
+                action = QAction(f"{icon} {label}".strip(), self)
+                action.setToolTip(path)
+                action.triggered.connect(
+                    lambda checked=False, p=path, s=shell_id: self.open_saved_path_in_new_tab(p, shell_type=s)
+                )
+                backend_menu.addAction(action)
+
+            submenu.addSeparator()
+
+            default_action = QAction("Als Standardordner für neue Tabs setzen", self)
+            default_action.setToolTip(path)
+            default_action.triggered.connect(lambda checked=False, p=path: self.set_default_start_directory(p))
+            submenu.addAction(default_action)
 
     def _normalize_saved_path_item(self, name, path):
         clean_path = str(path or "").strip().strip('"')
@@ -1303,9 +1347,34 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab):
             tab = self.new_tab()
-        shell_path = self.path_for_shell(path, tab.shell_type)
         tab.current_working_directory = str(path).strip().strip('"') or tab.current_working_directory
         tab.run_text_command(self.cd_command_for_path(path, tab.shell_type))
+
+    def open_saved_path_in_new_tab(self, path, shell_type=None):
+        clean_path = str(path or "").strip().strip('"')
+        tab = self.new_tab(
+            shell_type=shell_type or self.shell_type,
+            title=Path(clean_path).name or clean_path or None,
+            start_directory=clean_path,
+        )
+        if isinstance(tab, TerminalTab):
+            tab.current_working_directory = clean_path or tab.current_working_directory
+            tab.input_line.setFocus()
+
+    def set_default_start_directory(self, path):
+        clean_path = str(path or "").strip().strip('"')
+        if not clean_path:
+            return
+        self.default_start_directory = clean_path
+        self.rebuild_saved_paths_menu()
+        self.save_settings()
+        self.statusBar().showMessage(f"Standardordner für neue Tabs gesetzt: {clean_path}")
+
+    def clear_default_start_directory(self):
+        self.default_start_directory = ""
+        self.rebuild_saved_paths_menu()
+        self.save_settings()
+        self.statusBar().showMessage("Standardordner für neue Tabs zurückgesetzt")
 
     def update_current_tab_directory(self):
         tab = self.current_terminal()
@@ -1878,6 +1947,7 @@ class TerminalWindow(QMainWindow):
             if isinstance(item, dict) and str(item.get("path", "")).strip()
         ] if isinstance(saved_paths, list) else []
 
+        self.default_start_directory = str(settings.get("default_start_directory", self.default_start_directory or "") or "")
         self.selected_ollama_model = str(settings.get("selected_ollama_model", self.selected_ollama_model or "") or "")
 
     def save_settings(self):
@@ -1892,6 +1962,7 @@ class TerminalWindow(QMainWindow):
             "shell_type": self.shell_type,
             "tabs": self.collect_tab_settings(),
             "saved_paths": self.saved_paths,
+            "default_start_directory": self.default_start_directory,
             "selected_ollama_model": self.selected_ollama_model,
         }
 
