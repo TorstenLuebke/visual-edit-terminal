@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.11.0"
 
 
 def install_crash_logging():
@@ -137,7 +137,7 @@ class OllamaApiWorker(QThread):
 
 
 class TerminalTab(QWidget):
-    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None):
+    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None):
         super().__init__(window)
         self.window = window
         self.shell_type = shell_type or window.shell_type
@@ -147,6 +147,7 @@ class TerminalTab(QWidget):
         self.title = title
         self.history_index = -1
         self.current_command = ""
+        self.command_history = self.normalize_command_history(command_history)
         self.client_mode_active = False
         self.client_mode_name = ""
         self.client_mode_kind = ""
@@ -563,25 +564,63 @@ class TerminalTab(QWidget):
                 return True
         return super().eventFilter(source, event)
 
+    def normalize_command_history(self, history):
+        if not isinstance(history, list):
+            return []
+        result = []
+        for item in history:
+            text = str(item or "").strip()
+            if text and (not result or result[-1] != text):
+                result.append(text)
+        return result[-max(1, int(getattr(self.window, "max_history_size", 1000))):]
+
+    def tab_history(self):
+        return self.command_history
+
+    def command_history_text(self, command):
+        text = str(command or "").strip()
+        marker = "\n\n---\nAngehängte Datei als Kontext:"
+        if marker in text:
+            text = text.split(marker, 1)[0].strip() or "[Prompt mit angehängter Datei]"
+        if len(text) > 2000:
+            text = text[:2000].rstrip() + " …"
+        return text
+
+    def add_command_history(self, command):
+        text = self.command_history_text(command)
+        if not text:
+            return
+        if not self.command_history or self.command_history[-1] != text:
+            self.command_history.append(text)
+        limit = max(1, int(getattr(self.window, "max_history_size", 1000)))
+        self.command_history = self.command_history[-limit:]
+        if text and (not self.window.history or self.window.history[-1] != text):
+            self.window.history.append(text)
+            self.window.history = self.window.history[-limit:]
+            self.window.save_history()
+        self.window.save_settings()
+
     def show_previous_command(self):
-        if not self.window.history:
+        history = self.tab_history()
+        if not history:
             return
         if self.history_index == -1:
             self.current_command = self.input_line.toPlainText()
-            self.history_index = len(self.window.history) - 1
+            self.history_index = len(history) - 1
         elif self.history_index > 0:
             self.history_index -= 1
-        self.input_line.setPlainText(self.window.history[self.history_index])
+        self.input_line.setPlainText(history[self.history_index])
         self.input_line.moveCursor(QTextCursor.MoveOperation.End)
 
     def show_next_command(self):
-        if not self.window.history:
+        history = self.tab_history()
+        if not history:
             return
-        if self.history_index < len(self.window.history) - 1:
+        if self.history_index < len(history) - 1:
             self.history_index += 1
-            self.input_line.setPlainText(self.window.history[self.history_index])
+            self.input_line.setPlainText(history[self.history_index])
             self.input_line.moveCursor(QTextCursor.MoveOperation.End)
-        elif self.history_index == len(self.window.history) - 1:
+        elif self.history_index == len(history) - 1:
             self.history_index = -1
             self.input_line.setPlainText(self.current_command)
             self.input_line.moveCursor(QTextCursor.MoveOperation.End)
@@ -754,9 +793,7 @@ class TerminalTab(QWidget):
             self.input_line.clear()
             return
 
-        if payload and (not self.window.history or self.window.history[-1] != payload):
-            self.window.history.append(payload)
-            self.window.save_history()
+        self.add_command_history(payload)
         self.history_index = -1
         self.current_command = ""
         self.client_process.write(payload.encode() + b"\n")
@@ -837,9 +874,7 @@ class TerminalTab(QWidget):
         if self.ollama_worker is not None and self.ollama_worker.isRunning():
             self.output_area.append("\n[Ollama verarbeitet noch eine Anfrage. Bitte kurz warten.]\n")
             return
-        if prompt and (not self.window.history or self.window.history[-1] != prompt):
-            self.window.history.append(prompt)
-            self.window.save_history()
+        self.add_command_history(prompt)
         self.history_index = -1
         self.current_command = ""
         self.output_area.append(f"\nDu → {prompt}\n")
@@ -1047,9 +1082,7 @@ class TerminalTab(QWidget):
             self.set_client_mode(False)
             return
 
-        if payload and (not self.window.history or self.window.history[-1] != payload):
-            self.window.history.append(payload)
-            self.window.save_history()
+        self.add_command_history(payload)
 
         self.history_index = -1
         self.current_command = ""
@@ -1075,9 +1108,7 @@ class TerminalTab(QWidget):
             return
 
         history_entry = command_text
-        if history_entry and (not self.window.history or self.window.history[-1] != history_entry):
-            self.window.history.append(history_entry)
-        self.window.save_history()
+        self.add_command_history(history_entry)
         self.history_index = -1
         self.current_command = ""
 
@@ -1235,6 +1266,7 @@ class TerminalWindow(QMainWindow):
         self.workspaces = []
         self.default_start_directory = ""
         self.selected_ollama_model = ""
+        self.ai_features_enabled = False
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
         self.load_history()
@@ -1311,39 +1343,47 @@ class TerminalWindow(QMainWindow):
         shell_action.triggered.connect(self.select_shell)
         settings_menu.addAction(shell_action)
 
-        ai_menu = menubar.addMenu("&KI")
+        settings_menu.addSeparator()
+
+        self.ai_features_action = QAction("KI-Menü / Ollama aktivieren", self)
+        self.ai_features_action.setCheckable(True)
+        self.ai_features_action.setChecked(False)
+        self.ai_features_action.triggered.connect(self.set_ai_features_enabled)
+        settings_menu.addAction(self.ai_features_action)
+
+        self.ai_menu = menubar.addMenu("&KI")
 
         new_ollama_tab_action = QAction("Neuer Ollama-Chat", self)
         new_ollama_tab_action.triggered.connect(self.new_ollama_chat_tab)
-        ai_menu.addAction(new_ollama_tab_action)
+        self.ai_menu.addAction(new_ollama_tab_action)
 
         select_ollama_model_action = QAction("Ollama-Modell wählen", self)
         select_ollama_model_action.triggered.connect(self.select_ollama_model)
-        ai_menu.addAction(select_ollama_model_action)
+        self.ai_menu.addAction(select_ollama_model_action)
 
         clear_ollama_chat_action = QAction("Ollama-Gespräch löschen", self)
         clear_ollama_chat_action.triggered.connect(self.clear_current_ollama_chat)
-        ai_menu.addAction(clear_ollama_chat_action)
+        self.ai_menu.addAction(clear_ollama_chat_action)
 
         clear_ollama_context_action = QAction("Ollama-Kontext löschen", self)
         clear_ollama_context_action.triggered.connect(self.clear_current_ollama_context)
-        ai_menu.addAction(clear_ollama_context_action)
+        self.ai_menu.addAction(clear_ollama_context_action)
 
         system_prompt_action = QAction("Ollama-Systemprompt setzen", self)
         system_prompt_action.triggered.connect(self.set_current_ollama_system_prompt)
-        ai_menu.addAction(system_prompt_action)
+        self.ai_menu.addAction(system_prompt_action)
 
         stop_ollama_action = QAction("Ollama-Antwort stoppen", self)
         stop_ollama_action.triggered.connect(self.stop_current_ollama_response)
-        ai_menu.addAction(stop_ollama_action)
+        self.ai_menu.addAction(stop_ollama_action)
 
         save_ollama_markdown_action = QAction("Ollama-Chat als Markdown speichern", self)
         save_ollama_markdown_action.triggered.connect(self.save_current_ollama_chat_markdown)
-        ai_menu.addAction(save_ollama_markdown_action)
+        self.ai_menu.addAction(save_ollama_markdown_action)
 
         save_chat_action = QAction("Aktuelle Ausgabe speichern", self)
         save_chat_action.triggered.connect(self.save_current_output)
-        ai_menu.addAction(save_chat_action)
+        self.ai_menu.addAction(save_chat_action)
 
         help_menu = menubar.addMenu("&Hilfe")
 
@@ -1372,6 +1412,7 @@ class TerminalWindow(QMainWindow):
         layout.addWidget(self.tab_widget)
 
         self.load_settings()
+        self.update_ai_menu_visibility()
         self.rebuild_saved_paths_menu()
         self.rebuild_profiles_menu()
         self.rebuild_workspaces_menu()
@@ -1393,7 +1434,31 @@ class TerminalWindow(QMainWindow):
         self.shortcut_command_palette = QShortcut("Ctrl+Shift+P", self)
         self.shortcut_command_palette.activated.connect(self.show_command_palette)
 
-    def new_tab(self, shell_type=None, title=None, start_directory=None):
+    def update_ai_menu_visibility(self):
+        enabled = bool(getattr(self, "ai_features_enabled", False))
+        if hasattr(self, "ai_menu"):
+            self.ai_menu.menuAction().setVisible(enabled)
+        if hasattr(self, "ai_features_action"):
+            self.ai_features_action.blockSignals(True)
+            self.ai_features_action.setChecked(enabled)
+            self.ai_features_action.blockSignals(False)
+
+    def set_ai_features_enabled(self, enabled):
+        self.ai_features_enabled = bool(enabled)
+        self.update_ai_menu_visibility()
+        self.save_settings()
+        if self.ai_features_enabled:
+            self.show_status("KI-Menü aktiviert")
+        else:
+            self.show_status("KI-Menü deaktiviert")
+
+    def ensure_ai_features_enabled(self):
+        if bool(getattr(self, "ai_features_enabled", False)):
+            return True
+        self.show_status("KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.")
+        return False
+
+    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None):
         effective_start_directory = start_directory
         if effective_start_directory is None:
             effective_start_directory = self.default_start_directory
@@ -1402,6 +1467,7 @@ class TerminalWindow(QMainWindow):
             shell_type=shell_type or self.shell_type,
             custom_title=title,
             start_directory=effective_start_directory,
+            command_history=command_history,
         )
         index = self.tab_widget.addTab(tab, tab.title or f"Terminal {self.tab_widget.count() + 1}")
         self.tab_widget.setCurrentIndex(index)
@@ -1637,8 +1703,10 @@ class TerminalWindow(QMainWindow):
         ollama_model = str(profile.get("ollama_model", "") or "").strip()
         startup_command = str(profile.get("startup_command", "") or "").strip()
 
-        if ollama_model:
+        if ollama_model and self.ai_features_enabled:
             tab.start_ollama_prompt_mode(ollama_model)
+        elif ollama_model and not self.ai_features_enabled:
+            tab.output_area.append("[KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.]\n")
         elif startup_command:
             tab.run_text_command(startup_command)
 
@@ -1787,11 +1855,12 @@ class TerminalWindow(QMainWindow):
                 shell_type=tab_shell,
                 title=str(item.get("title", "") or ""),
                 start_directory=str(item.get("working_directory", "") or ""),
+                command_history=item.get("command_history", []),
             )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
                 client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
-                if ollama_model or client_kind == "ollama_api":
+                if self.ai_features_enabled and (ollama_model or client_kind == "ollama_api"):
                     tab.start_ollama_prompt_mode(
                         ollama_model or self.selected_ollama_model,
                         system_prompt=str(item.get("ollama_system_prompt", "") or ""),
@@ -2014,14 +2083,6 @@ class TerminalWindow(QMainWindow):
             ("Datei an aktuellen Prompt anhängen", self.attach_file_to_current_prompt),
             ("Design anpassen", self.show_theme_dialog),
             ("Hilfe öffnen", self.show_help_dialog),
-            ("Ollama: Neuer Chat", self.new_ollama_chat_tab),
-            ("Ollama: Modell wählen", self.select_ollama_model),
-            ("Ollama: Gespräch löschen", self.clear_current_ollama_chat),
-            ("Ollama: Kontext löschen", self.clear_current_ollama_context),
-            ("Ollama: Systemprompt setzen", self.set_current_ollama_system_prompt),
-            ("Ollama: Antwort stoppen", self.stop_current_ollama_response),
-            ("Ollama: Chat als Markdown speichern", self.save_current_ollama_chat_markdown),
-            ("Ollama: Letzten Codeblock kopieren", self.copy_last_ollama_code_block),
             ("Profil: Aktuellen Tab speichern", self.save_current_tab_as_profile),
             ("Profil: Öffnen", self.open_profile_dialog),
             ("Profil: Löschen", self.delete_profile_dialog),
@@ -2029,6 +2090,18 @@ class TerminalWindow(QMainWindow):
             ("Workspace: Laden", self.load_workspace_dialog),
             ("Workspace: Löschen", self.delete_workspace_dialog),
         ]
+
+        if self.ai_features_enabled:
+            entries.extend([
+                ("Ollama: Neuer Chat", self.new_ollama_chat_tab),
+                ("Ollama: Modell wählen", self.select_ollama_model),
+                ("Ollama: Gespräch löschen", self.clear_current_ollama_chat),
+                ("Ollama: Kontext löschen", self.clear_current_ollama_context),
+                ("Ollama: Systemprompt setzen", self.set_current_ollama_system_prompt),
+                ("Ollama: Antwort stoppen", self.stop_current_ollama_response),
+                ("Ollama: Chat als Markdown speichern", self.save_current_ollama_chat_markdown),
+                ("Ollama: Letzten Codeblock kopieren", self.copy_last_ollama_code_block),
+            ])
 
         for backend in self.available_shell_backends():
             shell_id = str(backend.get("id", "") or "")
@@ -2213,6 +2286,7 @@ class TerminalWindow(QMainWindow):
                 shell_type=tab.shell_type,
                 title=title,
                 start_directory=tab.refresh_current_working_directory(),
+                command_history=list(tab.command_history),
             )
 
     def restore_tabs_from_settings(self):
@@ -2225,11 +2299,11 @@ class TerminalWindow(QMainWindow):
                 shell_type = self.shell_type
             title = str(item.get("title", "") or "")
             working_directory = str(item.get("working_directory", "") or "")
-            tab = self.new_tab(shell_type=shell_type, title=title, start_directory=working_directory)
+            tab = self.new_tab(shell_type=shell_type, title=title, start_directory=working_directory, command_history=item.get("command_history", []))
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
                 client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
-                if ollama_model or client_kind == "ollama_api":
+                if self.ai_features_enabled and (ollama_model or client_kind == "ollama_api"):
                     tab.start_ollama_prompt_mode(
                         ollama_model or self.selected_ollama_model,
                         system_prompt=str(item.get("ollama_system_prompt", "") or ""),
@@ -2249,6 +2323,7 @@ class TerminalWindow(QMainWindow):
                     "shell_type": tab.shell_type,
                     "title": tab.custom_title,
                     "working_directory": tab.refresh_current_working_directory(),
+                    "command_history": list(tab.command_history)[-self.max_history_size:],
                 }
                 if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
                     item.update({
@@ -2667,6 +2742,7 @@ class TerminalWindow(QMainWindow):
 
         self.default_start_directory = str(settings.get("default_start_directory", self.default_start_directory or "") or "")
         self.selected_ollama_model = str(settings.get("selected_ollama_model", self.selected_ollama_model or "") or "")
+        self.ai_features_enabled = bool(settings.get("ai_features_enabled", False))
         self.tab_profiles = normalize_profiles(settings.get("tab_profiles", self.tab_profiles))
         self.workspaces = normalize_workspaces(settings.get("workspaces", self.workspaces))
 
@@ -2684,6 +2760,7 @@ class TerminalWindow(QMainWindow):
             "saved_paths": self.saved_paths,
             "default_start_directory": self.default_start_directory,
             "selected_ollama_model": self.selected_ollama_model,
+            "ai_features_enabled": self.ai_features_enabled,
             "tab_profiles": normalize_profiles(self.tab_profiles),
             "workspaces": normalize_workspaces(self.workspaces),
         }
@@ -3098,6 +3175,10 @@ class TerminalWindow(QMainWindow):
         if ok:
             self.max_history_size = size
             self.history = self.history[-self.max_history_size:]
+            for i in range(self.tab_widget.count()):
+                tab = self.tab_widget.widget(i)
+                if isinstance(tab, TerminalTab):
+                    tab.command_history = tab.command_history[-self.max_history_size:]
             self.save_history()
             self.save_settings()
 
@@ -3105,6 +3186,8 @@ class TerminalWindow(QMainWindow):
         return list_ollama_models()
 
     def choose_ollama_model(self):
+        if not self.ensure_ai_features_enabled():
+            return ""
         models = self.ollama_models()
         if not models:
             model, ok = QInputDialog.getText(
@@ -3146,6 +3229,8 @@ class TerminalWindow(QMainWindow):
         self.save_settings()
 
     def clear_current_ollama_chat(self):
+        if not self.ensure_ai_features_enabled():
+            return
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab):
             return
@@ -3159,6 +3244,8 @@ class TerminalWindow(QMainWindow):
             self.show_status("Ausgabe gelöscht")
 
     def clear_current_ollama_context(self):
+        if not self.ensure_ai_features_enabled():
+            return
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
             self.show_status("Kein aktiver Ollama-Tab")
@@ -3168,6 +3255,8 @@ class TerminalWindow(QMainWindow):
         self.show_status("Ollama-Kontext gelöscht")
 
     def set_current_ollama_system_prompt(self):
+        if not self.ensure_ai_features_enabled():
+            return
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
             self.show_status("Kein aktiver Ollama-Tab")
@@ -3187,6 +3276,8 @@ class TerminalWindow(QMainWindow):
         self.show_status(f"Ollama-Systemprompt {note}")
 
     def stop_current_ollama_response(self):
+        if not self.ensure_ai_features_enabled():
+            return
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
             self.show_status("Kein aktiver Ollama-Tab")
@@ -3194,6 +3285,8 @@ class TerminalWindow(QMainWindow):
         tab.stop_ollama_response()
 
     def copy_last_ollama_code_block(self):
+        if not self.ensure_ai_features_enabled():
+            return
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
             self.show_status("Kein aktiver Ollama-Tab")
@@ -3201,6 +3294,8 @@ class TerminalWindow(QMainWindow):
         tab.copy_last_ollama_code_block()
 
     def save_current_ollama_chat_markdown(self):
+        if not self.ensure_ai_features_enabled():
+            return
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
             self.show_status("Kein aktiver Ollama-Tab")
@@ -3332,6 +3427,7 @@ Workspaces-Menü
 - Workspaces eignen sich für komplette Arbeitsumgebungen, zum Beispiel Terminal-Projekt, Visual Edit und Ollama nebeneinander.
 
 KI-Menü
+- Das KI-Menü ist standardmäßig ausgeblendet und kann unter Einstellungen → KI-Menü / Ollama aktivieren eingeschaltet werden.
 - Neuer Ollama-Chat: startet einen neuen Ollama-API-Tab mit ausgewähltem Modell.
 - Ollama-Modell wählen: liest verfügbare Modelle über ollama list aus und merkt das bevorzugte Modell.
 - Ollama-Gespräch löschen: leert Ausgabe und Kontext des aktuellen Ollama-Tabs.
