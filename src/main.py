@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
+from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
@@ -29,7 +30,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "1.9.0"
+APP_VERSION = "2.0.0"
 
 
 def install_crash_logging():
