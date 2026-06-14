@@ -32,7 +32,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.6.0"
 
 
 def install_crash_logging():
@@ -303,6 +303,10 @@ class TerminalTab(QWidget):
             select_all_action = QAction("Alles auswählen", self)
             select_all_action.triggered.connect(self.input_line.selectAll)
             menu.addAction(select_all_action)
+
+            attach_file_action = QAction("Datei anhängen", self)
+            attach_file_action.triggered.connect(self.window.attach_file_to_current_prompt)
+            menu.addAction(attach_file_action)
 
             menu.addSeparator()
 
@@ -1187,6 +1191,10 @@ class TerminalWindow(QMainWindow):
         self.new_backend_tab_menu = self.file_menu.addMenu("Neuer Tab mit Backend")
         self.new_backend_tab_menu.aboutToShow.connect(self.rebuild_new_backend_tab_menu)
 
+        attach_file_action = QAction("Datei an aktuellen Prompt anhängen", self)
+        attach_file_action.triggered.connect(self.attach_file_to_current_prompt)
+        self.file_menu.addAction(attach_file_action)
+
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.setShortcut("Ctrl+W")
         close_tab_action.triggered.connect(self.close_current_tab)
@@ -1898,6 +1906,7 @@ class TerminalWindow(QMainWindow):
             ("Vorheriger Suchtreffer", self.find_previous_current_output),
             ("Ausgabe leeren", self.clear_current_output),
             ("Ausgabe speichern", self.save_current_output),
+            ("Datei an aktuellen Prompt anhängen", self.attach_file_to_current_prompt),
             ("Design anpassen", self.show_theme_dialog),
             ("Hilfe öffnen", self.show_help_dialog),
             ("Ollama: Neuer Chat", self.new_ollama_chat_tab),
@@ -1990,6 +1999,34 @@ class TerminalWindow(QMainWindow):
         refill()
         search.setFocus()
         dialog.exec()
+
+    def attach_file_to_current_prompt(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            self.show_status("Kein aktiver Terminal-Tab")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Datei an aktuellen Prompt anhängen",
+            tab.refresh_current_working_directory() or str(Path.cwd()),
+            "Textdateien (*.txt *.md *.py *.pyw *.json *.csv *.log *.sql *.xml *.html *.css *.js *.ts *.yaml *.yml *.toml *.ini *.bat *.cmd *.ps1 *.sh);;Alle Dateien (*)",
+        )
+        if not path:
+            return
+
+        try:
+            file_context = read_text_file_context(path)
+        except Exception as exc:
+            self.show_status(f"Datei konnte nicht angehängt werden: {exc}")
+            return
+
+        current_prompt = tab.input_line.toPlainText()
+        combined_prompt = append_file_context_to_prompt(current_prompt, file_context)
+        tab.input_line.setPlainText(combined_prompt)
+        tab.input_line.moveCursor(QTextCursor.MoveOperation.Start)
+        tab.input_line.setFocus()
+        self.show_status(f"Datei angehängt: {file_context.get('name', path)}")
 
     def stop_process(self):
         tab = self.current_terminal()
@@ -3261,11 +3298,11 @@ Hinweise
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends, "
             "gespeicherten Ordnerpfaden, Tab-Profilen, Workspaces, Befehlspalette "
-            "und verbessertem Ollama-Client-Modus.</p>"
+            "und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
             "<p>Modulare Helferdateien: shelldeck_profiles.py, "
-            "shelldeck_workspaces.py und shelldeck_ollama.py.</p>",
+            "shelldeck_workspaces.py, shelldeck_ollama.py und shelldeck_file_context.py.</p>",
             dialog,
         )
         label.setWordWrap(True)
