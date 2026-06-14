@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
 from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
-from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message
+from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
@@ -31,7 +31,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 
 def install_crash_logging():
@@ -100,17 +100,19 @@ class OllamaApiWorker(QThread):
     response_ready = Signal(str, object)
     error_ready = Signal(str)
 
-    def __init__(self, model, prompt, context=None, parent=None):
+    def __init__(self, model, prompt, context=None, system_prompt="", parent=None):
         super().__init__(parent)
         self.model = str(model or "").strip()
         self.prompt = str(prompt or "")
         self.context = context if isinstance(context, list) else []
+        self.system_prompt = normalize_system_prompt(system_prompt)
 
     def run(self):
         payload = build_generate_payload(
             self.model,
             self.prompt,
             context=self.context,
+            system_prompt=self.system_prompt,
         )
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
@@ -123,8 +125,11 @@ class OllamaApiWorker(QThread):
         try:
             with urllib.request.urlopen(request, timeout=180) as response:
                 raw = response.read().decode("utf-8", errors="replace")
+            if self.isInterruptionRequested():
+                return
             answer, context = extract_generate_response(raw)
-            self.response_ready.emit(answer, context)
+            if not self.isInterruptionRequested():
+                self.response_ready.emit(answer, context)
         except Exception as exc:
             self.error_ready.emit(ollama_api_error_message(exc))
 
@@ -145,6 +150,7 @@ class TerminalTab(QWidget):
         self.client_mode_kind = ""
         self.ollama_model = ""
         self.ollama_context = []
+        self.ollama_system_prompt = ""
         self.ollama_worker = None
         self.client_process = None
         self.direct_client_exit_command = "exit"
@@ -248,6 +254,16 @@ class TerminalTab(QWidget):
             save_text_action = QAction("Ausgabe als Text speichern", self)
             save_text_action.triggered.connect(lambda: self.window.save_current_output("txt"))
             menu.addAction(save_text_action)
+
+            if self.client_mode_kind == "ollama_api":
+                save_ollama_md_action = QAction("Ollama-Chat als Markdown speichern", self)
+                save_ollama_md_action.triggered.connect(self.window.save_current_ollama_chat_markdown)
+                menu.addAction(save_ollama_md_action)
+
+                stop_ollama_action = QAction("Ollama-Antwort stoppen", self)
+                stop_ollama_action.setEnabled(self.ollama_worker is not None and self.ollama_worker.isRunning())
+                stop_ollama_action.triggered.connect(self.window.stop_current_ollama_response)
+                menu.addAction(stop_ollama_action)
 
             search_action = QAction("Suchen", self)
             search_action.setShortcut("Ctrl+F")
@@ -766,13 +782,15 @@ class TerminalTab(QWidget):
             return '"' + value.replace('"', '\\"') + '"'
         return "'" + value.replace("'", "'\\''") + "'"
 
-    def start_ollama_prompt_mode(self, model_name):
+    def start_ollama_prompt_mode(self, model_name, system_prompt=""):
         self.ollama_model = str(model_name or "").strip()
         self.ollama_context = []
+        self.ollama_system_prompt = normalize_system_prompt(system_prompt)
         if not self.ollama_model:
             return False
+        prompt_note = " mit Systemprompt" if self.ollama_system_prompt else ""
         self.output_area.append(
-            f"\n[Ollama-API-Modus aktiv: {self.ollama_model}] "
+            f"\n[Ollama-API-Modus aktiv: {self.ollama_model}{prompt_note}] "
             "Eingaben unten werden direkt an die lokale Ollama-API gesendet. "
             "/bye, exit oder quit beendet den Modus.\n"
         )
@@ -806,6 +824,7 @@ class TerminalTab(QWidget):
             self.ollama_model,
             prompt,
             context=self.ollama_context,
+            system_prompt=self.ollama_system_prompt,
             parent=self,
         )
         self.ollama_worker.response_ready.connect(self.handle_ollama_response)
@@ -840,6 +859,20 @@ class TerminalTab(QWidget):
             self.ollama_worker.deleteLater()
             self.ollama_worker = None
         self.client_process = None
+
+    def stop_ollama_response(self):
+        if self.ollama_worker is None or not self.ollama_worker.isRunning():
+            self.window.show_status("Keine laufende Ollama-Antwort")
+            return
+        self.ollama_worker.requestInterruption()
+        self.ollama_worker.terminate()
+        self.ollama_worker.wait(1500)
+        self.ollama_worker.deleteLater()
+        self.ollama_worker = None
+        self.execute_button.setEnabled(True)
+        self.execute_button.setText(self.client_send_button_text())
+        self.output_area.append("\n[Ollama-Antwort gestoppt]\n")
+        self.window.show_status("Ollama-Antwort gestoppt")
 
     def is_client_exit_command(self, text):
         command = str(text or "").strip().lower()
@@ -919,6 +952,7 @@ class TerminalTab(QWidget):
             self.client_mode_kind = ""
             self.ollama_model = ""
             self.ollama_context = []
+            self.ollama_system_prompt = ""
             self.execute_button.setEnabled(True)
             self.execute_button.setText("Befehl ausführen")
             self.input_line.setPlaceholderText("")
@@ -1222,6 +1256,22 @@ class TerminalWindow(QMainWindow):
         clear_ollama_chat_action = QAction("Ollama-Gespräch löschen", self)
         clear_ollama_chat_action.triggered.connect(self.clear_current_ollama_chat)
         ai_menu.addAction(clear_ollama_chat_action)
+
+        clear_ollama_context_action = QAction("Ollama-Kontext löschen", self)
+        clear_ollama_context_action.triggered.connect(self.clear_current_ollama_context)
+        ai_menu.addAction(clear_ollama_context_action)
+
+        system_prompt_action = QAction("Ollama-Systemprompt setzen", self)
+        system_prompt_action.triggered.connect(self.set_current_ollama_system_prompt)
+        ai_menu.addAction(system_prompt_action)
+
+        stop_ollama_action = QAction("Ollama-Antwort stoppen", self)
+        stop_ollama_action.triggered.connect(self.stop_current_ollama_response)
+        ai_menu.addAction(stop_ollama_action)
+
+        save_ollama_markdown_action = QAction("Ollama-Chat als Markdown speichern", self)
+        save_ollama_markdown_action.triggered.connect(self.save_current_ollama_chat_markdown)
+        ai_menu.addAction(save_ollama_markdown_action)
 
         save_chat_action = QAction("Aktuelle Ausgabe speichern", self)
         save_chat_action.triggered.connect(self.save_current_output)
@@ -1852,6 +1902,10 @@ class TerminalWindow(QMainWindow):
             ("Ollama: Neuer Chat", self.new_ollama_chat_tab),
             ("Ollama: Modell wählen", self.select_ollama_model),
             ("Ollama: Gespräch löschen", self.clear_current_ollama_chat),
+            ("Ollama: Kontext löschen", self.clear_current_ollama_context),
+            ("Ollama: Systemprompt setzen", self.set_current_ollama_system_prompt),
+            ("Ollama: Antwort stoppen", self.stop_current_ollama_response),
+            ("Ollama: Chat als Markdown speichern", self.save_current_ollama_chat_markdown),
             ("Profil: Aktuellen Tab speichern", self.save_current_tab_as_profile),
             ("Profil: Öffnen", self.open_profile_dialog),
             ("Profil: Löschen", self.delete_profile_dialog),
@@ -2938,10 +2992,75 @@ class TerminalWindow(QMainWindow):
             tab.ollama_context = []
             tab.output_area.clear()
             tab.output_area.append(f"[Ollama-API-Modus aktiv: {tab.ollama_model}] Gespräch wurde gelöscht.\n")
-            self.statusBar().showMessage("Ollama-Gespräch gelöscht")
+            self.show_status("Ollama-Gespräch gelöscht")
         else:
             tab.output_area.clear()
-            self.statusBar().showMessage("Ausgabe gelöscht")
+            self.show_status("Ausgabe gelöscht")
+
+    def clear_current_ollama_context(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
+            self.show_status("Kein aktiver Ollama-Tab")
+            return
+        tab.ollama_context = []
+        tab.output_area.append("\n[Ollama-Kontext gelöscht]\n")
+        self.show_status("Ollama-Kontext gelöscht")
+
+    def set_current_ollama_system_prompt(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
+            self.show_status("Kein aktiver Ollama-Tab")
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Ollama-Systemprompt",
+            "Systemprompt für diesen Ollama-Tab:",
+            tab.ollama_system_prompt,
+        )
+        if not ok:
+            return
+        tab.ollama_system_prompt = normalize_system_prompt(text)
+        tab.ollama_context = []
+        note = "gesetzt" if tab.ollama_system_prompt else "geleert"
+        tab.output_area.append(f"\n[Ollama-Systemprompt {note}; Kontext zurückgesetzt]\n")
+        self.show_status(f"Ollama-Systemprompt {note}")
+
+    def stop_current_ollama_response(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
+            self.show_status("Kein aktiver Ollama-Tab")
+            return
+        tab.stop_ollama_response()
+
+    def save_current_ollama_chat_markdown(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
+            self.show_status("Kein aktiver Ollama-Tab")
+            return
+        transcript = self.current_output_text(clean=True)
+        if not transcript.strip():
+            self.show_status("Kein Ollama-Chat zum Speichern vorhanden")
+            return
+        safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", tab.ollama_model or "ollama")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Ollama-Chat als Markdown speichern",
+            str(Path.cwd() / f"ollama_chat_{safe_model}.md"),
+            "Markdown (*.md);;Textdateien (*.txt);;Alle Dateien (*)",
+        )
+        if not path:
+            return
+        content = markdown_chat_export(
+            app_name=APP_NAME,
+            model=tab.ollama_model,
+            system_prompt=tab.ollama_system_prompt,
+            transcript=transcript,
+        )
+        try:
+            Path(path).write_text(content, encoding="utf-8", newline="\n")
+            self.show_status(f"Ollama-Chat gespeichert: {path}")
+        except OSError as exc:
+            self.show_status(f"Ollama-Chat konnte nicht gespeichert werden: {exc}")
 
     def show_status(self, message, timeout=5000):
         self.statusBar().showMessage(str(message or ""), timeout)
@@ -3006,7 +3125,7 @@ class TerminalWindow(QMainWindow):
 - Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
 - Tab-Namen, Shell-Typen, Arbeitsordner je Tab, Profile, Workspaces und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
 - Gemeinsame Befehlshistorie für alle Tabs.
-- Ollama-API-Modus sowie direkte Client-Prozesse für Python, Node.js und SQL-Clients.
+- Ollama-API-Modus mit Systemprompt, Kontextsteuerung, Antwort-Stopp und Markdown-Export sowie direkte Client-Prozesse für Python, Node.js und SQL-Clients.
 - Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
 - Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
 - Ausgabe kann als Markdown oder Text gespeichert und ohne Steuerzeichen kopiert werden.
@@ -3047,7 +3166,11 @@ Workspaces-Menü
 KI-Menü
 - Neuer Ollama-Chat: startet einen neuen Ollama-API-Tab mit ausgewähltem Modell.
 - Ollama-Modell wählen: liest verfügbare Modelle über ollama list aus und merkt das bevorzugte Modell.
-- Ollama-Gespräch löschen: leert den Kontext des aktuellen Ollama-Tabs.
+- Ollama-Gespräch löschen: leert Ausgabe und Kontext des aktuellen Ollama-Tabs.
+- Ollama-Kontext löschen: setzt nur den Modellkontext zurück, die sichtbare Ausgabe bleibt erhalten.
+- Ollama-Systemprompt setzen: legt eine Rollen-/Verhaltensanweisung für den aktuellen Ollama-Tab fest und setzt den Kontext zurück.
+- Ollama-Antwort stoppen: bricht eine laufende Ollama-Anfrage ab.
+- Ollama-Chat als Markdown speichern: exportiert Verlauf, Modell und Systemprompt als Markdown.
 - Aktuelle Ausgabe speichern: speichert die sichtbare Ausgabe des aktuellen Tabs.
 
 Einstellungen-Menü
@@ -3062,6 +3185,8 @@ Einstellungen-Menü
 Interaktiver Client-Modus
 - ollama run <modell> aktiviert einen stabilen Ollama-Prompt-Modus ohne echten PTY-Zwang.
 - Jede Eingabe unten wird als einzelner Prompt an das gewählte Ollama-Modell gesendet; die Antwort erscheint oben.
+- Optionaler Systemprompt je Ollama-Tab beeinflusst die Antworten und wird beim Markdown-Export dokumentiert.
+- Der Ollama-Kontext kann getrennt von der sichtbaren Ausgabe gelöscht werden.
 - Andere interaktive Clients wie python, node, sqlite3, psql oder mysql senden rohe Zeilen direkt an den laufenden Client.
 - Im Client-Modus wird der Button zu „An Client senden“ und die Statuszeile zeigt den aktiven Client.
 - /bye, exit, quit oder Ctrl+C verlassen den Client-Modus.
@@ -3069,7 +3194,7 @@ Interaktiver Client-Modus
 
 Befehlspalette
 - Ctrl+Shift+P öffnet die Befehlspalette.
-- Aktionen lassen sich per Suchtext filtern, zum Beispiel Tab, Backend, Pfad, Profil, Workspace, Ollama oder Suche.
+- Aktionen lassen sich per Suchtext filtern, zum Beispiel Tab, Backend, Pfad, Profil, Workspace, Ollama, Systemprompt oder Suche.
 - Profile und Workspaces erscheinen ebenfalls als Aktionen, sofern welche gespeichert sind.
 
 Kontextmenüs
@@ -3135,11 +3260,11 @@ Hinweise
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends, "
             "gespeicherten Ordnerpfaden, Tab-Profilen, Workspaces, Befehlspalette "
-            "und interaktivem Client-Modus.</p>"
+            "und verbessertem Ollama-Client-Modus.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
-            "<p>Modulare Helferdateien: shelldeck_profiles.py und "
-            "shelldeck_workspaces.py.</p>",
+            "<p>Modulare Helferdateien: shelldeck_profiles.py, "
+            "shelldeck_workspaces.py und shelldeck_ollama.py.</p>",
             dialog,
         )
         label.setWordWrap(True)
