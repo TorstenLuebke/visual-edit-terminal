@@ -11,6 +11,7 @@ import shlex
 import urllib.error
 import urllib.request
 from pathlib import Path
+from shelldeck_profiles import normalize_profiles
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
@@ -28,7 +29,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 
 def install_crash_logging():
@@ -1144,6 +1145,7 @@ class TerminalWindow(QMainWindow):
         self.terminal_font = QFont("Courier New", 10)
         self.saved_tabs = []
         self.saved_paths = []
+        self.tab_profiles = []
         self.default_start_directory = ""
         self.selected_ollama_model = ""
         self.history_file = Path.home() / ".visual_edit_terminal_history"
@@ -2173,6 +2175,7 @@ class TerminalWindow(QMainWindow):
 
         self.default_start_directory = str(settings.get("default_start_directory", self.default_start_directory or "") or "")
         self.selected_ollama_model = str(settings.get("selected_ollama_model", self.selected_ollama_model or "") or "")
+        self.tab_profiles = normalize_profiles(settings.get("tab_profiles", self.tab_profiles))
 
     def save_settings(self):
         settings = {
@@ -2188,6 +2191,7 @@ class TerminalWindow(QMainWindow):
             "saved_paths": self.saved_paths,
             "default_start_directory": self.default_start_directory,
             "selected_ollama_model": self.selected_ollama_model,
+            "tab_profiles": normalize_profiles(self.tab_profiles),
         }
 
         try:
