@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "PathForge Terminal"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 
 def install_crash_logging():
@@ -1461,58 +1461,83 @@ class TerminalWindow(QMainWindow):
             )
         except Exception:
             return ""
-
+    
         raw = result.stdout or result.stderr or b""
-        if isinstance(raw, bytes):
-            for encoding in ("utf-16", "utf-8", "cp850", "cp1252", "latin-1"):
-                try:
-                    text = raw.decode(encoding)
-                    break
-                except UnicodeDecodeError:
-                    continue
-            else:
-                text = raw.decode("utf-8", errors="replace")
-        else:
-            text = str(raw)
-
+        if not raw:
+            return ""
+    
+        for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "cp850", "cp1252"):
+            try:
+                text = raw.decode(encoding, errors="replace")
+                break
+            except Exception:
+                text = ""
+    
         text = text.replace("\x00", "").strip()
-        return text.splitlines()[0].strip() if text else ""
+        if not text:
+            return ""
+    
+        return text.splitlines()[0].strip()
 
     def available_shell_backends(self):
         options = []
-
+    
         def add(shell_id, label, executable=None, args=None):
             executable = executable or self.system_shell(shell_id)
             if not executable:
                 return
-            version = self._command_version_text(executable, args or ["--version"]) if args is not None else ""
+    
+            # Versionen werden nur noch genutzt, wenn ausdrücklich gewünscht.
+            # Für PowerShell/WSL vermeiden wir bewusst Versionsausgaben,
+            # weil Windows je nach Umgebung kaputte Kodierungen liefern kann.
+            version = ""
+            if args is not None:
+                version = self._command_version_text(executable, args)
+    
             full_label = f"{label} — {version}" if version else label
             if shell_id not in [item["id"] for item in options]:
-                options.append({"id": shell_id, "label": full_label, "executable": executable})
-
+                options.append({
+                    "id": shell_id,
+                    "label": full_label,
+                    "executable": executable,
+                })
+    
         if sys.platform == "win32":
             if shutil.which("powershell.exe"):
-                add("powershell", "PowerShell", "powershell.exe", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"] )
+                add("powershell", "PowerShell", "powershell.exe", None)
+    
             if shutil.which("pwsh.exe"):
-                add("pwsh", "PowerShell 7", "pwsh.exe", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"] )
+                add("pwsh", "PowerShell 7", "pwsh.exe", None)
+    
             if shutil.which("cmd.exe"):
                 add("cmd", "CMD", "cmd.exe", None)
+    
             git_bash = self.find_git_bash()
             if git_bash:
-                add("git_bash", "Git Bash", git_bash, ["--version"])
+                add("git_bash", "Git Bash", git_bash, None)
+    
             if shutil.which("wsl.exe"):
-                # WSL --version can return UTF-16/NUL-filled output on some systems.
-                # The backend chooser only needs a clean, stable label here.
                 add("wsl", "WSL", "wsl.exe", None)
+    
         else:
-            for shell_id, label in (("bash", "Bash"), ("zsh", "Z Shell"), ("fish", "Fish"), ("sh", "sh")):
+            for shell_id, label in (
+                ("bash", "Bash"),
+                ("zsh", "Z Shell"),
+                ("fish", "Fish"),
+                ("sh", "sh"),
+            ):
                 executable = shutil.which(shell_id)
                 if executable:
-                    add(shell_id, label, executable, ["--version"] if shell_id != "sh" else None)
-
+                    add(shell_id, label, executable, None)
+    
         if not options:
             fallback = "cmd" if sys.platform == "win32" else "sh"
-            options.append({"id": fallback, "label": self.shell_backend_label(fallback), "executable": self.system_shell(fallback) or fallback})
+            options.append({
+                "id": fallback,
+                "label": self.shell_backend_label(fallback),
+                "executable": self.system_shell(fallback) or fallback,
+            })
+    
         return options
 
     def shell_backend_label(self, shell_name=None) -> str:
