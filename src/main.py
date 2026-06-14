@@ -27,7 +27,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 
 def install_crash_logging():
@@ -1037,6 +1037,7 @@ class TerminalWindow(QMainWindow):
         self.terminal_font = QFont("Courier New", 10)
         self.saved_tabs = []
         self.saved_paths = []
+        self.selected_ollama_model = ""
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
         self.load_history()
@@ -1104,6 +1105,24 @@ class TerminalWindow(QMainWindow):
         shell_action = QAction("Shell-Backend", self)
         shell_action.triggered.connect(self.select_shell)
         settings_menu.addAction(shell_action)
+
+        ai_menu = menubar.addMenu("&KI")
+
+        new_ollama_tab_action = QAction("Neuer Ollama-Chat", self)
+        new_ollama_tab_action.triggered.connect(self.new_ollama_chat_tab)
+        ai_menu.addAction(new_ollama_tab_action)
+
+        select_ollama_model_action = QAction("Ollama-Modell wählen", self)
+        select_ollama_model_action.triggered.connect(self.select_ollama_model)
+        ai_menu.addAction(select_ollama_model_action)
+
+        clear_ollama_chat_action = QAction("Ollama-Gespräch löschen", self)
+        clear_ollama_chat_action.triggered.connect(self.clear_current_ollama_chat)
+        ai_menu.addAction(clear_ollama_chat_action)
+
+        save_chat_action = QAction("Aktuelle Ausgabe speichern", self)
+        save_chat_action.triggered.connect(self.save_current_output)
+        ai_menu.addAction(save_chat_action)
 
         help_menu = menubar.addMenu("&Hilfe")
 
@@ -1859,6 +1878,8 @@ class TerminalWindow(QMainWindow):
             if isinstance(item, dict) and str(item.get("path", "")).strip()
         ] if isinstance(saved_paths, list) else []
 
+        self.selected_ollama_model = str(settings.get("selected_ollama_model", self.selected_ollama_model or "") or "")
+
     def save_settings(self):
         settings = {
             "font": self.terminal_font.toString(),
@@ -1871,6 +1892,7 @@ class TerminalWindow(QMainWindow):
             "shell_type": self.shell_type,
             "tabs": self.collect_tab_settings(),
             "saved_paths": self.saved_paths,
+            "selected_ollama_model": self.selected_ollama_model,
         }
 
         try:
@@ -2285,6 +2307,109 @@ class TerminalWindow(QMainWindow):
             self.history = self.history[-self.max_history_size:]
             self.save_history()
             self.save_settings()
+
+    def ollama_models(self):
+        executable = shutil.which("ollama")
+        if not executable:
+            return []
+        try:
+            result = subprocess.run(
+                [executable, "list"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception:
+            return []
+        output = result.stdout or ""
+        models = []
+        for line in output.splitlines()[1:]:
+            parts = line.split()
+            if parts:
+                models.append(parts[0])
+        return models
+
+    def choose_ollama_model(self):
+        models = self.ollama_models()
+        if not models:
+            model, ok = QInputDialog.getText(
+                self,
+                "Ollama-Modell",
+                "Kein Modell über 'ollama list' gefunden oder Ollama ist nicht im PATH. Modellname manuell eingeben:",
+                text=self.selected_ollama_model or "gemma3:1b",
+            )
+            return model.strip() if ok and model.strip() else ""
+        current = self.selected_ollama_model if self.selected_ollama_model in models else models[0]
+        index = models.index(current) if current in models else 0
+        model, ok = QInputDialog.getItem(
+            self,
+            "Ollama-Modell wählen",
+            "Modell:",
+            models,
+            index,
+            False,
+        )
+        return str(model or "").strip() if ok else ""
+
+    def select_ollama_model(self):
+        model = self.choose_ollama_model()
+        if not model:
+            return
+        self.selected_ollama_model = model
+        self.statusBar().showMessage(f"Ollama-Modell gewählt: {model}")
+        self.save_settings()
+
+    def new_ollama_chat_tab(self):
+        model = self.choose_ollama_model() or self.selected_ollama_model
+        if not model:
+            return
+        self.selected_ollama_model = model
+        tab = self.new_tab(title=f"Ollama {model}")
+        if isinstance(tab, TerminalTab):
+            tab.start_ollama_prompt_mode(model)
+            tab.input_line.setFocus()
+        self.save_settings()
+
+    def clear_current_ollama_chat(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        if tab.client_mode_kind == "ollama_api":
+            tab.ollama_context = []
+            tab.output_area.clear()
+            tab.output_area.append(f"[Ollama-API-Modus aktiv: {tab.ollama_model}] Gespräch wurde gelöscht.\n")
+            self.statusBar().showMessage("Ollama-Gespräch gelöscht")
+        else:
+            tab.output_area.clear()
+            self.statusBar().showMessage("Ausgabe gelöscht")
+
+    def save_current_output(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        text = tab.output_area.toPlainText()
+        if not text.strip():
+            self.statusBar().showMessage("Keine Ausgabe zum Speichern vorhanden")
+            return
+        default_name = "shelldeck_output.md"
+        if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
+            safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "_", tab.ollama_model)
+            default_name = f"ollama_{safe_model}.md"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Aktuelle Ausgabe speichern",
+            str(Path.cwd() / default_name),
+            "Markdown (*.md);;Textdateien (*.txt);;Alle Dateien (*)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(text, encoding="utf-8")
+            self.statusBar().showMessage(f"Ausgabe gespeichert: {path}")
+        except OSError as exc:
+            self.statusBar().showMessage(f"Ausgabe konnte nicht gespeichert werden: {exc}")
 
     def help_text(self):
         return f"""{APP_NAME} {APP_VERSION}
