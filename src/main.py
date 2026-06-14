@@ -32,7 +32,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 
 
 def install_crash_logging():
@@ -158,6 +158,7 @@ class TerminalTab(QWidget):
         self.direct_client_label = "Client"
         self.direct_client_start_error_reported = False
         self.output_search_text = ""
+        self.last_ollama_code_blocks = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -265,6 +266,11 @@ class TerminalTab(QWidget):
                 stop_ollama_action.setEnabled(self.ollama_worker is not None and self.ollama_worker.isRunning())
                 stop_ollama_action.triggered.connect(self.window.stop_current_ollama_response)
                 menu.addAction(stop_ollama_action)
+
+                copy_last_code_action = QAction("Letzten Codeblock kopieren", self)
+                copy_last_code_action.setEnabled(bool(self.last_ollama_code_blocks))
+                copy_last_code_action.triggered.connect(self.copy_last_ollama_code_block)
+                menu.addAction(copy_last_code_action)
 
             search_action = QAction("Suchen", self)
             search_action.setShortcut("Ctrl+F")
@@ -842,12 +848,27 @@ class TerminalTab(QWidget):
             self.ollama_context = context
         text = str(answer or "").strip()
         if text:
+            self.last_ollama_code_blocks = extract_code_blocks(text)
+            html = ollama_answer_to_html(text)
             self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-            self.output_area.insertPlainText(f"\nOllama → {text}\n")
+            if html:
+                self.output_area.insertHtml(html)
+                self.output_area.insertPlainText("\n")
+            else:
+                self.output_area.insertPlainText(f"\nOllama → {text}\n")
             self.output_area.moveCursor(QTextCursor.MoveOperation.End)
             self.output_area.ensureCursorVisible()
         else:
             self.output_area.append("\n[Ollama hat keine sichtbare Antwort geliefert.]\n")
+
+    def copy_last_ollama_code_block(self):
+        if not self.last_ollama_code_blocks:
+            self.window.show_status("Kein Codeblock zum Kopieren gefunden")
+            return
+        block = self.last_ollama_code_blocks[-1]
+        QApplication.clipboard().setText(str(block.get("code", "") or ""))
+        language = str(block.get("language", "Code") or "Code")
+        self.window.show_status(f"Letzten {language}-Codeblock kopiert")
 
     def handle_ollama_error(self, message):
         self.output_area.append(f"\n[Ollama-Fehler] {message}\n")
@@ -1916,6 +1937,7 @@ class TerminalWindow(QMainWindow):
             ("Ollama: Systemprompt setzen", self.set_current_ollama_system_prompt),
             ("Ollama: Antwort stoppen", self.stop_current_ollama_response),
             ("Ollama: Chat als Markdown speichern", self.save_current_ollama_chat_markdown),
+            ("Ollama: Letzten Codeblock kopieren", self.copy_last_ollama_code_block),
             ("Profil: Aktuellen Tab speichern", self.save_current_tab_as_profile),
             ("Profil: Öffnen", self.open_profile_dialog),
             ("Profil: Löschen", self.delete_profile_dialog),
@@ -3070,6 +3092,13 @@ class TerminalWindow(QMainWindow):
             return
         tab.stop_ollama_response()
 
+    def copy_last_ollama_code_block(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
+            self.show_status("Kein aktiver Ollama-Tab")
+            return
+        tab.copy_last_ollama_code_block()
+
     def save_current_ollama_chat_markdown(self):
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab) or tab.client_mode_kind != "ollama_api":
@@ -3302,7 +3331,7 @@ Hinweise
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
             "<p>Modulare Helferdateien: shelldeck_profiles.py, "
-            "shelldeck_workspaces.py, shelldeck_ollama.py und shelldeck_file_context.py.</p>",
+            "shelldeck_workspaces.py, shelldeck_ollama.py, shelldeck_file_context.py und shelldeck_markdown.py.</p>",
             dialog,
         )
         label.setWordWrap(True)
