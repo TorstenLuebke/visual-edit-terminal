@@ -119,16 +119,62 @@ class TerminalTab(QWidget):
             self.process.write(self.window.default_command.encode() + b"\n")
 
     def show_terminal_context_menu(self, pos):
+        sender = self.sender()
+        if not hasattr(sender, "mapToGlobal"):
+            return
+
         menu = QMenu(self)
+
+        if sender is self.output_area:
+            copy_action = QAction("Kopieren", self)
+            copy_action.setEnabled(bool(self.output_area.textCursor().hasSelection()))
+            copy_action.triggered.connect(self.output_area.copy)
+            menu.addAction(copy_action)
+
+            copy_all_action = QAction("Alles kopieren", self)
+            copy_all_action.triggered.connect(self.copy_all_output)
+            menu.addAction(copy_all_action)
+
+            clear_action = QAction("Ausgabe leeren", self)
+            clear_action.triggered.connect(self.output_area.clear)
+            menu.addAction(clear_action)
+
+            menu.addSeparator()
+
+        elif sender is self.input_line:
+            copy_action = QAction("Kopieren", self)
+            copy_action.setEnabled(bool(self.input_line.textCursor().hasSelection()))
+            copy_action.triggered.connect(self.input_line.copy)
+            menu.addAction(copy_action)
+
+            paste_action = QAction("Einfügen", self)
+            paste_action.triggered.connect(self.input_line.paste)
+            menu.addAction(paste_action)
+
+            cut_action = QAction("Ausschneiden", self)
+            cut_action.setEnabled(bool(self.input_line.textCursor().hasSelection()))
+            cut_action.triggered.connect(self.input_line.cut)
+            menu.addAction(cut_action)
+
+            select_all_action = QAction("Alles auswählen", self)
+            select_all_action.triggered.connect(self.input_line.selectAll)
+            menu.addAction(select_all_action)
+
+            menu.addSeparator()
+
         new_tab_action = QAction("Neuer Tab", self)
         new_tab_action.triggered.connect(self.window.new_tab)
         menu.addAction(new_tab_action)
+
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.window.close_current_tab)
         menu.addAction(close_tab_action)
-        sender = self.sender()
-        if hasattr(sender, "mapToGlobal"):
-            menu.exec(sender.mapToGlobal(pos))
+
+        menu.exec(sender.mapToGlobal(pos))
+
+    def copy_all_output(self):
+        self.output_area.selectAll()
+        self.output_area.copy()
 
     def start_shell(self):
         shell_path = self.window.system_shell()
@@ -167,9 +213,9 @@ class TerminalTab(QWidget):
         shell_name = shell_label.replace("\\", "/").rsplit("/", 1)[-1]
         if shell_name.lower().endswith(".exe"):
             shell_name = shell_name[:-4]
-        self.title = shell_name or "Terminal"
+        self.title = self.window.shell_backend_label(shell_name)
         self.window.update_tab_title(self)
-        self.window.statusBar().showMessage(f"Shell: {self.title}")
+        self.window.statusBar().showMessage(f"Shell-Backend: {self.title}")
 
     def eventFilter(self, source, event):
         if source is self.input_line and event.type() == QEvent.Type.KeyPress:
@@ -196,6 +242,7 @@ class TerminalTab(QWidget):
         elif self.history_index > 0:
             self.history_index -= 1
         self.input_line.setPlainText(self.window.history[self.history_index])
+        self.input_line.moveCursor(QTextCursor.MoveOperation.End)
 
     def show_next_command(self):
         if not self.window.history:
@@ -203,9 +250,11 @@ class TerminalTab(QWidget):
         if self.history_index < len(self.window.history) - 1:
             self.history_index += 1
             self.input_line.setPlainText(self.window.history[self.history_index])
+            self.input_line.moveCursor(QTextCursor.MoveOperation.End)
         elif self.history_index == len(self.window.history) - 1:
             self.history_index = -1
             self.input_line.setPlainText(self.current_command)
+            self.input_line.moveCursor(QTextCursor.MoveOperation.End)
 
     def execute_command(self):
         command_text = self.input_line.toPlainText().strip()
@@ -404,7 +453,7 @@ class TerminalWindow(QMainWindow):
         history_action.triggered.connect(self.show_history_dialog)
         settings_menu.addAction(history_action)
 
-        shell_action = QAction("Shell", self)
+        shell_action = QAction("Shell-Backend", self)
         shell_action.triggered.connect(self.select_shell)
         settings_menu.addAction(shell_action)
 
@@ -482,7 +531,7 @@ class TerminalWindow(QMainWindow):
     def current_tab_changed(self, index):
         tab = self.current_terminal()
         if tab is not None:
-            self.statusBar().showMessage(f"Shell: {tab.title}")
+            self.statusBar().showMessage(f"Shell-Backend: {tab.title}")
 
     def stop_process(self):
         tab = self.current_terminal()
@@ -509,11 +558,19 @@ class TerminalWindow(QMainWindow):
         shells = ["cmd", "powershell"]
         if shutil.which("pwsh.exe") is not None:
             shells.append("pwsh")
+        if shutil.which("bash.exe") is not None:
+            shells.append("bash")
+        if shutil.which("wsl.exe") is not None:
+            shells.append("wsl")
+        if sys.platform != "win32":
+            for shell_name in ("bash", "zsh", "fish", "sh"):
+                if shutil.which(shell_name) is not None and shell_name not in shells:
+                    shells.append(shell_name)
         current_index = shells.index(self.shell_type) if self.shell_type in shells else 0
         selected, ok = QInputDialog.getItem(
             self,
-            "Shell auswahl",
-            "Shell waehlen:",
+            "Shell-Backend auswählen",
+            "Shell-Backend wählen:",
             shells,
             current_index,
             False,
@@ -523,6 +580,25 @@ class TerminalWindow(QMainWindow):
             self.restart_shell()
             self.save_settings()
 
+    def shell_backend_label(self, shell_name=None) -> str:
+        name = str(shell_name or self.shell_type or "Terminal").strip()
+        lower = name.lower()
+        if lower in ("powershell", "powershell.exe"):
+            return "PowerShell"
+        if lower in ("pwsh", "pwsh.exe"):
+            return "PowerShell 7"
+        if lower in ("cmd", "cmd.exe"):
+            return "CMD"
+        if lower in ("bash", "bash.exe"):
+            return "Bash"
+        if lower in ("zsh",):
+            return "Z Shell"
+        if lower in ("fish",):
+            return "Fish"
+        if lower in ("wsl", "wsl.exe"):
+            return "WSL"
+        return name or "Terminal"
+
     def system_shell(self) -> str:
         if sys.platform != "win32":
             return os.environ.get("SHELL") or "bash"
@@ -530,6 +606,11 @@ class TerminalWindow(QMainWindow):
             "cmd": "cmd.exe",
             "powershell": "powershell.exe",
             "pwsh": "pwsh.exe",
+            "bash": "bash.exe" if sys.platform == "win32" else "bash",
+            "wsl": "wsl.exe",
+            "zsh": "zsh",
+            "fish": "fish",
+            "sh": "sh",
         }
         executable = shell_map.get(self.shell_type, "cmd.exe")
         if shutil.which(executable) is not None:
