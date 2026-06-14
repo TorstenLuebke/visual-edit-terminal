@@ -1,3 +1,4 @@
+
 import sys
 import re
 import json
@@ -6,12 +7,17 @@ import traceback
 import faulthandler
 import shutil
 from pathlib import Path
-from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
     QDialog, QFormLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
-    QDialogButtonBox, QCheckBox)
+    QDialogButtonBox, QCheckBox, QTabWidget, QMenu
+)
 from PySide6.QtCore import Qt, QProcess, QEvent
-from PySide6.QtGui import QTextCursor, QFont, QTextCharFormat, QColor, QSyntaxHighlighter, QAction, QShortcut, QPalette
+from PySide6.QtGui import (
+    QTextCursor, QFont, QTextCharFormat, QColor, QSyntaxHighlighter,
+    QAction, QShortcut, QPalette
+)
 
 
 LOG_FILE = Path.home() / "TerminalApp.log"
@@ -42,40 +48,305 @@ class TerminalHighlighter(QSyntaxHighlighter):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.highlighting_rules = []
-        
-        # Error patterns
+
         error_format = QTextCharFormat()
         error_format.setForeground(QColor("#ff6b6b"))
-        self.highlighting_rules.append((re.compile(r'error', re.IGNORECASE), error_format))
-        
-        # Command patterns
+        self.highlighting_rules.append((re.compile(r"error", re.IGNORECASE), error_format))
+
         command_format = QTextCharFormat()
         command_format.setForeground(QColor("#7dd3fc"))
-        self.highlighting_rules.append((re.compile(r'\b(cd|ls|pwd|mkdir|rm|cp|mv|grep|find|cat|echo|exit)\b'), command_format))
-        
-        # Path patterns
+        self.highlighting_rules.append((re.compile(r"\b(cd|ls|pwd|mkdir|rm|cp|mv|grep|find|cat|echo|exit)\b"), command_format))
+
         path_format = QTextCharFormat()
         path_format.setForeground(QColor("#86efac"))
-        self.highlighting_rules.append((re.compile(r'[\w\-\_/\.]+[/\\]'), path_format))
-        
-        # Number patterns
+        self.highlighting_rules.append((re.compile(r"[\w\-\_/\.]+[/\\]"), path_format))
+
         number_format = QTextCharFormat()
         number_format.setForeground(QColor("#c084fc"))
-        self.highlighting_rules.append((re.compile(r'\b\d+\b'), number_format))
-    
+        self.highlighting_rules.append((re.compile(r"\b\d+\b"), number_format))
+
     def highlightBlock(self, text):
-        for pattern, format in self.highlighting_rules:
+        for pattern, fmt in self.highlighting_rules:
             for match in pattern.finditer(text):
                 start = match.start()
                 length = match.end() - start
-                self.setFormat(start, length, format)
+                self.setFormat(start, length, fmt)
+
+
+class TerminalTab(QWidget):
+    def __init__(self, window, title="Terminal"):
+        super().__init__(window)
+        self.window = window
+        self.title = title
+        self.history_index = -1
+        self.current_command = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.output_area = QTextEdit()
+        self.output_area.setReadOnly(True)
+        self.output_area.setFont(self.window.terminal_font)
+        self.output_area.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.output_area.customContextMenuRequested.connect(self.show_terminal_context_menu)
+        layout.addWidget(self.output_area)
+
+        self.highlighter = TerminalHighlighter(self.output_area.document())
+
+        self.input_line = QPlainTextEdit()
+        self.input_line.setMaximumHeight(110)
+        self.input_line.setFont(self.window.terminal_font)
+        self.input_line.installEventFilter(self)
+        self.input_line.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.input_line.customContextMenuRequested.connect(self.show_terminal_context_menu)
+        layout.addWidget(self.input_line)
+
+        self.execute_button = QPushButton("Befehl ausführen")
+        self.execute_button.clicked.connect(self.execute_command)
+        layout.addWidget(self.execute_button)
+
+        self.process = QProcess(self)
+        self.process.readyReadStandardOutput.connect(self.handle_stdout)
+        self.process.readyReadStandardError.connect(self.handle_stderr)
+        self.process.finished.connect(self.handle_finished)
+        self.process.errorOccurred.connect(self.handle_process_error)
+
+        self.apply_theme()
+        self.start_shell()
+
+        if self.window.default_command and self.process.waitForStarted(2000):
+            self.process.write(self.window.default_command.encode() + b"\n")
+
+    def show_terminal_context_menu(self, pos):
+        menu = QMenu(self)
+        new_tab_action = QAction("Neuer Tab", self)
+        new_tab_action.triggered.connect(self.window.new_tab)
+        menu.addAction(new_tab_action)
+        close_tab_action = QAction("Aktuellen Tab schließen", self)
+        close_tab_action.triggered.connect(self.window.close_current_tab)
+        menu.addAction(close_tab_action)
+        sender = self.sender()
+        if hasattr(sender, "mapToGlobal"):
+            menu.exec(sender.mapToGlobal(pos))
+
+    def start_shell(self):
+        shell_path = self.window.system_shell()
+        if not shutil.which(shell_path) and sys.platform == "win32":
+            for fallback in ["cmd.exe", "powershell.exe"]:
+                if shutil.which(fallback):
+                    shell_path = fallback
+                    break
+        self.process.start(shell_path)
+        self.display_shell_status(shell_path)
+
+    def restart_shell(self):
+        if self.process.state() == QProcess.ProcessState.Running:
+            self.stop_process()
+            while self.process.state() != QProcess.ProcessState.NotRunning:
+                self.process.waitForFinished(500)
+        self.output_area.clear()
+        self.start_shell()
+
+    def stop_process(self):
+        if self.process and self.process.state() == QProcess.ProcessState.Running:
+            self.process.terminate()
+            if not self.process.waitForFinished(3000):
+                self.process.kill()
+                self.process.waitForFinished(1000)
+
+    def interrupt_current_command(self):
+        if self.process and self.process.state() == QProcess.ProcessState.Running:
+            self.process.write(b"\x03")
+            self.process.waitForBytesWritten(1000)
+        else:
+            self.output_area.append("Kein laufender Prozess zum Unterbrechen.")
+
+    def display_shell_status(self, shell_path=None):
+        shell_label = str(shell_path or self.window.system_shell() or "unknown")
+        shell_name = shell_label.replace("\\", "/").rsplit("/", 1)[-1]
+        if shell_name.lower().endswith(".exe"):
+            shell_name = shell_name[:-4]
+        self.title = shell_name or "Terminal"
+        self.window.update_tab_title(self)
+        self.window.statusBar().showMessage(f"Shell: {self.title}")
+
+    def eventFilter(self, source, event):
+        if source is self.input_line and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self.execute_command()
+                return True
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.input_line.insertPlainText("\n")
+                return True
+            if event.key() == Qt.Key.Key_Up:
+                self.show_previous_command()
+                return True
+            if event.key() == Qt.Key.Key_Down:
+                self.show_next_command()
+                return True
+        return super().eventFilter(source, event)
+
+    def show_previous_command(self):
+        if not self.window.history:
+            return
+        if self.history_index == -1:
+            self.current_command = self.input_line.toPlainText()
+            self.history_index = len(self.window.history) - 1
+        elif self.history_index > 0:
+            self.history_index -= 1
+        self.input_line.setPlainText(self.window.history[self.history_index])
+
+    def show_next_command(self):
+        if not self.window.history:
+            return
+        if self.history_index < len(self.window.history) - 1:
+            self.history_index += 1
+            self.input_line.setPlainText(self.window.history[self.history_index])
+        elif self.history_index == len(self.window.history) - 1:
+            self.history_index = -1
+            self.input_line.setPlainText(self.current_command)
+
+    def execute_command(self):
+        command_text = self.input_line.toPlainText().strip()
+        commands = [
+            cmd.strip()
+            for line in command_text.splitlines()
+            for cmd in line.split(";")
+            if cmd.strip()
+        ]
+        if not commands:
+            return
+
+        history_entry = command_text
+        if history_entry and (not self.window.history or self.window.history[-1] != history_entry):
+            self.window.history.append(history_entry)
+        self.window.save_history()
+        self.history_index = -1
+        self.current_command = ""
+
+        for command in commands:
+            if command.lower() in ("cls", "clear"):
+                self.output_area.clear()
+            elif self.process.state() != QProcess.ProcessState.Running:
+                self.output_area.append(
+                    f"Shell ist nicht aktiv: {self.process.errorString() or 'Prozess wurde beendet.'}"
+                )
+                break
+            else:
+                self.process.write(command.encode() + b"\n")
+        self.input_line.clear()
+
+    def _decode_process_output(self, raw) -> str:
+        data = bytes(raw)
+        for encoding in ("cp850", "mbcs", "cp1252", "utf-8", "latin-1"):
+            try:
+                return data.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return data.decode("utf-8", errors="replace")
+
+    def handle_stdout(self):
+        data = self._decode_process_output(self.process.readAllStandardOutput())
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.insertPlainText(data)
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.ensureCursorVisible()
+
+    def handle_stderr(self):
+        data = self._decode_process_output(self.process.readAllStandardError())
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.setTextColor(Qt.GlobalColor.red)
+        self.output_area.insertPlainText(data)
+        self.output_area.setTextColor(QColor(self.window.active_theme().get("foreground", "#d4d4d4")))
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.ensureCursorVisible()
+
+    def handle_finished(self, exit_code, exit_status):
+        self.output_area.append(f"\nProcess finished with exit code {exit_code}")
+
+    def handle_process_error(self, error):
+        self.output_area.append(f"\nShell konnte nicht gestartet werden: {self.process.errorString()}")
+
+    def set_terminal_font(self, font):
+        self.output_area.setFont(font)
+        self.input_line.setFont(font)
+
+    def apply_theme(self):
+        theme = self.window.active_theme()
+        background = self.window.normalize_hex_color(theme.get("background"), "#181818")
+        foreground = self.window.normalize_hex_color(theme.get("foreground"), "#FFFFFF")
+        input_background = self.window.normalize_hex_color(theme.get("input_background"), background)
+        accent = self.window.normalize_hex_color(theme.get("accent"), "#339CFF")
+        try:
+            background_opacity = max(0, min(100, int(theme.get("background_opacity", 100))))
+        except (TypeError, ValueError):
+            background_opacity = 100
+        try:
+            contrast = max(0, min(100, int(theme.get("contrast", 60))))
+        except (TypeError, ValueError):
+            contrast = 60
+
+        background_rgba = self.window.rgba_color(background, background_opacity)
+        input_background_rgba = self.window.rgba_color(input_background, background_opacity)
+
+        border_width = 1 if contrast < 85 else 2
+        radius = 8 if bool(theme.get("transparent_sidebar", True)) else 2
+        border_color = self.window.readable_border_color(background)
+        input_border_color = self.window.readable_border_color(input_background)
+        translucent = background_opacity < 100
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
+        self.setStyleSheet("background: transparent;" if translucent else "")
+        self.output_area.setStyleSheet(
+            "QTextEdit {"
+            f" background-color: {background_rgba};"
+            f" color: {foreground};"
+            f" border: {border_width}px solid {border_color};"
+            f" border-radius: {radius}px;"
+            " padding: 8px;"
+            " selection-background-color: #2D5F93;"
+            "}"
+            "QTextEdit:focus {"
+            f" border: {border_width}px solid {accent};"
+            "}"
+        )
+        self.output_area.setTextColor(QColor(foreground))
+        self.input_line.setStyleSheet(
+            "QPlainTextEdit {"
+            f" background-color: {input_background_rgba};"
+            f" color: {foreground};"
+            f" border: {border_width}px solid {input_border_color};"
+            f" border-radius: {radius}px;"
+            " padding: 6px;"
+            " selection-background-color: #2D5F93;"
+            "}"
+            "QPlainTextEdit:focus {"
+            f" border: {border_width}px solid {accent};"
+            "}"
+        )
+        self.execute_button.setStyleSheet(
+            "QPushButton {"
+            f" background-color: {accent};"
+            " color: white;"
+            " border: none;"
+            " border-radius: 6px;"
+            " padding: 7px 12px;"
+            "}"
+            "QPushButton:hover {"
+            " background-color: #4AA8FF;"
+            "}"
+            "QPushButton:pressed {"
+            " background-color: #1E7FCC;"
+            "}"
+        )
+
+
 class TerminalWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Terminal Emulator')
+        self.setWindowTitle("Terminal Emulator")
         self.history = []
-        self.history_index = -1
-        self.current_command = ""
         self.default_command = ""
         self.color_scheme_name = "Dunkel"
         self.theme_mode = "dark"
@@ -83,35 +354,40 @@ class TerminalWindow(QMainWindow):
         self.theme_config = self.default_theme_config()
         self.shell_type = "cmd"
         self.max_history_size = 1000
+        self.terminal_font = QFont("Courier New", 10)
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
         self.load_history()
-        
-        # Create central widget and layout
-        # Create menu bar
+
         menubar = self.menuBar()
-        file_menu = menubar.addMenu("&Datei")
-        
-        # Add exit action
+        self.file_menu = menubar.addMenu("&Datei")
+
+        new_tab_action = QAction("Neuer Tab", self)
+        new_tab_action.setShortcut("Ctrl+T")
+        new_tab_action.triggered.connect(self.new_tab)
+        self.file_menu.addAction(new_tab_action)
+
+        close_tab_action = QAction("Aktuellen Tab schließen", self)
+        close_tab_action.setShortcut("Ctrl+W")
+        close_tab_action.triggered.connect(self.close_current_tab)
+        self.file_menu.addAction(close_tab_action)
+        self.file_menu.addSeparator()
+
         exit_action = QAction("&Beenden", self)
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
-        
-        # Add settings menu
+        self.file_menu.addAction(exit_action)
+
         settings_menu = menubar.addMenu("&Einstellungen")
-        
-        # Add font settings action
+
         font_action = QAction("Schriftart", self)
         font_action.triggered.connect(self.show_font_dialog)
         settings_menu.addAction(font_action)
-        
-        # Add color scheme action
+
         color_action = QAction("Farbschema", self)
         color_action.triggered.connect(self.show_color_dialog)
         settings_menu.addAction(color_action)
 
-        # Add detailed theme settings action
         theme_action = QAction("Design anpassen", self)
         theme_action.triggered.connect(self.show_theme_dialog)
         settings_menu.addAction(theme_action)
@@ -119,77 +395,116 @@ class TerminalWindow(QMainWindow):
         reset_theme_action = QAction("Design auf Standard zurücksetzen", self)
         reset_theme_action.triggered.connect(self.reset_theme_defaults)
         settings_menu.addAction(reset_theme_action)
-        
-        # Add default command action
+
         cmd_action = QAction("Standardbefehl", self)
         cmd_action.triggered.connect(self.show_command_dialog)
         settings_menu.addAction(cmd_action)
-        
-        # Add history size action
+
         history_action = QAction("History-Größe", self)
         history_action.triggered.connect(self.show_history_dialog)
         settings_menu.addAction(history_action)
 
-        # Add shell selection action
         shell_action = QAction("Shell", self)
         shell_action.triggered.connect(self.select_shell)
         settings_menu.addAction(shell_action)
-        
+
         central_widget = QWidget()
         self.central_widget = central_widget
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        
-        # Create output text area
-        self.output_area = QTextEdit()
-        self.output_area.setReadOnly(True)
-        self.output_area.setFont(QFont("Courier New", 10))
-        
-        # Add syntax highlighter
-        self.highlighter = TerminalHighlighter(self.output_area.document())
-        layout.addWidget(self.output_area)
-        
-        # Create input line
-        self.input_line = QPlainTextEdit()
-        self.input_line.setMaximumHeight(110)
-        self.input_line.installEventFilter(self)
-        layout.addWidget(self.input_line)
-        # Create execution button
-        self.execute_button = QPushButton("Befehl ausführen")
-        self.execute_button.clicked.connect(self.execute_command)
-        layout.addWidget(self.execute_button)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # Apply persisted settings only after the widgets they touch exist.
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabsClosable(True)
+        self.tab_widget.setMovable(True)
+        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        self.tab_widget.currentChanged.connect(self.current_tab_changed)
+        self.tab_widget.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tab_widget.tabBar().customContextMenuRequested.connect(self.show_tab_context_menu)
+        layout.addWidget(self.tab_widget)
+
         self.load_settings()
         self.apply_color_scheme()
-        
-        # Start with system shell
-        self.process = QProcess(self)
-        self.process.readyReadStandardOutput.connect(self.handle_stdout)
-        self.process.readyReadStandardError.connect(self.handle_stderr)
-        self.process.finished.connect(self.handle_finished)
-        self.process.errorOccurred.connect(self.handle_process_error)
+        self.new_tab()
 
-        self.start_shell()
-        # Connect Ctrl+C shortcut to stop_process
         self.shortcut_stop = QShortcut("Ctrl+C", self)
         self.shortcut_stop.activated.connect(self.interrupt_current_command)
 
-        if self.default_command and self.process.waitForStarted(2000):
-            self.process.write(self.default_command.encode() + b"\n")
+    def new_tab(self):
+        tab = TerminalTab(self)
+        index = self.tab_widget.addTab(tab, tab.title or f"Terminal {self.tab_widget.count() + 1}")
+        self.tab_widget.setCurrentIndex(index)
+        self.apply_color_scheme()
+        return tab
+
+    def update_tab_title(self, tab):
+        index = self.tab_widget.indexOf(tab)
+        if index >= 0:
+            base = tab.title or "Terminal"
+            existing_same_title = sum(
+                1 for i in range(self.tab_widget.count())
+                if i != index and self.tab_widget.widget(i).title == base
+            )
+            title = f"{base} {index + 1}" if existing_same_title else base
+            self.tab_widget.setTabText(index, title)
+
+    def current_terminal(self):
+        widget = self.tab_widget.currentWidget() if hasattr(self, "tab_widget") else None
+        return widget if isinstance(widget, TerminalTab) else None
+
+    def close_current_tab(self):
+        if not hasattr(self, "tab_widget"):
+            return
+        self.close_tab(self.tab_widget.currentIndex())
+
+    def close_tab(self, index):
+        if index < 0 or index >= self.tab_widget.count():
+            return
+        tab = self.tab_widget.widget(index)
+        if isinstance(tab, TerminalTab):
+            tab.stop_process()
+        self.tab_widget.removeTab(index)
+        if tab is not None:
+            tab.deleteLater()
+        if self.tab_widget.count() == 0:
+            self.new_tab()
+
+    def show_tab_context_menu(self, pos):
+        menu = QMenu(self)
+        new_tab_action = QAction("Neuer Tab", self)
+        new_tab_action.triggered.connect(self.new_tab)
+        menu.addAction(new_tab_action)
+        close_tab_action = QAction("Aktuellen Tab schließen", self)
+        close_tab_action.triggered.connect(self.close_current_tab)
+        menu.addAction(close_tab_action)
+        menu.exec(self.tab_widget.tabBar().mapToGlobal(pos))
+
+    def current_tab_changed(self, index):
+        tab = self.current_terminal()
+        if tab is not None:
+            self.statusBar().showMessage(f"Shell: {tab.title}")
 
     def stop_process(self):
-        if self.process and self.process.state() == QProcess.Running:
-            self.process.terminate()
-            if not self.process.waitForFinished(3000):
-                self.process.kill()
-                self.process.waitForFinished(1000)
+        tab = self.current_terminal()
+        if tab is not None:
+            tab.stop_process()
+
     def interrupt_current_command(self):
-        if self.process and self.process.state() == QProcess.Running:
-            self.process.write(b"\x03")
-            self.process.waitForBytesWritten(1000)
-        else:
-            self.output_area.append("Kein laufender Prozess zum Unterbrechen.")
+        tab = self.current_terminal()
+        if tab is not None:
+            tab.interrupt_current_command()
+
+    def execute_command(self):
+        tab = self.current_terminal()
+        if tab is not None:
+            tab.execute_command()
+
+    def restart_shell(self):
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if isinstance(tab, TerminalTab):
+                tab.restart_shell()
+
     def select_shell(self):
         shells = ["cmd", "powershell"]
         if shutil.which("pwsh.exe") is not None:
@@ -208,24 +523,6 @@ class TerminalWindow(QMainWindow):
             self.restart_shell()
             self.save_settings()
 
-    def start_shell(self):
-        shell_path = self.system_shell()
-        if not shutil.which(shell_path) and sys.platform == "win32":
-            for fallback in ["cmd.exe", "powershell.exe"]:
-                if shutil.which(fallback):
-                    shell_path = fallback
-                    break
-        self.process.start(shell_path)
-        self.display_shell_status(shell_path)
-
-    def restart_shell(self):
-        if hasattr(self, "process") and self.process.state() == QProcess.Running:
-            self.stop_process()
-            while self.process.state() != QProcess.NotRunning:
-                self.process.waitForFinished(500)
-            self.output_area.clear()
-        self.start_shell()
-
     def system_shell(self) -> str:
         if sys.platform != "win32":
             return os.environ.get("SHELL") or "bash"
@@ -237,29 +534,16 @@ class TerminalWindow(QMainWindow):
         executable = shell_map.get(self.shell_type, "cmd.exe")
         if shutil.which(executable) is not None:
             return executable
-        # Fallback chain
         for fallback in ("powershell.exe", "cmd.exe"):
             if shutil.which(fallback) is not None:
                 return fallback
         return "cmd.exe"
-    def display_shell_status(self, shell_path=None):
-        shell_label = str(shell_path or self.system_shell() or "unknown")
-        shell_name = shell_label.replace("\\", "/").rsplit("/", 1)[-1]
-        if shell_name.lower().endswith(".exe"):
-            shell_name = shell_name[:-4]
-        message = f"Shell: {shell_name}"
-        try:
-            self.statusBar().showMessage(message)
-        except Exception:
-            if hasattr(self, "output_area"):
-                self.output_area.append(message)
+
     def load_history(self):
         if self.history_file.exists():
             try:
-                lines = self.history_file.read_text(encoding='utf-8').splitlines()
-                # Remove empty lines
+                lines = self.history_file.read_text(encoding="utf-8").splitlines()
                 lines = [line for line in lines if line.strip()]
-                # Keep only the last max_history_size entries
                 self.history = lines[-self.max_history_size:]
             except Exception:
                 self.history = []
@@ -268,9 +552,8 @@ class TerminalWindow(QMainWindow):
 
     def save_history(self):
         try:
-            # Limit to max_history_size entries
             history_to_save = self.history[-self.max_history_size:]
-            self.history_file.write_text('\n'.join(history_to_save), encoding='utf-8')
+            self.history_file.write_text("\n".join(history_to_save), encoding="utf-8")
         except Exception:
             pass
 
@@ -309,18 +592,10 @@ class TerminalWindow(QMainWindow):
             values = loaded_config.get(mode)
             if isinstance(values, dict):
                 merged[mode].update(values)
-                merged[mode]["accent"] = self.normalize_hex_color(
-                    merged[mode].get("accent"), merged[mode]["accent"]
-                )
-                merged[mode]["background"] = self.normalize_hex_color(
-                    merged[mode].get("background"), merged[mode]["background"]
-                )
-                merged[mode]["foreground"] = self.normalize_hex_color(
-                    merged[mode].get("foreground"), merged[mode]["foreground"]
-                )
-                merged[mode]["input_background"] = self.normalize_hex_color(
-                    merged[mode].get("input_background"), merged[mode]["input_background"]
-                )
+                merged[mode]["accent"] = self.normalize_hex_color(merged[mode].get("accent"), merged[mode]["accent"])
+                merged[mode]["background"] = self.normalize_hex_color(merged[mode].get("background"), merged[mode]["background"])
+                merged[mode]["foreground"] = self.normalize_hex_color(merged[mode].get("foreground"), merged[mode]["foreground"])
+                merged[mode]["input_background"] = self.normalize_hex_color(merged[mode].get("input_background"), merged[mode]["input_background"])
                 try:
                     merged[mode]["background_opacity"] = max(0, min(100, int(merged[mode].get("background_opacity", 100))))
                 except (TypeError, ValueError):
@@ -376,11 +651,10 @@ class TerminalWindow(QMainWindow):
             return
 
         font_text = str(settings.get("font", "")).strip()
-        if font_text and hasattr(self, "output_area") and hasattr(self, "input_line"):
+        if font_text:
             font = QFont()
             if font.fromString(font_text):
-                self.output_area.setFont(font)
-                self.input_line.setFont(font)
+                self.terminal_font = font
 
         self.default_command = str(settings.get("default_command", self.default_command or "") or "")
         self.color_scheme_name = str(settings.get("color_scheme_name", self.color_scheme_name or "Dunkel") or "Dunkel")
@@ -414,7 +688,7 @@ class TerminalWindow(QMainWindow):
 
     def save_settings(self):
         settings = {
-            "font": self.output_area.font().toString(),
+            "font": self.terminal_font.toString(),
             "color_scheme_name": self.color_scheme_name,
             "theme_mode": self.theme_mode,
             "theme_config": self.theme_config,
@@ -438,9 +712,7 @@ class TerminalWindow(QMainWindow):
             theme = self.theme_config.setdefault(mode, defaults[mode].copy())
             accent = self.normalize_hex_color(theme.get("accent"), defaults[mode]["accent"])
             background = self.normalize_hex_color(theme.get("background"), defaults[mode]["background"])
-            input_background = self.normalize_hex_color(
-                theme.get("input_background"), defaults[mode]["input_background"]
-            )
+            input_background = self.normalize_hex_color(theme.get("input_background"), defaults[mode]["input_background"])
             foreground = self.normalize_hex_color(theme.get("foreground"), defaults[mode]["foreground"])
             try:
                 contrast = max(0, min(100, int(theme.get("contrast", defaults[mode]["contrast"]))))
@@ -490,129 +762,61 @@ class TerminalWindow(QMainWindow):
         theme = self.active_theme()
         background = self.normalize_hex_color(theme.get("background"), "#181818")
         foreground = self.normalize_hex_color(theme.get("foreground"), "#FFFFFF")
-        input_background = self.normalize_hex_color(theme.get("input_background"), background)
         accent = self.normalize_hex_color(theme.get("accent"), "#339CFF")
         try:
             background_opacity = max(0, min(100, int(theme.get("background_opacity", 100))))
         except (TypeError, ValueError):
             background_opacity = 100
+        translucent = background_opacity < 100
+
         try:
-            contrast = max(0, min(100, int(theme.get("contrast", 60))))
-        except (TypeError, ValueError):
-            contrast = 60
-
-        background_rgba = self.rgba_color(background, background_opacity)
-        input_background_rgba = self.rgba_color(input_background, background_opacity)
-
-        border_width = 1 if contrast < 85 else 2
-        radius = 8 if bool(theme.get("transparent_sidebar", True)) else 2
-        border_color = self.readable_border_color(background)
-        input_border_color = self.readable_border_color(input_background)
-
-        self.output_area.setStyleSheet(
-            "QTextEdit {"
-            f" background-color: {background_rgba};"
-            f" color: {foreground};"
-            f" border: {border_width}px solid {border_color};"
-            f" border-radius: {radius}px;"
-            " padding: 8px;"
-            " selection-background-color: #2D5F93;"
-            "}"
-            "QTextEdit:focus {"
-            f" border: {border_width}px solid {accent};"
-            "}"
-        )
-        self.output_area.setTextColor(QColor(foreground))
-        self.input_line.setStyleSheet(
-            "QPlainTextEdit {"
-            f" background-color: {input_background_rgba};"
-            f" color: {foreground};"
-            f" border: {border_width}px solid {input_border_color};"
-            f" border-radius: {radius}px;"
-            " padding: 6px;"
-            " selection-background-color: #2D5F93;"
-            "}"
-            "QPlainTextEdit:focus {"
-            f" border: {border_width}px solid {accent};"
-            "}"
-        )
-        self.execute_button.setStyleSheet(
-            "QPushButton {"
-            f" background-color: {accent};"
-            " color: white;"
-            " border: none;"
-            " border-radius: 6px;"
-            " padding: 7px 12px;"
-            "}"
-            "QPushButton:hover {"
-            " background-color: #4AA8FF;"
-            "}"
-            "QPushButton:pressed {"
-            " background-color: #1E7FCC;"
-            "}"
-        )
-        try:
-            translucent = background_opacity < 100
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
-            if hasattr(self, "central_widget"):
-                self.central_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
-                self.central_widget.setStyleSheet("background: transparent;" if translucent else "")
+            self.central_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
+            self.central_widget.setStyleSheet("background: transparent;" if translucent else "")
         except Exception:
             pass
+
+        self.tab_widget.setStyleSheet(
+            "QTabWidget::pane {"
+            f" border: 1px solid {self.readable_border_color(background)};"
+            " border-radius: 6px;"
+            "}"
+            "QTabBar::tab {"
+            f" background-color: {self.rgba_color(background, max(background_opacity, 85))};"
+            f" color: {foreground};"
+            " padding: 6px 12px;"
+            " border-top-left-radius: 6px;"
+            " border-top-right-radius: 6px;"
+            " margin-right: 2px;"
+            "}"
+            "QTabBar::tab:selected {"
+            f" background-color: {accent};"
+            " color: white;"
+            "}"
+        )
+
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if isinstance(tab, TerminalTab):
+                tab.apply_theme()
+
         try:
             self.setWindowOpacity(max(0.2, min(1.0, self.window_opacity / 100.0)))
         except Exception:
             pass
-    def eventFilter(self, source, event):
-        if source is self.input_line and event.type() == QEvent.Type.KeyPress:
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ControlModifier):
-                self.execute_command()
-                return True
-            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
-                self.input_line.insertPlainText('\n')
-                return True
-            if event.key() == Qt.Key_Up:
-                self.show_previous_command()
-                return True
-            elif event.key() == Qt.Key_Down:
-                self.show_next_command()
-                return True
-        return super().eventFilter(source, event)
-    
-    def show_previous_command(self):
-        if not self.history:
-            return
-        
-        if self.history_index == -1:
-            self.current_command = self.input_line.toPlainText()
-            self.history_index = len(self.history) - 1
-        elif self.history_index > 0:
-            self.history_index -= 1
-            
-        self.input_line.setPlainText(self.history[self.history_index])
-    
-    def show_next_command(self):
-        if not self.history:
-            return
-            
-        if self.history_index < len(self.history) - 1:
-            self.history_index += 1
-            self.input_line.setPlainText(self.history[self.history_index])
-        elif self.history_index == len(self.history) - 1:
-            self.history_index = -1
-            self.input_line.setPlainText(self.current_command)
-    
-    
+
     def show_font_dialog(self):
-        current_font = self.output_area.font()
-        result = QFontDialog.getFont(current_font, self, "Terminal Schriftart wählen")
+        result = QFontDialog.getFont(self.terminal_font, self, "Terminal Schriftart wählen")
         if isinstance(result, tuple) and len(result) >= 2 and isinstance(result[0], bool):
             ok, font = result[0], result[1]
         else:
             font, ok = result
         if ok:
-            self.output_area.setFont(font)
-            self.input_line.setFont(font)
+            self.terminal_font = font
+            for i in range(self.tab_widget.count()):
+                tab = self.tab_widget.widget(i)
+                if isinstance(tab, TerminalTab):
+                    tab.set_terminal_font(font)
             self.save_settings()
 
     def show_color_dialog(self):
@@ -710,7 +914,7 @@ class TerminalWindow(QMainWindow):
         contrast_row = QWidget(dialog)
         contrast_layout = QHBoxLayout(contrast_row)
         contrast_layout.setContentsMargins(0, 0, 0, 0)
-        contrast_slider = QSlider(Qt.Horizontal, dialog)
+        contrast_slider = QSlider(Qt.Orientation.Horizontal, dialog)
         contrast_slider.setRange(0, 100)
         contrast_slider.setSingleStep(5)
         contrast_slider.setPageStep(5)
@@ -722,7 +926,7 @@ class TerminalWindow(QMainWindow):
         background_opacity_row = QWidget(dialog)
         background_opacity_layout = QHBoxLayout(background_opacity_row)
         background_opacity_layout.setContentsMargins(0, 0, 0, 0)
-        background_opacity_slider = QSlider(Qt.Horizontal, dialog)
+        background_opacity_slider = QSlider(Qt.Orientation.Horizontal, dialog)
         background_opacity_slider.setRange(0, 100)
         background_opacity_slider.setSingleStep(5)
         background_opacity_slider.setPageStep(5)
@@ -736,7 +940,7 @@ class TerminalWindow(QMainWindow):
         opacity_row = QWidget(dialog)
         opacity_layout = QHBoxLayout(opacity_row)
         opacity_layout.setContentsMargins(0, 0, 0, 0)
-        opacity_slider = QSlider(Qt.Horizontal, dialog)
+        opacity_slider = QSlider(Qt.Orientation.Horizontal, dialog)
         opacity_slider.setRange(20, 100)
         opacity_slider.setSingleStep(5)
         opacity_slider.setPageStep(5)
@@ -830,7 +1034,7 @@ class TerminalWindow(QMainWindow):
         opacity_value.setText(f"{self.window_opacity} %")
         refresh_controls_from_theme()
 
-        if dialog.exec() == QDialog.Accepted:
+        if dialog.exec() == QDialog.DialogCode.Accepted:
             if self.theme_mode == "light":
                 self.color_scheme_name = "Hell"
             elif self.theme_mode == "dark":
@@ -854,81 +1058,27 @@ class TerminalWindow(QMainWindow):
             self.save_settings()
 
     def show_history_dialog(self):
-        size, ok = QInputDialog.getInt(self, "History-Größe", "Maximale Anzahl an History-Einträgen:",
-                                     self.max_history_size, 1, 10000, 1)
+        size, ok = QInputDialog.getInt(
+            self,
+            "History-Größe",
+            "Maximale Anzahl an History-Einträgen:",
+            self.max_history_size,
+            1,
+            10000,
+            1,
+        )
         if ok:
             self.max_history_size = size
             self.history = self.history[-self.max_history_size:]
             self.save_history()
             self.save_settings()
 
-    def execute_command(self):
-        command_text = self.input_line.toPlainText().strip()
-        commands = [
-            cmd.strip()
-            for line in command_text.splitlines()
-            for cmd in line.split(';')
-            if cmd.strip()
-        ]
-        if not commands:
-            return
-
-        # Add original input block to history so grouped commands can be recalled together
-        history_entry = command_text
-        if history_entry and (not self.history or self.history[-1] != history_entry):
-            self.history.append(history_entry)
-        self.save_history()
-        self.history_index = -1
-        self.current_command = ""
-
-        # Process each non-empty command without displaying in output
-        for command in commands:
-            if command.lower() in ("cls", "clear"):
-                self.output_area.clear()
-            elif self.process.state() != QProcess.Running:
-                self.output_area.append(
-                    f"Shell ist nicht aktiv: {self.process.errorString() or 'Prozess wurde beendet.'}"
-                )
-                break
-            else:
-                self.process.write(command.encode() + b"\n")
-        self.input_line.clear()
-        
-    def _decode_process_output(self, raw) -> str:
-        data = bytes(raw)
-        for encoding in ("cp850", "mbcs", "cp1252", "utf-8", "latin-1"):
-            try:
-                return data.decode(encoding)
-            except UnicodeDecodeError:
-                continue
-        return data.decode("utf-8", errors="replace")
-    def handle_stdout(self):
-        data = self._decode_process_output(self.process.readAllStandardOutput())
-        self.output_area.moveCursor(QTextCursor.End)
-        self.output_area.insertPlainText(data)
-        self.output_area.moveCursor(QTextCursor.End)
-        self.output_area.ensureCursorVisible()    
-    def handle_stderr(self):
-        data = self._decode_process_output(self.process.readAllStandardError())
-        self.output_area.moveCursor(QTextCursor.End)
-        self.output_area.setTextColor(Qt.red)
-        self.output_area.insertPlainText(data)
-        self.output_area.setTextColor(QColor(self.active_theme().get("foreground", "#d4d4d4")))
-        self.output_area.moveCursor(QTextCursor.End)
-        self.output_area.ensureCursorVisible()    
-    def handle_finished(self, exit_code, exit_status):
-        self.output_area.append(f"\nProcess finished with exit code {exit_code}")
-
-    def handle_process_error(self, error):
-        self.output_area.append(f"\nShell konnte nicht gestartet werden: {self.process.errorString()}")
-        
     def closeEvent(self, event):
         self.save_settings()
-        if self.process.state() == QProcess.Running:
-            self.process.terminate()
-            if not self.process.waitForFinished(2000):
-                self.process.kill()
-                self.process.waitForFinished(1000)
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if isinstance(tab, TerminalTab):
+                tab.stop_process()
         event.accept()
 
 
@@ -946,5 +1096,5 @@ def main() -> int:
     return app.exec()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())
