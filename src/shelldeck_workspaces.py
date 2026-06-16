@@ -23,6 +23,7 @@ def normalize_workspace(value: Any) -> Dict[str, Any]:
                 "command_history": [str(value or "").strip() for value in item.get("command_history", []) if str(value or "").strip()] if isinstance(item.get("command_history"), list) else [],
                 "restore_command": _clean_text(item.get("restore_command")),
                 "venv_path": _clean_text(item.get("venv_path")),
+                "view_pane": _clean_text(item.get("view_pane")) or "main",
                 "client_mode_kind": _clean_text(item.get("client_mode_kind") or item.get("client_mode")),
                 "ollama_model": _clean_text(item.get("ollama_model")),
                 "ollama_system_prompt": _clean_text(item.get("ollama_system_prompt")),
@@ -33,6 +34,7 @@ def normalize_workspace(value: Any) -> Dict[str, Any]:
         "default_start_directory": _clean_text(data.get("default_start_directory")),
         "selected_ollama_model": _clean_text(data.get("selected_ollama_model")),
         "shell_type": _clean_text(data.get("shell_type")) or "cmd",
+        "layout_mode": _clean_text(data.get("layout_mode")) or "single",
     }
 
 
@@ -58,6 +60,7 @@ def workspace_from_tabs(
     default_start_directory: str = "",
     selected_ollama_model: str = "",
     shell_type: str = "cmd",
+    layout_mode: str = "single",
 ) -> Dict[str, Any]:
     return normalize_workspace({
         "name": name,
@@ -65,6 +68,7 @@ def workspace_from_tabs(
         "default_start_directory": default_start_directory,
         "selected_ollama_model": selected_ollama_model,
         "shell_type": shell_type,
+        "layout_mode": layout_mode,
     })
 
 

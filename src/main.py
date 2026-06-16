@@ -19,7 +19,7 @@ from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
-    QDialog, QFormLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
+    QDialog, QFormLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QSlider,
     QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog,
     QLineEdit, QListWidget, QListWidgetItem, QSplitter
 )
@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.13.2"
+APP_VERSION = "2.14.0"
 
 
 def install_crash_logging():
@@ -1524,12 +1524,31 @@ class TerminalWindow(QMainWindow):
 
         self.view_menu = menubar.addMenu("&Ansicht")
 
-        self.split_view_action = QAction("Zwei Ansichten nebeneinander", self)
+        self.view_single_action = QAction("Einzelansicht", self)
+        self.view_single_action.setCheckable(True)
+        self.view_single_action.triggered.connect(lambda checked=False: self.set_view_layout_mode("single"))
+        self.view_menu.addAction(self.view_single_action)
+
+        self.split_view_action = QAction("2er horizontal: links | rechts", self)
         self.split_view_action.setCheckable(True)
-        self.split_view_action.triggered.connect(self.set_split_view_enabled)
+        self.split_view_action.triggered.connect(lambda checked=False: self.set_view_layout_mode("horizontal"))
         self.view_menu.addAction(self.split_view_action)
 
-        self.move_to_other_view_action = QAction("Aktuellen Tab in andere Ansicht verschieben", self)
+        self.view_vertical_action = QAction("2er vertikal: oben / unten", self)
+        self.view_vertical_action.setCheckable(True)
+        self.view_vertical_action.triggered.connect(lambda checked=False: self.set_view_layout_mode("vertical"))
+        self.view_menu.addAction(self.view_vertical_action)
+
+        self.view_quad_action = QAction("4er Raster", self)
+        self.view_quad_action.setCheckable(True)
+        self.view_quad_action.triggered.connect(lambda checked=False: self.set_view_layout_mode("quad"))
+        self.view_menu.addAction(self.view_quad_action)
+
+        self.view_menu.addSeparator()
+        self.move_view_menu = self.view_menu.addMenu("Aktuellen Tab verschieben nach")
+        self.rebuild_move_view_menu()
+
+        self.move_to_other_view_action = QAction("Aktuellen Tab in nächste Ansicht verschieben", self)
         self.move_to_other_view_action.triggered.connect(self.move_current_tab_to_other_view)
         self.view_menu.addAction(self.move_to_other_view_action)
 
@@ -1622,19 +1641,21 @@ class TerminalWindow(QMainWindow):
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.view_container = QWidget()
+        self.view_grid = QGridLayout(self.view_container)
+        self.view_grid.setContentsMargins(0, 0, 0, 0)
+        self.view_grid.setSpacing(4)
         self.tab_widget = self.create_terminal_tab_widget()
         self.secondary_tab_widget = self.create_terminal_tab_widget()
-        self.secondary_tab_widget.hide()
+        self.tertiary_tab_widget = self.create_terminal_tab_widget()
+        self.quaternary_tab_widget = self.create_terminal_tab_widget()
         self.active_tab_widget = self.tab_widget
+        self.view_layout_mode = "single"
         self.split_view_enabled = False
-        self.splitter.addWidget(self.tab_widget)
-        self.splitter.addWidget(self.secondary_tab_widget)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 1)
-        layout.addWidget(self.splitter)
+        layout.addWidget(self.view_container)
 
         self.load_settings()
+        self.apply_view_layout(move_tabs=False)
         self.update_ai_menu_visibility()
         self.rebuild_saved_paths_menu()
         self.rebuild_profiles_menu()
@@ -1671,11 +1692,19 @@ class TerminalWindow(QMainWindow):
 
     def terminal_tab_widgets(self):
         widgets = []
-        if hasattr(self, "tab_widget") and self.tab_widget is not None:
-            widgets.append(self.tab_widget)
-        if hasattr(self, "secondary_tab_widget") and self.secondary_tab_widget is not None:
-            widgets.append(self.secondary_tab_widget)
+        for name in ("tab_widget", "secondary_tab_widget", "tertiary_tab_widget", "quaternary_tab_widget"):
+            widget = getattr(self, name, None)
+            if widget is not None and widget not in widgets:
+                widgets.append(widget)
         return widgets
+
+    def view_pane_widgets(self):
+        return {
+            "main": self.tab_widget,
+            "secondary": self.secondary_tab_widget,
+            "tertiary": self.tertiary_tab_widget,
+            "quaternary": self.quaternary_tab_widget,
+        }
 
     def all_terminal_tabs(self):
         for tab_widget in self.terminal_tab_widgets():
@@ -1698,31 +1727,205 @@ class TerminalWindow(QMainWindow):
         if tab_widget in self.terminal_tab_widgets():
             self.active_tab_widget = tab_widget
 
-    def set_split_view_enabled(self, enabled):
-        enabled = bool(enabled)
-        self.split_view_enabled = enabled
-        if hasattr(self, "split_view_action"):
-            self.split_view_action.blockSignals(True)
-            self.split_view_action.setChecked(enabled)
-            self.split_view_action.blockSignals(False)
+    def view_mode_pane_order(self, mode=None):
+        mode = str(mode or getattr(self, "view_layout_mode", "single") or "single")
+        if mode == "horizontal":
+            return ["left", "right"]
+        if mode == "vertical":
+            return ["top", "bottom"]
+        if mode == "quad":
+            return ["top_left", "top_right", "bottom_left", "bottom_right"]
+        return ["main"]
 
-        if enabled:
-            self.secondary_tab_widget.show()
-            self.splitter.setSizes([1, 1])
-            self.show_status("Zwei-Ansichten-Modus aktiv")
+    def pane_widget_for_logical_pane(self, pane, mode=None):
+        mode = str(mode or getattr(self, "view_layout_mode", "single") or "single")
+        pane = str(pane or "main")
+        if mode == "horizontal":
+            return {"left": self.tab_widget, "right": self.secondary_tab_widget, "main": self.tab_widget}.get(pane, self.tab_widget)
+        if mode == "vertical":
+            return {"top": self.tab_widget, "bottom": self.secondary_tab_widget, "main": self.tab_widget}.get(pane, self.tab_widget)
+        if mode == "quad":
+            return {
+                "top_left": self.tab_widget,
+                "top_right": self.secondary_tab_widget,
+                "bottom_left": self.tertiary_tab_widget,
+                "bottom_right": self.quaternary_tab_widget,
+                "left": self.tab_widget,
+                "right": self.secondary_tab_widget,
+                "top": self.tab_widget,
+                "bottom": self.tertiary_tab_widget,
+                "main": self.tab_widget,
+            }.get(pane, self.tab_widget)
+        return self.tab_widget
+
+    def logical_pane_for_widget(self, tab_widget):
+        mode = str(getattr(self, "view_layout_mode", "single") or "single")
+        if mode == "horizontal":
+            if tab_widget is self.secondary_tab_widget:
+                return "right"
+            return "left"
+        if mode == "vertical":
+            if tab_widget is self.secondary_tab_widget:
+                return "bottom"
+            return "top"
+        if mode == "quad":
+            if tab_widget is self.secondary_tab_widget:
+                return "top_right"
+            if tab_widget is self.tertiary_tab_widget:
+                return "bottom_left"
+            if tab_widget is self.quaternary_tab_widget:
+                return "bottom_right"
+            return "top_left"
+        return "main"
+
+    def logical_pane_label(self, pane, mode=None):
+        labels = {
+            "main": "Hauptansicht",
+            "left": "links",
+            "right": "rechts",
+            "top": "oben",
+            "bottom": "unten",
+            "top_left": "links oben",
+            "top_right": "rechts oben",
+            "bottom_left": "links unten",
+            "bottom_right": "rechts unten",
+        }
+        return labels.get(str(pane or "main"), str(pane or "main"))
+
+    def layout_mode_for_target_pane(self, pane):
+        pane = str(pane or "main")
+        if pane in {"left", "right"}:
+            return "horizontal"
+        if pane in {"top", "bottom"}:
+            return "vertical"
+        if pane in {"top_left", "top_right", "bottom_left", "bottom_right"}:
+            return "quad"
+        return "single"
+
+    def clear_view_grid(self):
+        while self.view_grid.count():
+            item = self.view_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(self.view_container)
+                widget.hide()
+
+    def move_all_tabs(self, source, target):
+        if source is target:
             return
-
-        while self.secondary_tab_widget.count() > 0:
-            tab = self.secondary_tab_widget.widget(0)
-            label = self.secondary_tab_widget.tabText(0)
-            self.secondary_tab_widget.removeTab(0)
-            index = self.tab_widget.addTab(tab, label)
-            self.tab_widget.setCurrentIndex(index)
+        while source.count() > 0:
+            tab = source.widget(0)
+            label = source.tabText(0)
+            source.removeTab(0)
+            target.addTab(tab, label)
             if isinstance(tab, TerminalTab):
                 self.update_tab_title(tab)
-        self.secondary_tab_widget.hide()
-        self.active_tab_widget = self.tab_widget
-        self.show_status("Einzelansicht aktiv")
+
+    def apply_view_layout(self, move_tabs=True):
+        mode = str(getattr(self, "view_layout_mode", "single") or "single")
+        if mode not in {"single", "horizontal", "vertical", "quad"}:
+            mode = "single"
+            self.view_layout_mode = mode
+
+        if move_tabs:
+            if mode == "single":
+                for widget in (self.secondary_tab_widget, self.tertiary_tab_widget, self.quaternary_tab_widget):
+                    self.move_all_tabs(widget, self.tab_widget)
+            elif mode in {"horizontal", "vertical"}:
+                self.move_all_tabs(self.tertiary_tab_widget, self.tab_widget)
+                self.move_all_tabs(self.quaternary_tab_widget, self.secondary_tab_widget)
+
+        self.clear_view_grid()
+        if mode == "single":
+            self.view_grid.addWidget(self.tab_widget, 0, 0, 1, 1)
+            visible = [self.tab_widget]
+        elif mode == "horizontal":
+            self.view_grid.addWidget(self.tab_widget, 0, 0, 1, 1)
+            self.view_grid.addWidget(self.secondary_tab_widget, 0, 1, 1, 1)
+            self.view_grid.setColumnStretch(0, 1)
+            self.view_grid.setColumnStretch(1, 1)
+            visible = [self.tab_widget, self.secondary_tab_widget]
+        elif mode == "vertical":
+            self.view_grid.addWidget(self.tab_widget, 0, 0, 1, 1)
+            self.view_grid.addWidget(self.secondary_tab_widget, 1, 0, 1, 1)
+            self.view_grid.setRowStretch(0, 1)
+            self.view_grid.setRowStretch(1, 1)
+            visible = [self.tab_widget, self.secondary_tab_widget]
+        else:
+            self.view_grid.addWidget(self.tab_widget, 0, 0, 1, 1)
+            self.view_grid.addWidget(self.secondary_tab_widget, 0, 1, 1, 1)
+            self.view_grid.addWidget(self.tertiary_tab_widget, 1, 0, 1, 1)
+            self.view_grid.addWidget(self.quaternary_tab_widget, 1, 1, 1, 1)
+            self.view_grid.setColumnStretch(0, 1)
+            self.view_grid.setColumnStretch(1, 1)
+            self.view_grid.setRowStretch(0, 1)
+            self.view_grid.setRowStretch(1, 1)
+            visible = [self.tab_widget, self.secondary_tab_widget, self.tertiary_tab_widget, self.quaternary_tab_widget]
+
+        for widget in self.terminal_tab_widgets():
+            widget.setVisible(widget in visible)
+        if self.active_tab_widget not in visible:
+            self.active_tab_widget = self.tab_widget
+        self.split_view_enabled = mode in {"horizontal", "vertical", "quad"}
+        self.update_view_actions()
+        self.rebuild_move_view_menu()
+        self.apply_color_scheme()
+
+    def update_view_actions(self):
+        mode = str(getattr(self, "view_layout_mode", "single") or "single")
+        action_map = {
+            "single": getattr(self, "view_single_action", None),
+            "horizontal": getattr(self, "split_view_action", None),
+            "vertical": getattr(self, "view_vertical_action", None),
+            "quad": getattr(self, "view_quad_action", None),
+        }
+        for action_mode, action in action_map.items():
+            if action is None:
+                continue
+            action.blockSignals(True)
+            action.setChecked(action_mode == mode)
+            action.blockSignals(False)
+
+    def set_view_layout_mode(self, mode, move_tabs=True):
+        mode = str(mode or "single")
+        if mode not in {"single", "horizontal", "vertical", "quad"}:
+            mode = "single"
+        self.view_layout_mode = mode
+        self.apply_view_layout(move_tabs=move_tabs)
+        self.save_settings()
+        labels = {
+            "single": "Einzelansicht aktiv",
+            "horizontal": "2er horizontal aktiv",
+            "vertical": "2er vertikal aktiv",
+            "quad": "4er Raster aktiv",
+        }
+        self.show_status(labels.get(mode, "Ansicht geändert"))
+
+    def set_split_view_enabled(self, enabled):
+        self.set_view_layout_mode("horizontal" if enabled else "single")
+
+    def rebuild_move_view_menu(self):
+        menu = getattr(self, "move_view_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        for pane in self.view_mode_pane_order():
+            label = self.logical_pane_label(pane)
+            action = QAction(label.capitalize(), self)
+            action.triggered.connect(lambda checked=False, p=pane: self.move_current_tab_to_pane(p))
+            menu.addAction(action)
+
+        menu.addSeparator()
+        for label, pane in (
+            ("Horizontal rechts", "right"),
+            ("Vertikal unten", "bottom"),
+            ("Raster: rechts oben", "top_right"),
+            ("Raster: links unten", "bottom_left"),
+            ("Raster: rechts unten", "bottom_right"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked=False, p=pane: self.move_current_tab_to_pane(p))
+            menu.addAction(action)
 
     def move_current_tab_to_other_view(self):
         tab = self.current_terminal()
@@ -1731,18 +1934,40 @@ class TerminalWindow(QMainWindow):
         source, index = self.tab_widget_for_tab(tab)
         if source is None or index < 0:
             return
-        if not self.split_view_enabled:
-            self.set_split_view_enabled(True)
-        target = self.secondary_tab_widget if source is self.tab_widget else self.tab_widget
+        order = self.view_mode_pane_order()
+        current_pane = self.logical_pane_for_widget(source)
+        if current_pane not in order or len(order) < 2:
+            target_pane = "right"
+        else:
+            target_pane = order[(order.index(current_pane) + 1) % len(order)]
+        self.move_current_tab_to_pane(target_pane)
+
+    def move_current_tab_to_pane(self, pane):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        source, index = self.tab_widget_for_tab(tab)
+        if source is None or index < 0:
+            return
+
+        target_mode = self.layout_mode_for_target_pane(pane)
+        if target_mode != self.view_layout_mode and target_mode != "single":
+            self.view_layout_mode = target_mode
+            self.apply_view_layout(move_tabs=False)
+
+        target = self.pane_widget_for_logical_pane(pane)
+        if target is source:
+            self.show_status(f"Tab ist bereits in Ansicht {self.logical_pane_label(self.logical_pane_for_widget(source))}")
+            return
+
         label = source.tabText(index)
         source.removeTab(index)
         new_index = target.addTab(tab, label)
         target.setCurrentIndex(new_index)
         self.active_tab_widget = target
         self.update_tab_title(tab)
-        if source.count() == 0:
-            self.new_tab(target_tab_widget=source)
-        self.show_status("Tab in andere Ansicht verschoben")
+        self.save_settings()
+        self.show_status(f"Tab nach {self.logical_pane_label(self.logical_pane_for_widget(target))} verschoben")
 
     def update_ai_menu_visibility(self):
         enabled = bool(getattr(self, "ai_features_enabled", False))
@@ -1782,7 +2007,7 @@ class TerminalWindow(QMainWindow):
             venv_path=venv_path,
         )
         target = target_tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
-        if target is self.secondary_tab_widget and not self.split_view_enabled:
+        if target not in self.terminal_tab_widgets() or not target.isVisible():
             target = self.tab_widget
         index = target.addTab(tab, tab.title or f"Terminal {self.total_terminal_tab_count() + 1}")
         target.setCurrentIndex(index)
@@ -2095,6 +2320,7 @@ class TerminalWindow(QMainWindow):
             default_start_directory=self.default_start_directory,
             selected_ollama_model=self.selected_ollama_model,
             shell_type=self.shell_type,
+            layout_mode=getattr(self, "view_layout_mode", "single"),
         )
         self.workspaces = [
             item for item in normalize_workspaces(self.workspaces)
@@ -2160,6 +2386,9 @@ class TerminalWindow(QMainWindow):
         if shell_type and self.system_shell(shell_type):
             self.shell_type = shell_type
 
+        layout_mode = str(workspace.get("layout_mode", "single") or "single")
+        self.set_view_layout_mode(layout_mode if layout_mode in {"single", "horizontal", "vertical", "quad"} else "single", move_tabs=False)
+
         self.clear_all_tabs_for_workspace_load()
 
         restored = False
@@ -2176,6 +2405,7 @@ class TerminalWindow(QMainWindow):
                 command_history=item.get("command_history", []),
                 restore_command=item.get("restore_command", ""),
                 venv_path=item.get("venv_path", ""),
+                target_tab_widget=self.pane_widget_for_logical_pane(item.get("view_pane", "main")),
             )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
@@ -2347,7 +2577,7 @@ class TerminalWindow(QMainWindow):
             tab.deleteLater()
         if self.total_terminal_tab_count() == 0:
             self.new_tab(target_tab_widget=self.tab_widget)
-        elif tab_widget.count() == 0 and tab_widget is self.secondary_tab_widget and self.split_view_enabled:
+        elif tab_widget.count() == 0 and self.active_tab_widget is tab_widget:
             self.active_tab_widget = self.tab_widget
 
     def show_tab_context_menu(self, pos, tab_widget=None):
@@ -2370,7 +2600,25 @@ class TerminalWindow(QMainWindow):
         update_directory_action.triggered.connect(self.update_current_tab_directory)
         menu.addAction(update_directory_action)
 
-        move_split_action = QAction("In andere Ansicht verschieben", self)
+        move_menu = menu.addMenu("In Ansicht verschieben")
+        for pane in self.view_mode_pane_order():
+            label = self.logical_pane_label(pane).capitalize()
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked=False, p=pane: self.move_current_tab_to_pane(p))
+            move_menu.addAction(action)
+        move_menu.addSeparator()
+        for label, pane in (
+            ("Horizontal rechts", "right"),
+            ("Vertikal unten", "bottom"),
+            ("Raster: rechts oben", "top_right"),
+            ("Raster: links unten", "bottom_left"),
+            ("Raster: rechts unten", "bottom_right"),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(lambda checked=False, p=pane: self.move_current_tab_to_pane(p))
+            move_menu.addAction(action)
+
+        move_split_action = QAction("In nächste Ansicht verschieben", self)
         move_split_action.triggered.connect(self.move_current_tab_to_other_view)
         menu.addAction(move_split_action)
 
@@ -2642,6 +2890,7 @@ class TerminalWindow(QMainWindow):
                 command_history=item.get("command_history", []),
                 restore_command=item.get("restore_command", ""),
                 venv_path=item.get("venv_path", ""),
+                target_tab_widget=self.pane_widget_for_logical_pane(item.get("view_pane", "main")),
             )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
@@ -2661,7 +2910,7 @@ class TerminalWindow(QMainWindow):
         tabs = []
         if not hasattr(self, "tab_widget"):
             return tabs
-        for _, _, tab in self.all_terminal_tabs():
+        for tab_widget, _, tab in self.all_terminal_tabs():
             item = {
                 "shell_type": tab.shell_type,
                 "title": tab.custom_title,
@@ -2669,6 +2918,7 @@ class TerminalWindow(QMainWindow):
                 "command_history": list(tab.command_history)[-self.max_history_size:],
                 "restore_command": tab.current_restore_command(),
                 "venv_path": tab.current_venv_path(),
+                "view_pane": self.logical_pane_for_widget(tab_widget),
             }
             if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
                 item.update({
@@ -3077,6 +3327,8 @@ class TerminalWindow(QMainWindow):
 
         saved_tabs = settings.get("tabs", [])
         self.saved_tabs = saved_tabs if isinstance(saved_tabs, list) else []
+        layout_mode = str(settings.get("view_layout_mode", self.view_layout_mode) or "single")
+        self.view_layout_mode = layout_mode if layout_mode in {"single", "horizontal", "vertical", "quad"} else "single"
 
         saved_paths = settings.get("saved_paths", [])
         self.saved_paths = [
@@ -3102,6 +3354,7 @@ class TerminalWindow(QMainWindow):
             "max_history_size": self.max_history_size,
             "shell_type": self.shell_type,
             "tabs": self.collect_tab_settings(),
+            "view_layout_mode": getattr(self, "view_layout_mode", "single"),
             "saved_paths": self.saved_paths,
             "default_start_directory": self.default_start_directory,
             "selected_ollama_model": self.selected_ollama_model,
@@ -3865,7 +4118,7 @@ Hinweise
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends, "
             "gespeicherten Ordnerpfaden, Tab-Profilen, Workspaces, Befehlspalette "
-            "und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts und Chat-artigen Codeblöcken.</p>"
+            "flexiblen Split-/Raster-Ansichten und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts und Chat-artigen Codeblöcken.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
             "<p>Modulare Helferdateien: shelldeck_profiles.py, "
