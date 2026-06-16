@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.12.0"
+APP_VERSION = "2.13.0"
 
 
 def install_crash_logging():
@@ -137,7 +137,7 @@ class OllamaApiWorker(QThread):
 
 
 class TerminalTab(QWidget):
-    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None):
+    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None, restore_command=""):
         super().__init__(window)
         self.window = window
         self.shell_type = shell_type or window.shell_type
@@ -148,6 +148,7 @@ class TerminalTab(QWidget):
         self.history_index = -1
         self.current_command = ""
         self.command_history = self.normalize_command_history(command_history)
+        self.restore_command = str(restore_command or "").strip()
         self.client_mode_active = False
         self.client_mode_name = ""
         self.client_mode_kind = ""
@@ -600,6 +601,80 @@ class TerminalTab(QWidget):
             self.window.save_history()
         self.window.save_settings()
 
+    def command_looks_like_venv_activation(self, command):
+        text = str(command or "").strip()
+        lower = text.lower().replace("/", "\\")
+        if "activate" not in lower:
+            return False
+        return (
+            "venv" in lower
+            or ".venv" in lower
+            or "scripts\\activate" in lower
+            or "bin\\activate" in lower
+        )
+
+    def update_restore_command_from_command(self, command):
+        text = str(command or "").strip()
+        if self.command_looks_like_venv_activation(text):
+            self.restore_command = text
+
+    def infer_venv_restore_command(self):
+        for command in reversed(self.command_history):
+            if self.command_looks_like_venv_activation(command):
+                return str(command).strip()
+
+        output = self.output_area.toPlainText()
+        if "(.venv)" not in output and "(venv)" not in output:
+            return ""
+
+        directory = self.refresh_current_working_directory()
+        if not directory:
+            return ""
+        root = Path(directory)
+        candidates = []
+        shell = str(self.shell_type or "").lower()
+        if sys.platform == "win32" and shell in {"powershell", "pwsh"}:
+            candidates = [
+                (root / ".venv" / "Scripts" / "Activate.ps1", r".\.venv\Scripts\Activate.ps1"),
+                (root / ".venv" / "Scripts" / "activate", r".\.venv\Scripts\activate"),
+            ]
+        elif sys.platform == "win32" and shell == "cmd":
+            candidates = [
+                (root / ".venv" / "Scripts" / "activate.bat", r".venv\Scripts\activate.bat"),
+            ]
+        else:
+            candidates = [
+                (root / ".venv" / "bin" / "activate", "source .venv/bin/activate"),
+                (root / ".venv" / "Scripts" / "activate", "source .venv/Scripts/activate"),
+            ]
+
+        for path, command in candidates:
+            if path.exists():
+                return command
+        return ""
+
+    def current_restore_command(self):
+        explicit = str(self.restore_command or "").strip()
+        if explicit:
+            return explicit
+        return self.infer_venv_restore_command()
+
+    def run_restore_command(self, command=None):
+        text = str(command if command is not None else self.restore_command or "").strip()
+        if not text:
+            return False
+        self.restore_command = text
+        if self.client_mode_active:
+            return False
+        if self.process.state() != QProcess.ProcessState.Running:
+            self.process.waitForStarted(2500)
+        if self.process.state() != QProcess.ProcessState.Running:
+            self.output_area.append(f"\n[Wiederherstellungsbefehl konnte nicht ausgeführt werden: Shell ist nicht aktiv] {text}\n")
+            return False
+        self.process.write(text.encode() + b"\n")
+        self.process.waitForBytesWritten(1000)
+        return True
+
     def show_previous_command(self):
         history = self.tab_history()
         if not history:
@@ -794,6 +869,7 @@ class TerminalTab(QWidget):
             return
 
         self.add_command_history(payload)
+        self.update_restore_command_from_command(payload)
         self.history_index = -1
         self.current_command = ""
         self.client_process.write(payload.encode() + b"\n")
@@ -1109,6 +1185,7 @@ class TerminalTab(QWidget):
 
         history_entry = command_text
         self.add_command_history(history_entry)
+        self.update_restore_command_from_command(history_entry)
         self.history_index = -1
         self.current_command = ""
 
@@ -1559,7 +1636,7 @@ class TerminalWindow(QMainWindow):
         self.show_status("KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.")
         return False
 
-    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None):
+    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command=""):
         effective_start_directory = start_directory
         if effective_start_directory is None:
             effective_start_directory = self.default_start_directory
@@ -1569,6 +1646,7 @@ class TerminalWindow(QMainWindow):
             custom_title=title,
             start_directory=effective_start_directory,
             command_history=command_history,
+            restore_command=restore_command,
         )
         target = target_tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
         if target is self.secondary_tab_widget and not self.split_view_enabled:
@@ -1963,6 +2041,7 @@ class TerminalWindow(QMainWindow):
                 title=str(item.get("title", "") or ""),
                 start_directory=str(item.get("working_directory", "") or ""),
                 command_history=item.get("command_history", []),
+                restore_command=item.get("restore_command", ""),
             )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
@@ -1972,6 +2051,8 @@ class TerminalWindow(QMainWindow):
                         ollama_model or self.selected_ollama_model,
                         system_prompt=str(item.get("ollama_system_prompt", "") or ""),
                     )
+                else:
+                    tab.run_restore_command(item.get("restore_command", ""))
             restored = True
 
         if not restored:
@@ -2406,6 +2487,7 @@ class TerminalWindow(QMainWindow):
                 title=title,
                 start_directory=tab.refresh_current_working_directory(),
                 command_history=list(tab.command_history),
+                restore_command=tab.current_restore_command(),
             )
 
     def restore_tabs_from_settings(self):
@@ -2418,7 +2500,13 @@ class TerminalWindow(QMainWindow):
                 shell_type = self.shell_type
             title = str(item.get("title", "") or "")
             working_directory = str(item.get("working_directory", "") or "")
-            tab = self.new_tab(shell_type=shell_type, title=title, start_directory=working_directory, command_history=item.get("command_history", []))
+            tab = self.new_tab(
+                shell_type=shell_type,
+                title=title,
+                start_directory=working_directory,
+                command_history=item.get("command_history", []),
+                restore_command=item.get("restore_command", ""),
+            )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
                 client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
@@ -2427,6 +2515,8 @@ class TerminalWindow(QMainWindow):
                         ollama_model or self.selected_ollama_model,
                         system_prompt=str(item.get("ollama_system_prompt", "") or ""),
                     )
+                else:
+                    tab.run_restore_command(item.get("restore_command", ""))
             restored = True
         if not restored:
             self.new_tab()
@@ -2441,6 +2531,7 @@ class TerminalWindow(QMainWindow):
                 "title": tab.custom_title,
                 "working_directory": tab.refresh_current_working_directory(),
                 "command_history": list(tab.command_history)[-self.max_history_size:],
+                "restore_command": tab.current_restore_command(),
             }
             if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
                 item.update({

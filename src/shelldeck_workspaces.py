@@ -21,6 +21,7 @@ def normalize_workspace(value: Any) -> Dict[str, Any]:
                 "title": _clean_text(item.get("title")),
                 "working_directory": _clean_text(item.get("working_directory")),
                 "command_history": [str(value or "").strip() for value in item.get("command_history", []) if str(value or "").strip()] if isinstance(item.get("command_history"), list) else [],
+                "restore_command": _clean_text(item.get("restore_command")),
                 "client_mode_kind": _clean_text(item.get("client_mode_kind") or item.get("client_mode")),
                 "ollama_model": _clean_text(item.get("ollama_model")),
                 "ollama_system_prompt": _clean_text(item.get("ollama_system_prompt")),
