@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.14.1"
+APP_VERSION = "2.15.0"
 
 
 def install_crash_logging():
@@ -1456,6 +1456,53 @@ class TerminalTab(QWidget):
         )
 
 
+class DetachedTerminalWindow(QMainWindow):
+    def __init__(self, owner, title="Entkoppelte Tabs"):
+        super().__init__(owner)
+        self.owner = owner
+        self._closing_from_owner = False
+        self.setWindowTitle(f"{APP_NAME} - {title}")
+        self.resize(900, 600)
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.tab_widget = owner.create_terminal_tab_widget(detached_window=self)
+        layout.addWidget(self.tab_widget)
+
+    def add_tab(self, tab, label=None):
+        label = label or getattr(tab, "custom_title", "") or getattr(tab, "title", "Terminal") or "Terminal"
+        index = self.tab_widget.addTab(tab, label)
+        self.tab_widget.setCurrentIndex(index)
+        self.owner.active_tab_widget = self.tab_widget
+        self.owner.update_tab_title(tab)
+        self.owner.apply_color_scheme()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        return index
+
+    def is_empty(self):
+        return self.tab_widget.count() <= 0
+
+    def reattach_all_tabs(self):
+        while self.tab_widget.count() > 0:
+            tab = self.tab_widget.widget(0)
+            label = self.tab_widget.tabText(0)
+            self.tab_widget.removeTab(0)
+            self.owner.attach_existing_tab_to_main(tab, label=label)
+
+    def closeEvent(self, event):
+        if getattr(self, "_closing_from_owner", False):
+            event.accept()
+            return
+        self.reattach_all_tabs()
+        self.owner.unregister_detached_window(self)
+        self.owner.save_settings()
+        event.accept()
+
+
+
 class TerminalWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1476,6 +1523,7 @@ class TerminalWindow(QMainWindow):
         self.default_start_directory = ""
         self.selected_ollama_model = ""
         self.ai_features_enabled = False
+        self.detached_windows = []
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
         workspace_config_base = Path(os.environ.get("APPDATA") or Path.home()) / "ShellDeckTerminal"
@@ -1553,6 +1601,15 @@ class TerminalWindow(QMainWindow):
         self.move_to_other_view_action = QAction("Aktuellen Tab in nächste Ansicht verschieben", self)
         self.move_to_other_view_action.triggered.connect(self.move_current_tab_to_other_view)
         self.view_menu.addAction(self.move_to_other_view_action)
+
+        self.view_menu.addSeparator()
+        self.detach_current_tab_action = QAction("Aktuellen Tab entkoppeln", self)
+        self.detach_current_tab_action.triggered.connect(self.detach_current_tab)
+        self.view_menu.addAction(self.detach_current_tab_action)
+
+        self.reattach_current_tab_action = QAction("Aktuellen Tab wieder ins Hauptfenster koppeln", self)
+        self.reattach_current_tab_action.triggered.connect(self.reattach_current_tab)
+        self.view_menu.addAction(self.reattach_current_tab_action)
 
         settings_menu = menubar.addMenu("&Einstellungen")
 
@@ -1680,8 +1737,9 @@ class TerminalWindow(QMainWindow):
         self.shortcut_command_palette = QShortcut("Ctrl+Shift+P", self)
         self.shortcut_command_palette.activated.connect(self.show_command_palette)
 
-    def create_terminal_tab_widget(self):
+    def create_terminal_tab_widget(self, detached_window=None):
         tab_widget = QTabWidget()
+        tab_widget._shelldeck_detached_window = detached_window
         tab_widget.setTabsClosable(True)
         tab_widget.setMovable(True)
         tab_widget.tabCloseRequested.connect(lambda index, w=tab_widget: self.close_tab(index, w))
@@ -1692,13 +1750,31 @@ class TerminalWindow(QMainWindow):
         )
         return tab_widget
 
-    def terminal_tab_widgets(self):
+    def main_terminal_tab_widgets(self):
         widgets = []
         for name in ("tab_widget", "secondary_tab_widget", "tertiary_tab_widget", "quaternary_tab_widget"):
             widget = getattr(self, name, None)
             if widget is not None and widget not in widgets:
                 widgets.append(widget)
         return widgets
+
+    def detached_tab_widgets(self):
+        widgets = []
+        for window in list(getattr(self, "detached_windows", [])):
+            widget = getattr(window, "tab_widget", None)
+            if widget is not None and widget not in widgets:
+                widgets.append(widget)
+        return widgets
+
+    def terminal_tab_widgets(self):
+        return self.main_terminal_tab_widgets() + self.detached_tab_widgets()
+
+    def is_detached_tab_widget(self, tab_widget):
+        return getattr(tab_widget, "_shelldeck_detached_window", None) is not None
+
+    def detached_window_for_tab_widget(self, tab_widget):
+        window = getattr(tab_widget, "_shelldeck_detached_window", None)
+        return window if window in getattr(self, "detached_windows", []) else None
 
     def view_pane_widgets(self):
         return {
@@ -1761,6 +1837,8 @@ class TerminalWindow(QMainWindow):
         return self.tab_widget
 
     def logical_pane_for_widget(self, tab_widget):
+        if self.is_detached_tab_widget(tab_widget):
+            return "detached"
         mode = str(getattr(self, "view_layout_mode", "single") or "single")
         if mode == "horizontal":
             if tab_widget is self.secondary_tab_widget:
@@ -1791,6 +1869,7 @@ class TerminalWindow(QMainWindow):
             "top_right": "rechts oben",
             "bottom_left": "links unten",
             "bottom_right": "rechts unten",
+            "detached": "entkoppelt",
         }
         return labels.get(str(pane or "main"), str(pane or "main"))
 
@@ -1864,7 +1943,7 @@ class TerminalWindow(QMainWindow):
             self.view_grid.setRowStretch(1, 1)
             visible = [self.tab_widget, self.secondary_tab_widget, self.tertiary_tab_widget, self.quaternary_tab_widget]
 
-        for widget in self.terminal_tab_widgets():
+        for widget in self.main_terminal_tab_widgets():
             widget.setVisible(widget in visible)
         if self.active_tab_widget not in visible:
             self.active_tab_widget = self.tab_widget
@@ -1968,8 +2047,84 @@ class TerminalWindow(QMainWindow):
         target.setCurrentIndex(new_index)
         self.active_tab_widget = target
         self.update_tab_title(tab)
+        self.cleanup_empty_detached_windows()
         self.save_settings()
         self.show_status(f"Tab nach {self.logical_pane_label(self.logical_pane_for_widget(target))} verschoben")
+
+    def ensure_detached_window(self):
+        windows = [window for window in getattr(self, "detached_windows", []) if window is not None]
+        self.detached_windows = windows
+        for window in self.detached_windows:
+            if not window.is_empty():
+                window.show()
+                return window
+        window = DetachedTerminalWindow(self)
+        self.detached_windows.append(window)
+        self.apply_color_scheme()
+        return window
+
+    def unregister_detached_window(self, window):
+        if window in getattr(self, "detached_windows", []):
+            self.detached_windows.remove(window)
+        if getattr(self, "active_tab_widget", None) is getattr(window, "tab_widget", None):
+            self.active_tab_widget = self.tab_widget
+
+    def cleanup_empty_detached_windows(self):
+        for window in list(getattr(self, "detached_windows", [])):
+            if window.is_empty():
+                self.unregister_detached_window(window)
+                window._closing_from_owner = True
+                window.close()
+
+    def attach_existing_tab_to_main(self, tab, label=None, target_tab_widget=None):
+        target = target_tab_widget or self.tab_widget
+        if target not in self.main_terminal_tab_widgets():
+            target = self.tab_widget
+        label = label or getattr(tab, "custom_title", "") or getattr(tab, "title", "Terminal") or "Terminal"
+        index = target.addTab(tab, label)
+        target.setCurrentIndex(index)
+        self.active_tab_widget = target
+        if isinstance(tab, TerminalTab):
+            self.update_tab_title(tab)
+        self.apply_color_scheme()
+        return index
+
+    def detach_current_tab(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        source, index = self.tab_widget_for_tab(tab)
+        if source is None or index < 0:
+            return
+        if self.is_detached_tab_widget(source):
+            self.show_status("Tab ist bereits entkoppelt")
+            return
+        label = source.tabText(index)
+        source.removeTab(index)
+        window = self.ensure_detached_window()
+        window.add_tab(tab, label=label)
+        self.active_tab_widget = window.tab_widget
+        if self.total_terminal_tab_count() == 0:
+            self.new_tab(target_tab_widget=self.tab_widget)
+        self.save_settings()
+        self.show_status(f"Tab entkoppelt: {label}")
+
+    def reattach_current_tab(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        source, index = self.tab_widget_for_tab(tab)
+        if source is None or index < 0:
+            return
+        if not self.is_detached_tab_widget(source):
+            self.show_status("Tab ist bereits im Hauptfenster")
+            return
+        label = source.tabText(index)
+        source.removeTab(index)
+        self.attach_existing_tab_to_main(tab, label=label)
+        self.cleanup_empty_detached_windows()
+        self.save_settings()
+        self.show_status(f"Tab wieder gekoppelt: {label}")
 
     def update_ai_menu_visibility(self):
         enabled = bool(getattr(self, "ai_features_enabled", False))
@@ -2009,7 +2164,7 @@ class TerminalWindow(QMainWindow):
             venv_path=venv_path,
         )
         target = target_tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
-        if target not in self.terminal_tab_widgets() or not target.isVisible():
+        if target not in self.terminal_tab_widgets() or (not target.isVisible() and not self.is_detached_tab_widget(target)):
             target = self.tab_widget
         index = target.addTab(tab, tab.title or f"Terminal {self.total_terminal_tab_count() + 1}")
         target.setCurrentIndex(index)
@@ -2432,6 +2587,11 @@ class TerminalWindow(QMainWindow):
                 tab_widget.removeTab(0)
                 if tab is not None:
                     tab.deleteLater()
+        for window in list(getattr(self, "detached_windows", [])):
+            window._closing_from_owner = True
+            window.close()
+        self.detached_windows = []
+        self.active_tab_widget = self.tab_widget
 
     def load_workspace(self, workspace):
         workspace = normalize_workspace(workspace)
@@ -2630,6 +2790,7 @@ class TerminalWindow(QMainWindow):
         tab_widget.removeTab(index)
         if tab is not None:
             tab.deleteLater()
+        self.cleanup_empty_detached_windows()
         if self.total_terminal_tab_count() == 0:
             self.new_tab(target_tab_widget=self.tab_widget)
         elif tab_widget.count() == 0 and self.active_tab_widget is tab_widget:
@@ -2676,6 +2837,16 @@ class TerminalWindow(QMainWindow):
         move_split_action = QAction("In nächste Ansicht verschieben", self)
         move_split_action.triggered.connect(self.move_current_tab_to_other_view)
         menu.addAction(move_split_action)
+
+        menu.addSeparator()
+        if self.is_detached_tab_widget(tab_widget):
+            reattach_action = QAction("Tab wieder ins Hauptfenster koppeln", self)
+            reattach_action.triggered.connect(self.reattach_current_tab)
+            menu.addAction(reattach_action)
+        else:
+            detach_action = QAction("Tab entkoppeln", self)
+            detach_action.triggered.connect(self.detach_current_tab)
+            menu.addAction(detach_action)
 
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.close_current_tab)
@@ -2965,8 +3136,12 @@ class TerminalWindow(QMainWindow):
         tabs = []
         if not hasattr(self, "tab_widget"):
             return tabs
-        for tab_widget, _, tab in self.all_terminal_tabs():
-            item = {
+        for tab_widget in self.main_terminal_tab_widgets():
+            for index in range(tab_widget.count()):
+                tab = tab_widget.widget(index)
+                if not isinstance(tab, TerminalTab):
+                    continue
+                item = {
                 "shell_type": tab.shell_type,
                 "title": tab.custom_title,
                 "working_directory": tab.refresh_current_working_directory(),
@@ -2975,13 +3150,13 @@ class TerminalWindow(QMainWindow):
                 "venv_path": tab.current_venv_path(),
                 "view_pane": self.logical_pane_for_widget(tab_widget),
             }
-            if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
-                item.update({
-                    "client_mode_kind": "ollama_api",
-                    "ollama_model": tab.ollama_model,
-                    "ollama_system_prompt": tab.ollama_system_prompt,
-                })
-            tabs.append(item)
+                if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
+                    item.update({
+                        "client_mode_kind": "ollama_api",
+                        "ollama_model": tab.ollama_model,
+                        "ollama_system_prompt": tab.ollama_system_prompt,
+                    })
+                tabs.append(item)
         return tabs
 
     def find_git_bash(self):
@@ -4199,9 +4374,13 @@ Hinweise
         dialog.exec()
 
     def closeEvent(self, event):
+        self._closing_app = True
         self.save_settings()
         for _, _, tab in self.all_terminal_tabs():
             tab.stop_process(fast=True)
+        for window in list(getattr(self, "detached_windows", [])):
+            window._closing_from_owner = True
+            window.close()
         event.accept()
 
 
