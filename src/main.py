@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.15.0"
+APP_VERSION = "2.16.0"
 
 
 def install_crash_logging():
@@ -1457,9 +1457,10 @@ class TerminalTab(QWidget):
 
 
 class DetachedTerminalWindow(QMainWindow):
-    def __init__(self, owner, title="Entkoppelte Tabs"):
+    def __init__(self, owner, title="Entkoppelte Tabs", window_id=""):
         super().__init__(owner)
         self.owner = owner
+        self.window_id = str(window_id or "").strip() or owner.next_detached_window_id()
         self._closing_from_owner = False
         self.setWindowTitle(f"{APP_NAME} - {title}")
         self.resize(900, 600)
@@ -2051,17 +2052,44 @@ class TerminalWindow(QMainWindow):
         self.save_settings()
         self.show_status(f"Tab nach {self.logical_pane_label(self.logical_pane_for_widget(target))} verschoben")
 
-    def ensure_detached_window(self):
+    def next_detached_window_id(self):
+        existing = {str(getattr(window, "window_id", "") or "") for window in getattr(self, "detached_windows", [])}
+        index = 1
+        while True:
+            candidate = f"detached-{index}"
+            if candidate not in existing:
+                return candidate
+            index += 1
+
+    def ensure_detached_window(self, window_id="", title="Entkoppelte Tabs", reuse_existing=True):
         windows = [window for window in getattr(self, "detached_windows", []) if window is not None]
         self.detached_windows = windows
-        for window in self.detached_windows:
-            if not window.is_empty():
-                window.show()
-                return window
-        window = DetachedTerminalWindow(self)
+        wanted_id = str(window_id or "").strip()
+        if wanted_id:
+            for window in self.detached_windows:
+                if str(getattr(window, "window_id", "") or "") == wanted_id:
+                    window.show()
+                    return window
+        elif reuse_existing:
+            for window in self.detached_windows:
+                if not window.is_empty():
+                    window.show()
+                    return window
+        window = DetachedTerminalWindow(self, title=title or "Entkoppelte Tabs", window_id=wanted_id)
         self.detached_windows.append(window)
         self.apply_color_scheme()
         return window
+
+    def detached_widget_for_saved_tab(self, item):
+        window_id = str(item.get("detached_window", "") or "").strip() or "detached-1"
+        title = str(item.get("detached_title", "") or "Entkoppelte Tabs")
+        return self.ensure_detached_window(window_id=window_id, title=title, reuse_existing=False).tab_widget
+
+    def target_widget_for_saved_tab(self, item):
+        pane = str(item.get("view_pane", "main") or "main")
+        if pane == "detached" or str(item.get("detached_window", "") or "").strip():
+            return self.detached_widget_for_saved_tab(item)
+        return self.pane_widget_for_logical_pane(pane)
 
     def unregister_detached_window(self, window):
         if window in getattr(self, "detached_windows", []):
@@ -2620,7 +2648,7 @@ class TerminalWindow(QMainWindow):
                 command_history=item.get("command_history", []),
                 restore_command=item.get("restore_command", ""),
                 venv_path=item.get("venv_path", ""),
-                target_tab_widget=self.pane_widget_for_logical_pane(item.get("view_pane", "main")),
+                target_tab_widget=self.target_widget_for_saved_tab(item),
             )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
@@ -3090,6 +3118,7 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if isinstance(tab, TerminalTab):
             title = f"{tab.custom_title or self.shell_backend_label(tab.shell_type)} Kopie"
+            source_widget, _ = self.tab_widget_for_tab(tab)
             self.new_tab(
                 shell_type=tab.shell_type,
                 title=title,
@@ -3097,6 +3126,7 @@ class TerminalWindow(QMainWindow):
                 command_history=list(tab.command_history),
                 restore_command=tab.current_restore_command(),
                 venv_path=tab.current_venv_path(),
+                target_tab_widget=source_widget if source_widget is not None else self.active_tab_widget,
             )
 
     def restore_tabs_from_settings(self):
@@ -3116,7 +3146,7 @@ class TerminalWindow(QMainWindow):
                 command_history=item.get("command_history", []),
                 restore_command=item.get("restore_command", ""),
                 venv_path=item.get("venv_path", ""),
-                target_tab_widget=self.pane_widget_for_logical_pane(item.get("view_pane", "main")),
+                target_tab_widget=self.target_widget_for_saved_tab(item),
             )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
@@ -3132,6 +3162,28 @@ class TerminalWindow(QMainWindow):
         if not restored:
             self.new_tab()
 
+    def tab_settings_item(self, tab, tab_widget, detached_window=None):
+        item = {
+            "shell_type": tab.shell_type,
+            "title": tab.custom_title,
+            "working_directory": tab.refresh_current_working_directory(),
+            "command_history": list(tab.command_history)[-self.max_history_size:],
+            "restore_command": tab.current_restore_command(),
+            "venv_path": tab.current_venv_path(),
+            "view_pane": self.logical_pane_for_widget(tab_widget),
+        }
+        if detached_window is not None:
+            item["view_pane"] = "detached"
+            item["detached_window"] = str(getattr(detached_window, "window_id", "") or "detached-1")
+            item["detached_title"] = str(detached_window.windowTitle() or "Entkoppelte Tabs")
+        if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
+            item.update({
+                "client_mode_kind": "ollama_api",
+                "ollama_model": tab.ollama_model,
+                "ollama_system_prompt": tab.ollama_system_prompt,
+            })
+        return item
+
     def collect_tab_settings(self):
         tabs = []
         if not hasattr(self, "tab_widget"):
@@ -3139,24 +3191,16 @@ class TerminalWindow(QMainWindow):
         for tab_widget in self.main_terminal_tab_widgets():
             for index in range(tab_widget.count()):
                 tab = tab_widget.widget(index)
-                if not isinstance(tab, TerminalTab):
-                    continue
-                item = {
-                "shell_type": tab.shell_type,
-                "title": tab.custom_title,
-                "working_directory": tab.refresh_current_working_directory(),
-                "command_history": list(tab.command_history)[-self.max_history_size:],
-                "restore_command": tab.current_restore_command(),
-                "venv_path": tab.current_venv_path(),
-                "view_pane": self.logical_pane_for_widget(tab_widget),
-            }
-                if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
-                    item.update({
-                        "client_mode_kind": "ollama_api",
-                        "ollama_model": tab.ollama_model,
-                        "ollama_system_prompt": tab.ollama_system_prompt,
-                    })
-                tabs.append(item)
+                if isinstance(tab, TerminalTab):
+                    tabs.append(self.tab_settings_item(tab, tab_widget))
+        for window in list(getattr(self, "detached_windows", [])):
+            tab_widget = getattr(window, "tab_widget", None)
+            if tab_widget is None:
+                continue
+            for index in range(tab_widget.count()):
+                tab = tab_widget.widget(index)
+                if isinstance(tab, TerminalTab):
+                    tabs.append(self.tab_settings_item(tab, tab_widget, detached_window=window))
         return tabs
 
     def find_git_bash(self):
@@ -4227,7 +4271,7 @@ class TerminalWindow(QMainWindow):
 - Ausgabe kann als Markdown oder Text gespeichert und ohne Steuerzeichen kopiert werden.
 - Befehlspalette mit Suchfeld für Tabs, Backends, Pfade, Profile, Workspaces, KI, Ausgabe und Suche.
 - Tab-Profile speichern Backend, Titel, Arbeitsordner, optionalen Startbefehl und Ollama-Modell.
-- Workspaces speichern die komplette Tab-Zusammenstellung mit Backends, Titeln, Arbeitsordnern und Standardordner.
+- Workspaces speichern die komplette Tab-Zusammenstellung mit Backends, Titeln, Arbeitsordnern, Layout-Bereichen, entkoppelten Tabs und Standardordner.
 
 Datei-Menü
 - Neuer Tab: öffnet einen neuen Terminal-Tab.
@@ -4257,7 +4301,7 @@ Workspaces-Menü
 - Workspace laden: ersetzt die aktuellen Tabs durch einen gespeicherten Workspace.
 - Workspace löschen: entfernt einen gespeicherten Workspace.
 - Gespeichert werden Tab-Titel, Shell-Backend, Arbeitsordner, Standardordner und ausgewähltes Ollama-Modell.
-- Workspaces eignen sich für komplette Arbeitsumgebungen, zum Beispiel Terminal-Projekt, Visual Edit und Ollama nebeneinander.
+- Workspaces eignen sich für komplette Arbeitsumgebungen, zum Beispiel Terminal-Projekt, Visual Edit und Ollama nebeneinander. Split-/Rasterbereiche und entkoppelte Tabs werden mitgespeichert.
 
 KI-Menü
 - Das KI-Menü ist standardmäßig ausgeblendet und kann unter Einstellungen → KI-Menü / Ollama aktivieren eingeschaltet werden.

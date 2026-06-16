@@ -24,6 +24,8 @@ def normalize_workspace(value: Any) -> Dict[str, Any]:
                 "restore_command": _clean_text(item.get("restore_command")),
                 "venv_path": _clean_text(item.get("venv_path")),
                 "view_pane": _clean_text(item.get("view_pane")) or "main",
+                "detached_window": _clean_text(item.get("detached_window")),
+                "detached_title": _clean_text(item.get("detached_title")),
                 "client_mode_kind": _clean_text(item.get("client_mode_kind") or item.get("client_mode")),
                 "ollama_model": _clean_text(item.get("ollama_model")),
                 "ollama_system_prompt": _clean_text(item.get("ollama_system_prompt")),
