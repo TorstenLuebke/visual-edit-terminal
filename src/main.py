@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog,
     QLineEdit, QListWidget, QListWidgetItem, QSplitter
 )
-from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal
+from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor, QSyntaxHighlighter,
     QAction, QShortcut, QPalette
@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.13.0"
+APP_VERSION = "2.13.1"
 
 
 def install_crash_logging():
@@ -137,7 +137,7 @@ class OllamaApiWorker(QThread):
 
 
 class TerminalTab(QWidget):
-    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None, restore_command=""):
+    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None, restore_command="", venv_path=""):
         super().__init__(window)
         self.window = window
         self.shell_type = shell_type or window.shell_type
@@ -149,6 +149,7 @@ class TerminalTab(QWidget):
         self.current_command = ""
         self.command_history = self.normalize_command_history(command_history)
         self.restore_command = str(restore_command or "").strip()
+        self.venv_path = self.normalize_venv_path(venv_path)
         self.client_mode_active = False
         self.client_mode_name = ""
         self.client_mode_kind = ""
@@ -214,6 +215,93 @@ class TerminalTab(QWidget):
                 return str(path)
         except OSError:
             pass
+        return ""
+
+    def normalize_venv_path(self, value):
+        text = str(value or "").strip().strip('"')
+        if not text:
+            return ""
+        try:
+            path = Path(text).expanduser()
+            if path.exists() and path.is_dir():
+                return str(path)
+        except OSError:
+            pass
+        return ""
+
+    def path_is_same_or_child(self, path, parent):
+        try:
+            candidate = Path(path).resolve()
+            base = Path(parent).resolve()
+            return candidate == base or base in candidate.parents
+        except OSError:
+            return False
+
+    def local_project_venv_path(self, directory=None):
+        base_text = str(directory or self.refresh_current_working_directory() or "").strip()
+        if not base_text:
+            return ""
+        try:
+            base = Path(base_text)
+        except OSError:
+            return ""
+        for candidate in (base / ".venv", base / "venv"):
+            if candidate.exists() and candidate.is_dir():
+                return str(candidate)
+        return ""
+
+    def inherited_venv_path_for_directory(self, directory=None):
+        env_path = self.normalize_venv_path(os.environ.get("VIRTUAL_ENV", ""))
+        if not env_path:
+            return ""
+        base_text = str(directory or self.refresh_current_working_directory() or "").strip()
+        if not base_text:
+            return env_path
+        try:
+            project_root = Path(env_path).resolve().parent
+            if self.path_is_same_or_child(base_text, project_root):
+                return env_path
+        except OSError:
+            return ""
+        return ""
+
+    def restore_command_for_venv(self, venv_path, directory=None):
+        venv_text = self.normalize_venv_path(venv_path)
+        if not venv_text:
+            return ""
+        venv = Path(venv_text)
+        shell = str(self.shell_type or "").lower()
+        base_text = str(directory or self.refresh_current_working_directory() or "").strip()
+
+        def relative_or_absolute(script_path, command_prefix=""):
+            try:
+                base = Path(base_text) if base_text else Path.cwd()
+                rel = script_path.resolve().relative_to(base.resolve())
+                text = str(rel).replace("/", "\\")
+                if not text.startswith("."):
+                    text = ".\\" + text
+                return command_prefix + text
+            except (OSError, ValueError):
+                return command_prefix + str(script_path)
+
+        if sys.platform == "win32" and shell in {"powershell", "pwsh"}:
+            script = venv / "Scripts" / "Activate.ps1"
+            if script.exists():
+                return relative_or_absolute(script)
+            script = venv / "Scripts" / "activate"
+            if script.exists():
+                return relative_or_absolute(script)
+        elif sys.platform == "win32" and shell == "cmd":
+            script = venv / "Scripts" / "activate.bat"
+            if script.exists():
+                return relative_or_absolute(script)
+        else:
+            script = venv / "bin" / "activate"
+            if script.exists():
+                return relative_or_absolute(script, "source ").replace("\\", "/")
+            script = venv / "Scripts" / "activate"
+            if script.exists():
+                return relative_or_absolute(script, "source ").replace("\\", "/")
         return ""
 
     def refresh_current_working_directory(self):
@@ -617,39 +705,44 @@ class TerminalTab(QWidget):
         text = str(command or "").strip()
         if self.command_looks_like_venv_activation(text):
             self.restore_command = text
+            detected = self.local_project_venv_path() or self.inherited_venv_path_for_directory()
+            if detected:
+                self.venv_path = detected
 
     def infer_venv_restore_command(self):
         for command in reversed(self.command_history):
             if self.command_looks_like_venv_activation(command):
+                detected = self.local_project_venv_path() or self.inherited_venv_path_for_directory()
+                if detected:
+                    self.venv_path = detected
                 return str(command).strip()
-
-        output = self.output_area.toPlainText()
-        if "(.venv)" not in output and "(venv)" not in output:
-            return ""
 
         directory = self.refresh_current_working_directory()
         if not directory:
             return ""
-        root = Path(directory)
-        candidates = []
-        shell = str(self.shell_type or "").lower()
-        if sys.platform == "win32" and shell in {"powershell", "pwsh"}:
-            candidates = [
-                (root / ".venv" / "Scripts" / "Activate.ps1", r".\.venv\Scripts\Activate.ps1"),
-                (root / ".venv" / "Scripts" / "activate", r".\.venv\Scripts\activate"),
-            ]
-        elif sys.platform == "win32" and shell == "cmd":
-            candidates = [
-                (root / ".venv" / "Scripts" / "activate.bat", r".venv\Scripts\activate.bat"),
-            ]
-        else:
-            candidates = [
-                (root / ".venv" / "bin" / "activate", "source .venv/bin/activate"),
-                (root / ".venv" / "Scripts" / "activate", "source .venv/Scripts/activate"),
-            ]
 
-        for path, command in candidates:
-            if path.exists():
+        candidates = [
+            self.venv_path,
+            self.inherited_venv_path_for_directory(directory),
+        ]
+
+        output = self.output_area.toPlainText()
+        prompt_looks_active = "(.venv)" in output or "(venv)" in output
+        if prompt_looks_active or bool(os.environ.get("VIRTUAL_ENV")):
+            candidates.append(self.local_project_venv_path(directory))
+
+        # Workspace restore should restore project state, not only a title/path.
+        # If a saved tab points at a project root containing .venv/venv, derive the
+        # matching activation command after the old shell process has gone away.
+        candidates.append(self.local_project_venv_path(directory))
+
+        for candidate in candidates:
+            normalized = self.normalize_venv_path(candidate)
+            if not normalized:
+                continue
+            command = self.restore_command_for_venv(normalized, directory)
+            if command:
+                self.venv_path = normalized
                 return command
         return ""
 
@@ -657,10 +750,26 @@ class TerminalTab(QWidget):
         explicit = str(self.restore_command or "").strip()
         if explicit:
             return explicit
-        return self.infer_venv_restore_command()
+        inferred = self.infer_venv_restore_command()
+        if inferred:
+            self.restore_command = inferred
+        return inferred
+
+    def current_venv_path(self):
+        if self.venv_path:
+            return self.venv_path
+        self.current_restore_command()
+        return self.venv_path
+
+    def schedule_restore_command(self, command=None, delay_ms=650):
+        text = str(command or "").strip() or self.current_restore_command()
+        if not text:
+            return False
+        QTimer.singleShot(int(delay_ms), lambda t=text: self.run_restore_command(t))
+        return True
 
     def run_restore_command(self, command=None):
-        text = str(command if command is not None else self.restore_command or "").strip()
+        text = str(command or "").strip() or self.current_restore_command()
         if not text:
             return False
         self.restore_command = text
@@ -671,6 +780,7 @@ class TerminalTab(QWidget):
         if self.process.state() != QProcess.ProcessState.Running:
             self.output_area.append(f"\n[Wiederherstellungsbefehl konnte nicht ausgeführt werden: Shell ist nicht aktiv] {text}\n")
             return False
+        self.output_area.append(f"\n[Restore] Führe aus: {text}\n")
         self.process.write(text.encode() + b"\n")
         self.process.waitForBytesWritten(1000)
         return True
@@ -1636,7 +1746,7 @@ class TerminalWindow(QMainWindow):
         self.show_status("KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.")
         return False
 
-    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command=""):
+    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path=""):
         effective_start_directory = start_directory
         if effective_start_directory is None:
             effective_start_directory = self.default_start_directory
@@ -1647,6 +1757,7 @@ class TerminalWindow(QMainWindow):
             start_directory=effective_start_directory,
             command_history=command_history,
             restore_command=restore_command,
+            venv_path=venv_path,
         )
         target = target_tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
         if target is self.secondary_tab_widget and not self.split_view_enabled:
@@ -2042,6 +2153,7 @@ class TerminalWindow(QMainWindow):
                 start_directory=str(item.get("working_directory", "") or ""),
                 command_history=item.get("command_history", []),
                 restore_command=item.get("restore_command", ""),
+                venv_path=item.get("venv_path", ""),
             )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
@@ -2052,7 +2164,7 @@ class TerminalWindow(QMainWindow):
                         system_prompt=str(item.get("ollama_system_prompt", "") or ""),
                     )
                 else:
-                    tab.run_restore_command(item.get("restore_command", ""))
+                    tab.schedule_restore_command(item.get("restore_command", ""))
             restored = True
 
         if not restored:
@@ -2488,6 +2600,7 @@ class TerminalWindow(QMainWindow):
                 start_directory=tab.refresh_current_working_directory(),
                 command_history=list(tab.command_history),
                 restore_command=tab.current_restore_command(),
+                venv_path=tab.current_venv_path(),
             )
 
     def restore_tabs_from_settings(self):
@@ -2506,6 +2619,7 @@ class TerminalWindow(QMainWindow):
                 start_directory=working_directory,
                 command_history=item.get("command_history", []),
                 restore_command=item.get("restore_command", ""),
+                venv_path=item.get("venv_path", ""),
             )
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
@@ -2516,7 +2630,7 @@ class TerminalWindow(QMainWindow):
                         system_prompt=str(item.get("ollama_system_prompt", "") or ""),
                     )
                 else:
-                    tab.run_restore_command(item.get("restore_command", ""))
+                    tab.schedule_restore_command(item.get("restore_command", ""))
             restored = True
         if not restored:
             self.new_tab()
@@ -2532,6 +2646,7 @@ class TerminalWindow(QMainWindow):
                 "working_directory": tab.refresh_current_working_directory(),
                 "command_history": list(tab.command_history)[-self.max_history_size:],
                 "restore_command": tab.current_restore_command(),
+                "venv_path": tab.current_venv_path(),
             }
             if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
                 item.update({
