@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.13.1"
+APP_VERSION = "2.13.2"
 
 
 def install_crash_logging():
@@ -554,19 +554,48 @@ class TerminalTab(QWidget):
 
     def restart_shell(self):
         if self.process.state() == QProcess.ProcessState.Running:
-            self.stop_process()
-            while self.process.state() != QProcess.ProcessState.NotRunning:
-                self.process.waitForFinished(500)
+            self.stop_process(fast=False)
         self.output_area.clear()
         self.start_shell()
 
-    def stop_process(self):
-        self.stop_client_process()
+    def process_is_running(self, process):
+        return process is not None and process.state() == QProcess.ProcessState.Running
+
+    def finish_process_quickly(self, process, fast=False):
+        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+            return
+
+        terminate_timeout = 250 if fast else 1200
+        kill_timeout = 250 if fast else 800
+
+        process.terminate()
+        if process.waitForFinished(terminate_timeout):
+            return
+
+        QApplication.processEvents()
+        if process.state() == QProcess.ProcessState.NotRunning:
+            return
+
+        process.kill()
+        process.waitForFinished(kill_timeout)
+        QApplication.processEvents()
+
+    def stop_ollama_worker(self, fast=False):
+        worker = self.ollama_worker
+        if worker is None:
+            return
+        if worker.isRunning():
+            worker.requestInterruption()
+            worker.terminate()
+            worker.wait(250 if fast else 1200)
+        worker.deleteLater()
+        self.ollama_worker = None
+
+    def stop_process(self, fast=False):
+        self.stop_ollama_worker(fast=fast)
+        self.stop_client_process(fast=fast)
         if self.process and self.process.state() == QProcess.ProcessState.Running:
-            self.process.terminate()
-            if not self.process.waitForFinished(3000):
-                self.process.kill()
-                self.process.waitForFinished(1000)
+            self.finish_process_quickly(self.process, fast=fast)
 
     def interrupt_current_command(self):
         if self.client_mode_active and self.client_mode_kind == "ollama_api":
@@ -951,14 +980,11 @@ class TerminalTab(QWidget):
 
         return f"\n[Client-Fehler] {label} konnte nicht gestartet werden: {error_text}{hint}\n"
 
-    def stop_client_process(self):
+    def stop_client_process(self, fast=False):
         if self.client_process is None:
             return
         if self.client_process.state() == QProcess.ProcessState.Running:
-            self.client_process.terminate()
-            if not self.client_process.waitForFinished(2000):
-                self.client_process.kill()
-                self.client_process.waitForFinished(1000)
+            self.finish_process_quickly(self.client_process, fast=fast)
         self.client_process.deleteLater()
         self.client_process = None
 
@@ -1137,11 +1163,7 @@ class TerminalTab(QWidget):
         if self.ollama_worker is None or not self.ollama_worker.isRunning():
             self.window.show_status("Keine laufende Ollama-Antwort")
             return
-        self.ollama_worker.requestInterruption()
-        self.ollama_worker.terminate()
-        self.ollama_worker.wait(1500)
-        self.ollama_worker.deleteLater()
-        self.ollama_worker = None
+        self.stop_ollama_worker(fast=True)
         self.execute_button.setEnabled(True)
         self.execute_button.setText(self.client_send_button_text())
         self.output_area.append("\n[Ollama-Antwort gestoppt]\n")
@@ -2125,7 +2147,7 @@ class TerminalWindow(QMainWindow):
             while tab_widget.count() > 0:
                 tab = tab_widget.widget(0)
                 if isinstance(tab, TerminalTab):
-                    tab.stop_process()
+                    tab.stop_process(fast=True)
                 tab_widget.removeTab(0)
                 if tab is not None:
                     tab.deleteLater()
@@ -2319,7 +2341,7 @@ class TerminalWindow(QMainWindow):
             return
         tab = tab_widget.widget(index)
         if isinstance(tab, TerminalTab):
-            tab.stop_process()
+            tab.stop_process(fast=True)
         tab_widget.removeTab(index)
         if tab is not None:
             tab.deleteLater()
@@ -2526,7 +2548,7 @@ class TerminalWindow(QMainWindow):
     def stop_process(self):
         tab = self.current_terminal()
         if tab is not None:
-            tab.stop_process()
+            tab.stop_process(fast=True)
 
     def interrupt_current_command(self):
         tab = self.current_terminal()
@@ -3862,7 +3884,7 @@ Hinweise
     def closeEvent(self, event):
         self.save_settings()
         for _, _, tab in self.all_terminal_tabs():
-            tab.stop_process()
+            tab.stop_process(fast=True)
         event.accept()
 
 
