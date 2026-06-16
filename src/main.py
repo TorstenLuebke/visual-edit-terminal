@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.14.0"
+APP_VERSION = "2.14.1"
 
 
 def install_crash_logging():
@@ -1478,6 +1478,8 @@ class TerminalWindow(QMainWindow):
         self.ai_features_enabled = False
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
+        workspace_config_base = Path(os.environ.get("APPDATA") or Path.home()) / "ShellDeckTerminal"
+        self.workspace_store_file = workspace_config_base / "workspaces.json"
         self.load_history()
 
         menubar = self.menuBar()
@@ -2252,6 +2254,54 @@ class TerminalWindow(QMainWindow):
         elif startup_command:
             tab.run_text_command(startup_command)
 
+    def merge_workspaces_by_name(self, *workspace_lists):
+        merged = []
+        positions = {}
+        for workspace_list in workspace_lists:
+            for workspace in normalize_workspaces(workspace_list):
+                name = str(workspace.get("name", "") or "").strip()
+                if not name:
+                    continue
+                key = name.lower()
+                if key in positions:
+                    merged[positions[key]] = workspace
+                else:
+                    positions[key] = len(merged)
+                    merged.append(workspace)
+        return normalize_workspaces(merged)
+
+    def load_persistent_workspaces(self):
+        store_file = getattr(self, "workspace_store_file", None)
+        if not store_file or not Path(store_file).exists():
+            return []
+        try:
+            data = json.loads(Path(store_file).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if isinstance(data, dict):
+            data = data.get("workspaces", [])
+        return normalize_workspaces(data)
+
+    def save_persistent_workspaces(self):
+        store_file = getattr(self, "workspace_store_file", None)
+        if not store_file:
+            return False
+        try:
+            store_file = Path(store_file)
+            store_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "app": APP_NAME,
+                "version": APP_VERSION,
+                "workspaces": normalize_workspaces(self.workspaces),
+            }
+            tmp_file = store_file.with_suffix(store_file.suffix + ".tmp")
+            tmp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=4), encoding="utf-8")
+            tmp_file.replace(store_file)
+            return True
+        except OSError as exc:
+            self.show_status(f"Workspace-Speicherfehler: {exc}")
+            return False
+
     def rebuild_workspaces_menu(self):
         if not hasattr(self, "workspaces_menu"):
             return
@@ -2328,8 +2378,12 @@ class TerminalWindow(QMainWindow):
         ]
         self.workspaces.append(workspace)
         self.rebuild_workspaces_menu()
-        self.save_settings()
-        self.show_status(f"Workspace gespeichert: {workspace['name']}")
+        settings_ok = self.save_settings()
+        store_ok = self.save_persistent_workspaces()
+        if settings_ok or store_ok:
+            self.show_status(f"Workspace gespeichert: {workspace['name']}")
+        else:
+            self.show_status(f"Workspace nur im laufenden Menü gespeichert, aber nicht dauerhaft: {workspace['name']}")
 
     def workspace_choice(self, title):
         workspaces = normalize_workspaces(self.workspaces)
@@ -2366,6 +2420,7 @@ class TerminalWindow(QMainWindow):
         ]
         self.rebuild_workspaces_menu()
         self.save_settings()
+        self.save_persistent_workspaces()
         self.show_status(f"Workspace gelöscht: {workspace.get('name', '')}")
 
     def clear_all_tabs_for_workspace_load(self):
@@ -3283,11 +3338,13 @@ class TerminalWindow(QMainWindow):
 
     def load_settings(self):
         if not self.settings_file.exists():
+            self.workspaces = self.merge_workspaces_by_name(self.workspaces, self.load_persistent_workspaces())
             return
 
         try:
             settings = json.loads(self.settings_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            self.workspaces = self.merge_workspaces_by_name(self.workspaces, self.load_persistent_workspaces())
             return
 
         font_text = str(settings.get("font", "")).strip()
@@ -3341,7 +3398,9 @@ class TerminalWindow(QMainWindow):
         self.selected_ollama_model = str(settings.get("selected_ollama_model", self.selected_ollama_model or "") or "")
         self.ai_features_enabled = bool(settings.get("ai_features_enabled", False))
         self.tab_profiles = normalize_profiles(settings.get("tab_profiles", self.tab_profiles))
-        self.workspaces = normalize_workspaces(settings.get("workspaces", self.workspaces))
+        settings_workspaces = normalize_workspaces(settings.get("workspaces", self.workspaces))
+        stored_workspaces = self.load_persistent_workspaces()
+        self.workspaces = self.merge_workspaces_by_name(settings_workspaces, stored_workspaces)
 
     def save_settings(self):
         settings = {
@@ -3364,12 +3423,17 @@ class TerminalWindow(QMainWindow):
         }
 
         try:
-            self.settings_file.write_text(
+            self.settings_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = self.settings_file.with_suffix(self.settings_file.suffix + ".tmp")
+            tmp_file.write_text(
                 json.dumps(settings, ensure_ascii=False, indent=4),
                 encoding="utf-8",
             )
-        except OSError:
-            pass
+            tmp_file.replace(self.settings_file)
+            return True
+        except OSError as exc:
+            self.show_status(f"Einstellungen konnten nicht gespeichert werden: {exc}")
+            return False
 
     def migrate_unreadable_theme_settings(self):
         defaults = self.default_theme_config()
