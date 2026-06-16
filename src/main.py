@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
     QDialog, QFormLayout, QHBoxLayout, QLabel, QComboBox, QSlider,
     QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog,
-    QLineEdit, QListWidget, QListWidgetItem
+    QLineEdit, QListWidget, QListWidgetItem, QSplitter
 )
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal
 from PySide6.QtGui import (
@@ -33,7 +33,7 @@ from PySide6.QtGui import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.11.0"
+APP_VERSION = "2.12.0"
 
 
 def install_crash_logging():
@@ -1313,6 +1313,17 @@ class TerminalWindow(QMainWindow):
 
         self.workspaces_menu = menubar.addMenu("&Workspaces")
 
+        self.view_menu = menubar.addMenu("&Ansicht")
+
+        self.split_view_action = QAction("Zwei Ansichten nebeneinander", self)
+        self.split_view_action.setCheckable(True)
+        self.split_view_action.triggered.connect(self.set_split_view_enabled)
+        self.view_menu.addAction(self.split_view_action)
+
+        self.move_to_other_view_action = QAction("Aktuellen Tab in andere Ansicht verschieben", self)
+        self.move_to_other_view_action.triggered.connect(self.move_current_tab_to_other_view)
+        self.view_menu.addAction(self.move_to_other_view_action)
+
         settings_menu = menubar.addMenu("&Einstellungen")
 
         font_action = QAction("Schriftart", self)
@@ -1402,14 +1413,17 @@ class TerminalWindow(QMainWindow):
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.tab_widget = QTabWidget()
-        self.tab_widget.setTabsClosable(True)
-        self.tab_widget.setMovable(True)
-        self.tab_widget.tabCloseRequested.connect(self.close_tab)
-        self.tab_widget.currentChanged.connect(self.current_tab_changed)
-        self.tab_widget.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.tab_widget.tabBar().customContextMenuRequested.connect(self.show_tab_context_menu)
-        layout.addWidget(self.tab_widget)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.tab_widget = self.create_terminal_tab_widget()
+        self.secondary_tab_widget = self.create_terminal_tab_widget()
+        self.secondary_tab_widget.hide()
+        self.active_tab_widget = self.tab_widget
+        self.split_view_enabled = False
+        self.splitter.addWidget(self.tab_widget)
+        self.splitter.addWidget(self.secondary_tab_widget)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        layout.addWidget(self.splitter)
 
         self.load_settings()
         self.update_ai_menu_visibility()
@@ -1433,6 +1447,93 @@ class TerminalWindow(QMainWindow):
 
         self.shortcut_command_palette = QShortcut("Ctrl+Shift+P", self)
         self.shortcut_command_palette.activated.connect(self.show_command_palette)
+
+    def create_terminal_tab_widget(self):
+        tab_widget = QTabWidget()
+        tab_widget.setTabsClosable(True)
+        tab_widget.setMovable(True)
+        tab_widget.tabCloseRequested.connect(lambda index, w=tab_widget: self.close_tab(index, w))
+        tab_widget.currentChanged.connect(lambda index, w=tab_widget: self.current_tab_changed(index, w))
+        tab_widget.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tab_widget.tabBar().customContextMenuRequested.connect(
+            lambda pos, w=tab_widget: self.show_tab_context_menu(pos, w)
+        )
+        return tab_widget
+
+    def terminal_tab_widgets(self):
+        widgets = []
+        if hasattr(self, "tab_widget") and self.tab_widget is not None:
+            widgets.append(self.tab_widget)
+        if hasattr(self, "secondary_tab_widget") and self.secondary_tab_widget is not None:
+            widgets.append(self.secondary_tab_widget)
+        return widgets
+
+    def all_terminal_tabs(self):
+        for tab_widget in self.terminal_tab_widgets():
+            for index in range(tab_widget.count()):
+                tab = tab_widget.widget(index)
+                if isinstance(tab, TerminalTab):
+                    yield tab_widget, index, tab
+
+    def total_terminal_tab_count(self):
+        return sum(widget.count() for widget in self.terminal_tab_widgets())
+
+    def tab_widget_for_tab(self, tab):
+        for tab_widget in self.terminal_tab_widgets():
+            index = tab_widget.indexOf(tab)
+            if index >= 0:
+                return tab_widget, index
+        return None, -1
+
+    def set_active_tab_widget(self, tab_widget):
+        if tab_widget in self.terminal_tab_widgets():
+            self.active_tab_widget = tab_widget
+
+    def set_split_view_enabled(self, enabled):
+        enabled = bool(enabled)
+        self.split_view_enabled = enabled
+        if hasattr(self, "split_view_action"):
+            self.split_view_action.blockSignals(True)
+            self.split_view_action.setChecked(enabled)
+            self.split_view_action.blockSignals(False)
+
+        if enabled:
+            self.secondary_tab_widget.show()
+            self.splitter.setSizes([1, 1])
+            self.show_status("Zwei-Ansichten-Modus aktiv")
+            return
+
+        while self.secondary_tab_widget.count() > 0:
+            tab = self.secondary_tab_widget.widget(0)
+            label = self.secondary_tab_widget.tabText(0)
+            self.secondary_tab_widget.removeTab(0)
+            index = self.tab_widget.addTab(tab, label)
+            self.tab_widget.setCurrentIndex(index)
+            if isinstance(tab, TerminalTab):
+                self.update_tab_title(tab)
+        self.secondary_tab_widget.hide()
+        self.active_tab_widget = self.tab_widget
+        self.show_status("Einzelansicht aktiv")
+
+    def move_current_tab_to_other_view(self):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        source, index = self.tab_widget_for_tab(tab)
+        if source is None or index < 0:
+            return
+        if not self.split_view_enabled:
+            self.set_split_view_enabled(True)
+        target = self.secondary_tab_widget if source is self.tab_widget else self.tab_widget
+        label = source.tabText(index)
+        source.removeTab(index)
+        new_index = target.addTab(tab, label)
+        target.setCurrentIndex(new_index)
+        self.active_tab_widget = target
+        self.update_tab_title(tab)
+        if source.count() == 0:
+            self.new_tab(target_tab_widget=source)
+        self.show_status("Tab in andere Ansicht verschoben")
 
     def update_ai_menu_visibility(self):
         enabled = bool(getattr(self, "ai_features_enabled", False))
@@ -1458,7 +1559,7 @@ class TerminalWindow(QMainWindow):
         self.show_status("KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.")
         return False
 
-    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None):
+    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None):
         effective_start_directory = start_directory
         if effective_start_directory is None:
             effective_start_directory = self.default_start_directory
@@ -1469,23 +1570,28 @@ class TerminalWindow(QMainWindow):
             start_directory=effective_start_directory,
             command_history=command_history,
         )
-        index = self.tab_widget.addTab(tab, tab.title or f"Terminal {self.tab_widget.count() + 1}")
-        self.tab_widget.setCurrentIndex(index)
+        target = target_tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
+        if target is self.secondary_tab_widget and not self.split_view_enabled:
+            target = self.tab_widget
+        index = target.addTab(tab, tab.title or f"Terminal {self.total_terminal_tab_count() + 1}")
+        target.setCurrentIndex(index)
+        self.active_tab_widget = target
         self.apply_color_scheme()
         return tab
 
     def update_tab_title(self, tab):
-        index = self.tab_widget.indexOf(tab)
-        if index >= 0:
-            base = tab.title or "Terminal"
-            existing_same_title = sum(
-                1 for i in range(self.tab_widget.count())
-                if i != index and isinstance(self.tab_widget.widget(i), TerminalTab) and self.tab_widget.widget(i).title == base
-            )
-            title = f"{base} {index + 1}" if existing_same_title and not tab.custom_title else base
-            icon = self.shell_backend_icon(tab.shell_type)
-            self.tab_widget.setTabText(index, f"{icon} {title}".strip())
-            self.tab_widget.tabBar().setTabTextColor(index, QColor(self.shell_backend_color(tab.shell_type)))
+        tab_widget, index = self.tab_widget_for_tab(tab)
+        if tab_widget is None or index < 0:
+            return
+        base = tab.title or "Terminal"
+        existing_same_title = sum(
+            1 for _, other_index, other_tab in self.all_terminal_tabs()
+            if other_tab is not tab and other_tab.title == base
+        )
+        title = f"{base} {index + 1}" if existing_same_title and not tab.custom_title else base
+        icon = self.shell_backend_icon(tab.shell_type)
+        tab_widget.setTabText(index, f"{icon} {title}".strip())
+        tab_widget.tabBar().setTabTextColor(index, QColor(self.shell_backend_color(tab.shell_type)))
 
     def rebuild_saved_paths_menu(self):
         self.paths_menu.clear()
@@ -1826,13 +1932,14 @@ class TerminalWindow(QMainWindow):
         self.show_status(f"Workspace gelöscht: {workspace.get('name', '')}")
 
     def clear_all_tabs_for_workspace_load(self):
-        while self.tab_widget.count() > 0:
-            tab = self.tab_widget.widget(0)
-            if isinstance(tab, TerminalTab):
-                tab.stop_process()
-            self.tab_widget.removeTab(0)
-            if tab is not None:
-                tab.deleteLater()
+        for tab_widget in self.terminal_tab_widgets():
+            while tab_widget.count() > 0:
+                tab = tab_widget.widget(0)
+                if isinstance(tab, TerminalTab):
+                    tab.stop_process()
+                tab_widget.removeTab(0)
+                if tab is not None:
+                    tab.deleteLater()
 
     def load_workspace(self, workspace):
         workspace = normalize_workspace(workspace)
@@ -2002,27 +2109,35 @@ class TerminalWindow(QMainWindow):
         self.save_settings()
 
     def current_terminal(self):
+        active = getattr(self, "active_tab_widget", None)
+        widget = active.currentWidget() if active is not None else None
+        if isinstance(widget, TerminalTab):
+            return widget
         widget = self.tab_widget.currentWidget() if hasattr(self, "tab_widget") else None
         return widget if isinstance(widget, TerminalTab) else None
 
     def close_current_tab(self):
-        if not hasattr(self, "tab_widget"):
-            return
-        self.close_tab(self.tab_widget.currentIndex())
+        active = getattr(self, "active_tab_widget", None) or self.tab_widget
+        self.close_tab(active.currentIndex(), active)
 
-    def close_tab(self, index):
-        if index < 0 or index >= self.tab_widget.count():
+    def close_tab(self, index, tab_widget=None):
+        tab_widget = tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
+        if index < 0 or index >= tab_widget.count():
             return
-        tab = self.tab_widget.widget(index)
+        tab = tab_widget.widget(index)
         if isinstance(tab, TerminalTab):
             tab.stop_process()
-        self.tab_widget.removeTab(index)
+        tab_widget.removeTab(index)
         if tab is not None:
             tab.deleteLater()
-        if self.tab_widget.count() == 0:
-            self.new_tab()
+        if self.total_terminal_tab_count() == 0:
+            self.new_tab(target_tab_widget=self.tab_widget)
+        elif tab_widget.count() == 0 and tab_widget is self.secondary_tab_widget and self.split_view_enabled:
+            self.active_tab_widget = self.tab_widget
 
-    def show_tab_context_menu(self, pos):
+    def show_tab_context_menu(self, pos, tab_widget=None):
+        tab_widget = tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
+        self.active_tab_widget = tab_widget
         menu = QMenu(self)
         new_tab_action = QAction("Neuer Tab", self)
         new_tab_action.triggered.connect(self.new_tab)
@@ -2040,12 +2155,18 @@ class TerminalWindow(QMainWindow):
         update_directory_action.triggered.connect(self.update_current_tab_directory)
         menu.addAction(update_directory_action)
 
+        move_split_action = QAction("In andere Ansicht verschieben", self)
+        move_split_action.triggered.connect(self.move_current_tab_to_other_view)
+        menu.addAction(move_split_action)
+
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.close_current_tab)
         menu.addAction(close_tab_action)
-        menu.exec(self.tab_widget.tabBar().mapToGlobal(pos))
+        menu.exec(tab_widget.tabBar().mapToGlobal(pos))
 
-    def current_tab_changed(self, index):
+    def current_tab_changed(self, index, tab_widget=None):
+        if tab_widget is not None and index >= 0:
+            self.active_tab_widget = tab_widget
         tab = self.current_terminal()
         if tab is not None:
             self.statusBar().showMessage(f"Shell-Backend: {self.shell_backend_label(tab.shell_type)}")
@@ -2230,10 +2351,8 @@ class TerminalWindow(QMainWindow):
             if isinstance(tab, TerminalTab):
                 tab.restart_shell()
             return
-        for i in range(self.tab_widget.count()):
-            tab = self.tab_widget.widget(i)
-            if isinstance(tab, TerminalTab):
-                tab.restart_shell()
+        for _, _, tab in self.all_terminal_tabs():
+            tab.restart_shell()
 
     def select_shell(self):
         options = self.available_shell_backends()
@@ -2316,22 +2435,20 @@ class TerminalWindow(QMainWindow):
         tabs = []
         if not hasattr(self, "tab_widget"):
             return tabs
-        for i in range(self.tab_widget.count()):
-            tab = self.tab_widget.widget(i)
-            if isinstance(tab, TerminalTab):
-                item = {
-                    "shell_type": tab.shell_type,
-                    "title": tab.custom_title,
-                    "working_directory": tab.refresh_current_working_directory(),
-                    "command_history": list(tab.command_history)[-self.max_history_size:],
-                }
-                if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
-                    item.update({
-                        "client_mode_kind": "ollama_api",
-                        "ollama_model": tab.ollama_model,
-                        "ollama_system_prompt": tab.ollama_system_prompt,
-                    })
-                tabs.append(item)
+        for _, _, tab in self.all_terminal_tabs():
+            item = {
+                "shell_type": tab.shell_type,
+                "title": tab.custom_title,
+                "working_directory": tab.refresh_current_working_directory(),
+                "command_history": list(tab.command_history)[-self.max_history_size:],
+            }
+            if tab.client_mode_kind == "ollama_api" and tab.ollama_model:
+                item.update({
+                    "client_mode_kind": "ollama_api",
+                    "ollama_model": tab.ollama_model,
+                    "ollama_system_prompt": tab.ollama_system_prompt,
+                })
+            tabs.append(item)
         return tabs
 
     def find_git_bash(self):
@@ -2843,7 +2960,7 @@ class TerminalWindow(QMainWindow):
         except Exception:
             pass
 
-        self.tab_widget.setStyleSheet(
+        tab_style = (
             "QTabWidget::pane {"
             f" border: 1px solid {self.readable_border_color(background)};"
             " border-radius: 6px;"
@@ -2861,11 +2978,11 @@ class TerminalWindow(QMainWindow):
             " color: white;"
             "}"
         )
+        for tab_widget in self.terminal_tab_widgets():
+            tab_widget.setStyleSheet(tab_style)
 
-        for i in range(self.tab_widget.count()):
-            tab = self.tab_widget.widget(i)
-            if isinstance(tab, TerminalTab):
-                tab.apply_theme()
+        for _, _, tab in self.all_terminal_tabs():
+            tab.apply_theme()
 
         try:
             self.setWindowOpacity(max(0.2, min(1.0, self.window_opacity / 100.0)))
@@ -2880,10 +2997,8 @@ class TerminalWindow(QMainWindow):
             font, ok = result
         if ok:
             self.terminal_font = font
-            for i in range(self.tab_widget.count()):
-                tab = self.tab_widget.widget(i)
-                if isinstance(tab, TerminalTab):
-                    tab.set_terminal_font(font)
+            for _, _, tab in self.all_terminal_tabs():
+                tab.set_terminal_font(font)
             self.save_settings()
 
     def show_color_dialog(self):
@@ -3175,10 +3290,8 @@ class TerminalWindow(QMainWindow):
         if ok:
             self.max_history_size = size
             self.history = self.history[-self.max_history_size:]
-            for i in range(self.tab_widget.count()):
-                tab = self.tab_widget.widget(i)
-                if isinstance(tab, TerminalTab):
-                    tab.command_history = tab.command_history[-self.max_history_size:]
+            for _, _, tab in self.all_terminal_tabs():
+                tab.command_history = tab.command_history[-self.max_history_size:]
             self.save_history()
             self.save_settings()
 
@@ -3542,10 +3655,8 @@ Hinweise
 
     def closeEvent(self, event):
         self.save_settings()
-        for i in range(self.tab_widget.count()):
-            tab = self.tab_widget.widget(i)
-            if isinstance(tab, TerminalTab):
-                tab.stop_process()
+        for _, _, tab in self.all_terminal_tabs():
+            tab.stop_process()
         event.accept()
 
 
