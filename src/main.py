@@ -396,6 +396,10 @@ class TerminalTab(QWidget):
             paste_action.triggered.connect(self.input_line.paste)
             menu.addAction(paste_action)
 
+            paste_execute_action = QAction("Einfügen + Ausführen", self)
+            paste_execute_action.triggered.connect(self.paste_and_execute_command)
+            menu.addAction(paste_execute_action)
+
             cut_action = QAction("Ausschneiden", self)
             cut_action.setEnabled(bool(self.input_line.textCursor().hasSelection()))
             cut_action.triggered.connect(self.input_line.cut)
@@ -508,6 +512,32 @@ class TerminalTab(QWidget):
             return
         QApplication.clipboard().setText(self.window.clean_output_text(text))
         self.window.show_status("Ausgabe ohne Steuerzeichen kopiert")
+
+    def paste_and_execute_command(self):
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            return
+        self.input_line.setPlainText(text)
+        self.input_line.moveCursor(QTextCursor.MoveOperation.End)
+        self.execute_command()
+
+    def command_sequence_from_text(self, command_text, *, include_prefix=True):
+        parts = []
+        if include_prefix and not self.client_mode_active:
+            prefix_commands = self.window.active_pre_command_text()
+            if prefix_commands:
+                self.window.remember_pre_command_text(prefix_commands)
+                parts.append(prefix_commands)
+        parts.append(str(command_text or ""))
+
+        commands = []
+        for block in parts:
+            for line in str(block or "").splitlines():
+                for cmd in line.split(";"):
+                    text = cmd.strip()
+                    if text:
+                        commands.append(text)
+        return commands
 
     def run_text_command(self, command):
         self.input_line.setPlainText(command)
@@ -1306,12 +1336,7 @@ class TerminalTab(QWidget):
             self.send_client_input(command_text)
             return
 
-        commands = [
-            cmd.strip()
-            for line in command_text.splitlines()
-            for cmd in line.split(";")
-            if cmd.strip()
-        ]
+        commands = self.command_sequence_from_text(command_text, include_prefix=True)
         if not commands:
             return
 
@@ -1524,11 +1549,16 @@ class TerminalWindow(QMainWindow):
         self.default_start_directory = ""
         self.selected_ollama_model = ""
         self.ai_features_enabled = False
+        self.pre_command_visible = True
+        self.pre_command_enabled = False
+        self.pre_command_text = ""
+        self.pre_command_history = []
         self.detached_windows = []
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
         workspace_config_base = Path(os.environ.get("APPDATA") or Path.home()) / "ShellDeckTerminal"
         self.workspace_store_file = workspace_config_base / "workspaces.json"
+        self.pre_command_store_file = workspace_config_base / "pre_command.json"
         self.load_history()
 
         menubar = self.menuBar()
@@ -1574,6 +1604,13 @@ class TerminalWindow(QMainWindow):
         self.workspaces_menu = menubar.addMenu("&Workspaces")
 
         self.view_menu = menubar.addMenu("&Ansicht")
+
+        self.pre_command_bar_action = QAction("Vorbefehl-Leiste anzeigen", self)
+        self.pre_command_bar_action.setCheckable(True)
+        self.pre_command_bar_action.setChecked(True)
+        self.pre_command_bar_action.triggered.connect(self.set_pre_command_bar_visible)
+        self.view_menu.addAction(self.pre_command_bar_action)
+        self.view_menu.addSeparator()
 
         self.view_single_action = QAction("Einzelansicht", self)
         self.view_single_action.setCheckable(True)
@@ -1701,6 +1738,37 @@ class TerminalWindow(QMainWindow):
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        self.pre_command_bar = QWidget(menubar)
+        self.pre_command_bar.setObjectName("preCommandCornerWidget")
+        pre_command_layout = QHBoxLayout(self.pre_command_bar)
+        pre_command_layout.setContentsMargins(8, 0, 8, 0)
+        pre_command_layout.setSpacing(6)
+
+        self.pre_command_enabled_checkbox = QCheckBox("Vorbefehl aktiv", self.pre_command_bar)
+        self.pre_command_enabled_checkbox.setToolTip(
+            "Führt den Vorbefehl vor normalen Eingaben aus dem unteren Eingabefeld aus."
+        )
+        self.pre_command_enabled_checkbox.toggled.connect(self.set_pre_command_enabled)
+        pre_command_layout.addWidget(self.pre_command_enabled_checkbox)
+
+        self.pre_command_input = QComboBox(self.pre_command_bar)
+        self.pre_command_input.setEditable(True)
+        self.pre_command_input.setMinimumWidth(320)
+        self.pre_command_input.setFixedWidth(320)
+        self.pre_command_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.pre_command_input.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.pre_command_input.setToolTip(
+            "Mehrere Vorbefehle können mit Semikolon getrennt werden. "
+            "Die letzten Vorbefehle bleiben gespeichert."
+        )
+        if self.pre_command_input.lineEdit() is not None:
+            self.pre_command_input.lineEdit().setPlaceholderText("Vorbefehl(e), z.B. cls oder cd ..; dir")
+            self.pre_command_input.lineEdit().editingFinished.connect(self.remember_current_pre_command)
+        self.pre_command_input.editTextChanged.connect(self.set_pre_command_text)
+        self.pre_command_input.currentTextChanged.connect(self.set_pre_command_text)
+        pre_command_layout.addWidget(self.pre_command_input, 0)
+        menubar.setCornerWidget(self.pre_command_bar, Qt.Corner.TopRightCorner)
+
         self.view_container = QWidget()
         self.view_grid = QGridLayout(self.view_container)
         self.view_grid.setContentsMargins(0, 0, 0, 0)
@@ -1715,6 +1783,7 @@ class TerminalWindow(QMainWindow):
         layout.addWidget(self.view_container)
 
         self.load_settings()
+        self.update_pre_command_ui()
         self.apply_view_layout(move_tabs=False)
         self.update_ai_menu_visibility()
         self.rebuild_saved_paths_menu()
@@ -1737,6 +1806,202 @@ class TerminalWindow(QMainWindow):
 
         self.shortcut_command_palette = QShortcut("Ctrl+Shift+P", self)
         self.shortcut_command_palette.activated.connect(self.show_command_palette)
+
+    def normalize_pre_command_text(self, text):
+        return str(text or "").strip()
+
+    def current_pre_command_widget_text(self):
+        widget = getattr(self, "pre_command_input", None)
+        if widget is None:
+            return self.normalize_pre_command_text(getattr(self, "pre_command_text", ""))
+        try:
+            line_edit = widget.lineEdit() if hasattr(widget, "lineEdit") else None
+            if line_edit is not None:
+                return self.normalize_pre_command_text(line_edit.text())
+            if hasattr(widget, "currentText"):
+                return self.normalize_pre_command_text(widget.currentText())
+            if hasattr(widget, "text"):
+                return self.normalize_pre_command_text(widget.text())
+        except RuntimeError:
+            pass
+        return self.normalize_pre_command_text(getattr(self, "pre_command_text", ""))
+
+    def pre_command_settings_snapshot(self):
+        return {
+            "pre_command_visible": bool(getattr(self, "pre_command_visible", True)),
+            "pre_command_enabled": bool(getattr(self, "pre_command_enabled", False)),
+            "pre_command_text": self.normalize_pre_command_text(getattr(self, "pre_command_text", "")),
+            "pre_command_history": self.normalize_pre_command_history(getattr(self, "pre_command_history", [])),
+        }
+
+    def apply_pre_command_settings_mapping(self, values):
+        if not isinstance(values, dict):
+            return
+        if "pre_command_visible" in values:
+            self.pre_command_visible = bool(values.get("pre_command_visible"))
+        if "pre_command_enabled" in values:
+            self.pre_command_enabled = bool(values.get("pre_command_enabled"))
+        if "pre_command_text" in values:
+            self.pre_command_text = self.normalize_pre_command_text(values.get("pre_command_text", ""))
+        if "pre_command_history" in values:
+            self.pre_command_history = self.normalize_pre_command_history(values.get("pre_command_history", []))
+
+    def load_pre_command_persistent_settings(self):
+        path = getattr(self, "pre_command_store_file", None)
+        if path is None or not Path(path).exists():
+            return {}
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save_pre_command_persistent_settings(self, snapshot=None):
+        data = snapshot if isinstance(snapshot, dict) else self.pre_command_settings_snapshot()
+        path = getattr(self, "pre_command_store_file", None)
+        if path is None:
+            return False
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = Path(path).with_suffix(Path(path).suffix + ".tmp")
+            tmp_file.write_text(
+                json.dumps(data, ensure_ascii=False, indent=4),
+                encoding="utf-8",
+            )
+            tmp_file.replace(Path(path))
+            return True
+        except OSError:
+            return False
+
+    def sync_pre_command_state_from_ui(self):
+        """Copy the visible Vorbefehl controls into the persistent model.
+
+        The menu action is the source of truth for visibility, because a corner
+        widget can report hidden while the main window is closing. The editor's
+        lineEdit() is the source of truth for the text, because QComboBox can
+        keep an unfinished edit only in its internal editor until focus changes.
+        """
+        action = getattr(self, "pre_command_bar_action", None)
+        bar = getattr(self, "pre_command_bar", None)
+        checkbox = getattr(self, "pre_command_enabled_checkbox", None)
+
+        if action is not None:
+            try:
+                self.pre_command_visible = bool(action.isChecked())
+            except RuntimeError:
+                pass
+        elif bar is not None:
+            try:
+                self.pre_command_visible = bool(bar.isVisible())
+            except RuntimeError:
+                pass
+
+        if checkbox is not None:
+            try:
+                self.pre_command_enabled = bool(checkbox.isChecked())
+            except RuntimeError:
+                pass
+
+        current_text = self.current_pre_command_widget_text()
+        self.pre_command_text = current_text
+        if current_text:
+            self.pre_command_history = self.normalize_pre_command_history([
+                current_text,
+                *list(getattr(self, "pre_command_history", [])),
+            ])
+        else:
+            self.pre_command_history = self.normalize_pre_command_history(
+                getattr(self, "pre_command_history", [])
+            )
+
+    def normalize_pre_command_history(self, values):
+        result = []
+        if isinstance(values, (list, tuple)):
+            candidates = values
+        else:
+            candidates = []
+        current = self.normalize_pre_command_text(getattr(self, "pre_command_text", ""))
+        if current:
+            candidates = [current, *list(candidates)]
+        for value in candidates:
+            text = self.normalize_pre_command_text(value)
+            if text and text not in result:
+                result.append(text)
+        return result[:20]
+
+    def remember_pre_command_text(self, text=None):
+        normalized = self.current_pre_command_widget_text() if text is None else self.normalize_pre_command_text(text)
+        if not normalized:
+            return
+        self.pre_command_text = normalized
+        self.pre_command_history = self.normalize_pre_command_history([
+            normalized,
+            *list(getattr(self, "pre_command_history", [])),
+        ])
+        self.update_pre_command_ui()
+        self.save_settings()
+
+    def remember_current_pre_command(self):
+        self.remember_pre_command_text()
+
+    def active_pre_command_text(self):
+        if not bool(getattr(self, "pre_command_visible", True)):
+            return ""
+        if not bool(getattr(self, "pre_command_enabled", False)):
+            return ""
+        return self.normalize_pre_command_text(getattr(self, "pre_command_text", ""))
+
+    def set_pre_command_text(self, text):
+        normalized = self.normalize_pre_command_text(text)
+        if normalized == getattr(self, "pre_command_text", ""):
+            return
+        self.pre_command_text = normalized
+        self.pre_command_history = self.normalize_pre_command_history(getattr(self, "pre_command_history", []))
+        self.save_settings()
+
+    def set_pre_command_enabled(self, enabled):
+        value = bool(enabled)
+        if value == bool(getattr(self, "pre_command_enabled", False)):
+            return
+        self.pre_command_enabled = value
+        self.save_settings()
+        if value and not self.active_pre_command_text():
+            self.show_status("Vorbefehl ist aktiv, aber noch leer")
+        elif value:
+            self.show_status("Vorbefehl aktiviert")
+        else:
+            self.show_status("Vorbefehl deaktiviert")
+
+    def set_pre_command_bar_visible(self, visible):
+        self.pre_command_visible = bool(visible)
+        self.update_pre_command_ui()
+        self.save_settings()
+        self.show_status("Vorbefehl-Leiste eingeblendet" if self.pre_command_visible else "Vorbefehl-Leiste ausgeblendet")
+
+    def update_pre_command_ui(self):
+        bar = getattr(self, "pre_command_bar", None)
+        if bar is not None:
+            bar.setVisible(bool(getattr(self, "pre_command_visible", True)))
+        action = getattr(self, "pre_command_bar_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(bool(getattr(self, "pre_command_visible", True)))
+            action.blockSignals(False)
+        checkbox = getattr(self, "pre_command_enabled_checkbox", None)
+        if checkbox is not None:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(bool(getattr(self, "pre_command_enabled", False)))
+            checkbox.blockSignals(False)
+        combo = getattr(self, "pre_command_input", None)
+        if combo is not None:
+            current_text = self.normalize_pre_command_text(getattr(self, "pre_command_text", ""))
+            history = self.normalize_pre_command_history(getattr(self, "pre_command_history", []))
+            combo.blockSignals(True)
+            combo.clear()
+            if history:
+                combo.addItems(history)
+            combo.setCurrentText(current_text)
+            combo.blockSignals(False)
 
     def create_terminal_tab_widget(self, detached_window=None):
         tab_widget = QTabWidget()
@@ -3557,12 +3822,14 @@ class TerminalWindow(QMainWindow):
 
     def load_settings(self):
         if not self.settings_file.exists():
+            self.apply_pre_command_settings_mapping(self.load_pre_command_persistent_settings())
             self.workspaces = self.merge_workspaces_by_name(self.workspaces, self.load_persistent_workspaces())
             return
 
         try:
             settings = json.loads(self.settings_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            self.apply_pre_command_settings_mapping(self.load_pre_command_persistent_settings())
             self.workspaces = self.merge_workspaces_by_name(self.workspaces, self.load_persistent_workspaces())
             return
 
@@ -3616,12 +3883,17 @@ class TerminalWindow(QMainWindow):
         self.default_start_directory = str(settings.get("default_start_directory", self.default_start_directory or "") or "")
         self.selected_ollama_model = str(settings.get("selected_ollama_model", self.selected_ollama_model or "") or "")
         self.ai_features_enabled = bool(settings.get("ai_features_enabled", False))
+        self.apply_pre_command_settings_mapping(settings)
+        self.apply_pre_command_settings_mapping(self.load_pre_command_persistent_settings())
         self.tab_profiles = normalize_profiles(settings.get("tab_profiles", self.tab_profiles))
         settings_workspaces = normalize_workspaces(settings.get("workspaces", self.workspaces))
         stored_workspaces = self.load_persistent_workspaces()
         self.workspaces = self.merge_workspaces_by_name(settings_workspaces, stored_workspaces)
 
     def save_settings(self):
+        self.sync_pre_command_state_from_ui()
+        pre_command_settings = self.pre_command_settings_snapshot()
+        self.save_pre_command_persistent_settings(pre_command_settings)
         settings = {
             "font": self.terminal_font.toString(),
             "color_scheme_name": self.color_scheme_name,
@@ -3637,6 +3909,7 @@ class TerminalWindow(QMainWindow):
             "default_start_directory": self.default_start_directory,
             "selected_ollama_model": self.selected_ollama_model,
             "ai_features_enabled": self.ai_features_enabled,
+            **pre_command_settings,
             "tab_profiles": normalize_profiles(self.tab_profiles),
             "workspaces": normalize_workspaces(self.workspaces),
         }
@@ -4260,59 +4533,70 @@ class TerminalWindow(QMainWindow):
         return f"""{APP_NAME} {APP_VERSION}
 
 Übersicht
-- Mehrere Terminal-Tabs mit eigenem Shell-Prozess je Tab.
-- Schnellstart-Menü für neue Tabs mit bestimmtem Backend.
-- Shell-Backends je Tab auswählbar, zum Beispiel CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh, sofern installiert.
-- Tab-Namen, Shell-Typen, Arbeitsordner je Tab, Profile, Workspaces und gespeicherte Ordnerpfade werden in der Einstellungsdatei gespeichert.
-- Gemeinsame Befehlshistorie für alle Tabs.
-- Ollama-API-Modus mit Systemprompt, Kontextsteuerung, Antwort-Stopp und Markdown-Export sowie direkte Client-Prozesse für Python, Node.js und SQL-Clients.
-- Design mit Hell/Dunkel/System, Farben, Kontrast, Fenster-Transparenz, Hintergrund-Deckkraft und getrennten Terminal-Farben.
-- Schnellzugriff auf gespeicherte Ordnerpfade über das Menü Pfade.
-- Ausgabe kann als Markdown oder Text gespeichert und ohne Steuerzeichen kopiert werden.
-- Befehlspalette mit Suchfeld für Tabs, Backends, Pfade, Profile, Workspaces, KI, Ausgabe und Suche.
-- Tab-Profile speichern Backend, Titel, Arbeitsordner, optionalen Startbefehl und Ollama-Modell.
-- Workspaces speichern die komplette Tab-Zusammenstellung mit Backends, Titeln, Arbeitsordnern, Layout-Bereichen, entkoppelten Tabs und Standardordner.
+- ShellDeck Terminal ist eine tabbasierte Terminal-Oberfläche mit mehreren Shell-Backends, Profilen, Workspaces, Split-/Rasteransichten, gespeicherten Pfaden und optionalem Ollama/KI-Modus.
+- Jeder Terminal-Tab besitzt einen eigenen Shell-Prozess, eine eigene Befehlshistorie, einen erkannten Arbeitsordner und optional einen eigenen Client-/Ollama-Modus.
+- Einstellungen wie Fenstergröße, Design, Schrift, Farben, Tabs, Workspaces, gespeicherte Pfade, Profile, KI-Menü, Vorbefehl-Leiste und History werden beim Beenden gespeichert und beim nächsten Start wiederhergestellt.
+- Die App bleibt bewusst kontrolliert: Befehle werden erst ausgeführt, wenn du Enter, den Button oder „Einfügen + Ausführen“ verwendest.
+
+Grundbedienung
+- Gib unten im Eingabefeld einen Befehl ein und starte ihn mit Enter oder dem Button „Befehl ausführen“.
+- Mehrere normale Befehle können mit Semikolon getrennt werden, zum Beispiel: cls; dir; git status.
+- Ctrl+Enter fügt im unteren Eingabefeld eine neue Zeile ein.
+- Pfeil hoch/runter blättert durch die History des aktuellen Tabs und setzt den Cursor ans Ende.
+- cls oder clear leert zusätzlich direkt die sichtbare Terminal-Ausgabe.
+- Ctrl+C unterbricht den laufenden Shell-Befehl oder beendet/unterbricht den aktiven Client-Modus.
+
+Vorbefehl-Leiste oben rechts
+- Die Vorbefehl-Leiste sitzt rechts in der Menüleiste.
+- „Vorbefehl aktiv“ bestimmt, ob der Vorbefehl vor normalen Eingaben ausgeführt wird.
+- Im Eingabefeld daneben kannst du einen oder mehrere Vorbefehle eintragen; mehrere Vorbefehle werden mit Semikolon getrennt.
+- Beispiel: oben cls, unten dir -> zuerst wird cls ausgeführt, danach dir.
+- Die Vorbefehl-Leiste wirkt auf normale Befehle aus dem unteren Eingabefeld und auf „Einfügen + Ausführen“.
+- Im Client-Modus wird der Vorbefehl bewusst nicht angewendet, damit Python, SQL, Node oder Ollama keine unerwarteten Zusatzzeilen erhalten.
+- Sichtbarkeit, Aktiv-Haken, aktueller Vorbefehl und die letzten Vorbefehle werden gespeichert.
+- Ansicht → Vorbefehl-Leiste anzeigen blendet die Leiste ein oder aus.
 
 Datei-Menü
-- Neuer Tab: öffnet einen neuen Terminal-Tab.
-- Neuer Tab mit Backend: öffnet direkt PowerShell, CMD, Git Bash, WSL oder ein anderes erkanntes Backend.
-- Aktuellen Tab schließen: beendet den Prozess des aktuellen Tabs und schließt den Tab.
-- Tab duplizieren: öffnet einen neuen Tab mit gleichem Shell-Backend und ähnlichem Namen.
+- Neuer Tab: öffnet einen neuen Terminal-Tab mit dem aktuell gewählten Standard-Backend.
+- Neuer Tab mit Backend: öffnet direkt einen neuen Tab mit CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish oder sh, sofern erkannt.
+- Datei an aktuellen Prompt anhängen: liest eine Textdatei ein und hängt sie als Kontext an den aktuellen Prompt, besonders nützlich für Ollama-Chats.
+- Aktuellen Tab schließen: beendet den Shell-Prozess des aktuellen Tabs und schließt den Tab.
+- Tab duplizieren: öffnet einen neuen Tab mit gleichem Backend und ähnlichem Titel.
 - Tab umbenennen: vergibt einen eigenen Tab-Namen.
-- Beenden: speichert Einstellungen und beendet alle laufenden Shell-Prozesse sauber.
+- Beenden: speichert Einstellungen und beendet laufende Prozesse möglichst sauber.
 
 Pfade-Menü
 - Aktuellen Ordner speichern: speichert den zuletzt erkannten Arbeitsordner des aktuellen Tabs.
-- Ordnerpfad manuell speichern: wählt oder tippt einen Ordnerpfad und speichert ihn unter einem Namen.
+- Ordnerpfad manuell speichern: speichert einen gewählten oder eingetippten Ordner unter einem Namen.
 - Gespeicherten Pfad löschen: entfernt einen gespeicherten Schnellzugriff.
-- Standardordner für neue Tabs zurücksetzen: entfernt den festen Startordner für neue Tabs.
-- Gespeicherte Pfade können im aktuellen Tab, in einem neuen Tab oder in einem neuen Tab mit bestimmtem Backend geöffnet werden.
-- Windows-Pfade werden für WSL und Git Bash möglichst passend umgewandelt.
+- Standardordner für neue Tabs zurücksetzen: entfernt den festen Startordner.
+- Ein gespeicherter Pfad kann im aktuellen Tab geöffnet, in einem neuen Tab geöffnet oder als Standardordner für neue Tabs gesetzt werden.
+- Für WSL und Git Bash werden Windows-Pfade möglichst passend umgewandelt.
 
 Profile-Menü
-- Aktuellen Tab als Profil speichern: speichert Backend, Tab-Name, Arbeitsordner und optionalen Startbefehl.
-- Profil in neuem Tab öffnen: startet ein gespeichertes Profil in einem neuen Tab.
+- Aktuellen Tab als Profil speichern: speichert Backend, Titel, Arbeitsordner und optionalen Startbefehl.
+- Profil in neuem Tab öffnen: startet ein gespeichertes Profil als neuen Tab.
 - Profil löschen: entfernt gespeicherte Profile.
-- Ollama-Tabs merken zusätzlich das verwendete Modell.
-- Profile eignen sich für wiederkehrende Einzeltabs wie Projekt-Terminal, Python-REPL oder Ollama-Chat.
+- Profile eignen sich für wiederkehrende Einzeltabs, zum Beispiel Projekt-Terminal, Python-REPL, Node-Konsole, SQL-Client oder Ollama-Chat.
+- Ollama-Profile merken zusätzlich das verwendete Modell.
 
 Workspaces-Menü
 - Aktuellen Workspace speichern: speichert die aktuelle Tab-Zusammenstellung.
-- Workspace laden: ersetzt die aktuellen Tabs durch einen gespeicherten Workspace.
-- Workspace löschen: entfernt einen gespeicherten Workspace.
-- Gespeichert werden Tab-Titel, Shell-Backend, Arbeitsordner, Standardordner und ausgewähltes Ollama-Modell.
-- Workspaces eignen sich für komplette Arbeitsumgebungen, zum Beispiel Terminal-Projekt, Visual Edit und Ollama nebeneinander. Split-/Rasterbereiche und entkoppelte Tabs werden mitgespeichert.
+- Workspace laden: ersetzt die aktuellen Tabs durch den gespeicherten Workspace.
+- Workspace löschen: entfernt gespeicherte Workspaces.
+- Gespeichert werden Tab-Titel, Shell-Backend, Arbeitsordner, Befehls-History je Tab, Restore-Befehl, venv-Pfad, Layout-Bereich, entkoppelte Tabs, ausgewähltes Ollama-Modell und Standardordner.
+- Workspaces sind für komplette Arbeitsumgebungen gedacht, zum Beispiel Visual Edit, Terminal-Projekt und Ollama nebeneinander.
 
-KI-Menü
-- Das KI-Menü ist standardmäßig ausgeblendet und kann unter Einstellungen → KI-Menü / Ollama aktivieren eingeschaltet werden.
-- Neuer Ollama-Chat: startet einen neuen Ollama-API-Tab mit ausgewähltem Modell.
-- Ollama-Modell wählen: liest verfügbare Modelle über ollama list aus und merkt das bevorzugte Modell.
-- Ollama-Gespräch löschen: leert Ausgabe und Kontext des aktuellen Ollama-Tabs.
-- Ollama-Kontext löschen: setzt nur den Modellkontext zurück, die sichtbare Ausgabe bleibt erhalten.
-- Ollama-Systemprompt setzen: legt eine Rollen-/Verhaltensanweisung für den aktuellen Ollama-Tab fest und setzt den Kontext zurück.
-- Ollama-Antwort stoppen: bricht eine laufende Ollama-Anfrage ab.
-- Ollama-Chat als Markdown speichern: exportiert Verlauf, Modell und Systemprompt als Markdown.
-- Aktuelle Ausgabe speichern: speichert die sichtbare Ausgabe des aktuellen Tabs.
+Ansicht-Menü
+- Vorbefehl-Leiste anzeigen: blendet das obere Vorbefehl-Feld ein oder aus.
+- Einzelansicht: zeigt eine normale Tab-Fläche.
+- 2er horizontal: zeigt zwei Bereiche links und rechts.
+- 2er vertikal: zeigt zwei Bereiche oben und unten.
+- 4er Raster: zeigt vier Bereiche.
+- Aktuellen Tab verschieben nach: verschiebt den aktiven Tab gezielt in einen Layout-Bereich.
+- Aktuellen Tab in nächste Ansicht verschieben: verschiebt den aktiven Tab zyklisch in den nächsten Bereich.
+- Aktuellen Tab entkoppeln: verschiebt den Tab in ein separates Fenster.
+- Aktuellen Tab wieder ins Hauptfenster koppeln: holt einen entkoppelten Tab zurück.
 
 Einstellungen-Menü
 - Schriftart: setzt die Terminal-Schrift für alle Tabs.
@@ -4322,26 +4606,66 @@ Einstellungen-Menü
 - Standardbefehl: Befehl, der beim Start eines neuen Tabs automatisch ausgeführt wird.
 - History-Größe: maximale Anzahl gespeicherter Befehle.
 - Shell-Backend: wechselt das Shell-Backend des aktuellen Tabs.
+- KI-Menü / Ollama aktivieren: zeigt oder versteckt das KI-Menü.
+
+KI-Menü und Ollama
+- Das KI-Menü ist standardmäßig ausblendbar und wird über Einstellungen → KI-Menü / Ollama aktivieren gesteuert.
+- Neuer Ollama-Chat: startet einen neuen Ollama-API-Tab mit ausgewähltem Modell.
+- Ollama-Modell wählen: liest verfügbare Modelle über ollama list aus und merkt das bevorzugte Modell.
+- Ollama-Gespräch löschen: leert Ausgabe und Kontext des aktuellen Ollama-Tabs.
+- Ollama-Kontext löschen: setzt nur den Modellkontext zurück, die sichtbare Ausgabe bleibt erhalten.
+- Ollama-Systemprompt setzen: legt eine Rollen-/Verhaltensanweisung für den aktuellen Ollama-Tab fest und setzt den Kontext zurück.
+- Ollama-Antwort stoppen: bricht eine laufende Ollama-Anfrage ab.
+- Ollama-Chat als Markdown speichern: exportiert Verlauf, Modell und Systemprompt als Markdown.
+- Aktuelle Ausgabe speichern: speichert die sichtbare Ausgabe des aktuellen Tabs.
+- Markdown-Codeblöcke in Ollama-Antworten werden als Codekarten mit Kopieren-Schaltfläche dargestellt.
 
 Interaktiver Client-Modus
-- ollama run <modell> aktiviert einen stabilen Ollama-Prompt-Modus ohne echten PTY-Zwang.
-- Jede Eingabe unten wird als einzelner Prompt an das gewählte Ollama-Modell gesendet; die Antwort erscheint oben.
-- Optionaler Systemprompt je Ollama-Tab beeinflusst die Antworten und wird beim Markdown-Export dokumentiert.
-- Der Ollama-Kontext kann getrennt von der sichtbaren Ausgabe gelöscht werden.
-- Andere interaktive Clients wie python, node, sqlite3, psql oder mysql senden rohe Zeilen direkt an den laufenden Client.
-- Im Client-Modus wird der Button zu „An Client senden“ und die Statuszeile zeigt den aktiven Client.
-- /bye, exit, quit oder Ctrl+C verlassen den Client-Modus.
-- Normale Befehlsfunktionen wie Semikolon-Aufteilung und cls/clear werden im Client-Modus bewusst nicht angewendet.
+- ollama run <modell> startet den stabilen Ollama-API-Prompt-Modus.
+- python, py, python3 oder python -i startet einen direkten Python-Client, sofern verfügbar.
+- node startet eine Node.js-Konsole.
+- sqlite3, psql, mysql, mariadb und sqlcmd werden als SQL-/Datenbank-Clients erkannt.
+- Im Client-Modus sendet das untere Eingabefeld rohe Zeilen direkt an den Client.
+- Der Button ändert sich zu „An Client senden“ oder passend zum aktiven Client.
+- /bye, /exit, exit, quit oder .exit beenden den Client-Modus, je nach Client.
+- Semikolon-Aufteilung, cls/clear-Sonderbehandlung und Vorbefehl werden im Client-Modus nicht angewendet.
+
+Kontextmenüs
+- Rechtsklick im unteren Eingabefeld: Kopieren, Einfügen, Einfügen + Ausführen, Ausschneiden, Alles auswählen, Datei anhängen, Neuer Tab, Tab duplizieren, Tab umbenennen, Befehlspalette, Tab-Ordner aktualisieren, Client-Modus beenden und aktuellen Tab schließen.
+- Einfügen + Ausführen übernimmt den Text aus der Zwischenablage in das Eingabefeld und startet ihn sofort. Ist der Vorbefehl sichtbar und aktiv, läuft er vorher.
+- Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Kopieren ohne Steuerzeichen, Alles kopieren ohne Steuerzeichen, Ausgabe leeren, Ausgabe speichern, Ausgabe als Markdown/Text speichern, Suchen, nächster/vorheriger Treffer und Tab-Aktionen.
+- Im Ollama-Ausgabefeld gibt es zusätzlich Ollama-Antwort stoppen, letzten Codeblock kopieren und Ollama-Chat als Markdown speichern.
+- Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, in Ansicht verschieben, in nächste Ansicht verschieben, Tab entkoppeln/wieder koppeln und Tab schließen.
+
+Ausgabe, Suche und Export
+- Ctrl+F sucht in der Ausgabe des aktuellen Tabs.
+- F3 springt zum nächsten Treffer, Shift+F3 zum vorherigen Treffer.
+- Ausgabe kann als Text oder Markdown gespeichert werden.
+- Kopieren ohne Steuerzeichen entfernt ANSI-/Terminal-Steuerzeichen aus der kopierten Ausgabe.
+- Ausgabe leeren entfernt nur den sichtbaren Inhalt, nicht den laufenden Prozess.
 
 Befehlspalette
 - Ctrl+Shift+P öffnet die Befehlspalette.
-- Aktionen lassen sich per Suchtext filtern, zum Beispiel Tab, Backend, Pfad, Profil, Workspace, Ollama, Systemprompt oder Suche.
-- Profile und Workspaces erscheinen ebenfalls als Aktionen, sofern welche gespeichert sind.
+- Aktionen lassen sich per Suchtext filtern, zum Beispiel Tab, Backend, Pfad, Profil, Workspace, Ollama, Systemprompt, Ausgabe oder Suche.
+- Gespeicherte Pfade, Profile und Workspaces erscheinen automatisch als Aktionen.
 
-Kontextmenüs
-- Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
-- Rechtsklick im Ausgabefeld: Kopieren, Kopieren ohne Steuerzeichen, Alles kopieren, Ausgabe speichern, Ausgabe als Markdown/Text speichern, Ausgabe leeren, Suchen, nächster/vorheriger Treffer, Befehlspalette, Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, aktuellen Tab schließen.
-- Rechtsklick im Eingabefeld: Kopieren, Einfügen, Ausschneiden, Alles auswählen, Neuer Tab, Tab duplizieren, Tab umbenennen, Befehlspalette, Tab-Ordner aktualisieren, aktuellen Tab schließen.
+Backends
+- Unterstützt werden je nach System CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh.
+- Nicht installierte Backends werden nicht oder nur eingeschränkt angeboten.
+- Das Backend kann pro neuem Tab gewählt werden.
+- Beim Öffnen gespeicherter Pfade wird der passende cd-Befehl für das jeweilige Backend erzeugt.
+
+Virtuelle Umgebungen und Restore
+- ShellDeck versucht Arbeitsordner und virtuelle Python-Umgebungen zu merken.
+- Bei Workspaces werden Restore-Befehle und venv-Pfade je Tab gespeichert.
+- Beim Laden eines Workspace kann ein erkannter Aktivierungsbefehl erneut ausgeführt werden.
+- Die Funktion ist bewusst allgemein gehalten und hängt vom Backend und vom sichtbaren Shell-Prompt ab.
+
+Gespeicherte Daten
+- Allgemeine Einstellungen werden über die Anwendungseinstellungen gespeichert.
+- Workspaces liegen zusätzlich als JSON-Datei im ShellDeckTerminal-Konfigurationsordner.
+- Der Vorbefehl-Zustand wird zusätzlich robust in pre_command.json gespeichert.
+- Gespeichert werden unter anderem Fensterzustand, Design, Tabs, Tab-History, Pfade, Profile, Workspaces, KI-Menü-Zustand, Vorbefehl-Sichtbarkeit, Vorbefehl-Aktivierung und Vorbefehl-Historie.
 
 Tastenkürzel
 - F1: Hilfe öffnen.
@@ -4361,16 +4685,17 @@ Tastenkürzel
 - Pfeil runter: nächsten Befehl aus der History laden, Cursor ans Ende setzen.
 
 Modulare Dateien
-- src/main.py enthält aktuell noch die Hauptoberfläche und Terminal-Logik.
+- src/main.py enthält aktuell die Hauptoberfläche und Terminal-Logik.
 - src/shelldeck_profiles.py enthält die Datenlogik für Tab-Profile.
 - src/shelldeck_workspaces.py enthält die Datenlogik für Workspaces.
-- Weitere Auslagerungen sollten schrittweise erfolgen, nicht als großer Komplettumbau.
+- src/shelldeck_ollama.py enthält Hilfsfunktionen für Ollama.
+- src/shelldeck_markdown.py rendert sichere Markdown-/Codeblock-Ausgabe für Ollama-Antworten.
+- src/shelldeck_file_context.py liest Textdateien als Prompt-Kontext.
 
 Hinweise
-- Die App ist eine eigene Terminal-Oberfläche. Die Ausführung der Befehle erfolgt über das gewählte Shell-Backend.
+- ShellDeck ist keine echte PTY-/ConPTY-Emulation. Normale Shell-Befehle funktionieren gut; Programme mit Vollbild-Terminalsteuerung können eingeschränkt sein.
+- Welche Backends, Clients und Ollama-Modelle nutzbar sind, hängt davon ab, was auf dem System installiert ist.
 - Unter Linux funktioniert die App grundsätzlich mit PySide6 und verfügbaren Shells wie bash, zsh, fish oder sh.
-- Welche Backends angeboten werden, hängt davon ab, was auf dem System installiert ist.
-- Für Programme mit eigener Vollbild- oder Spezial-Terminalsteuerung kann später ein echter PTY/ConPTY-Modus ergänzt werden.
 """
 
     def show_help_dialog(self):
