@@ -132,8 +132,241 @@ class OllamaApiWorker(QThread):
             answer, context = extract_generate_response(raw)
             if not self.isInterruptionRequested():
                 self.response_ready.emit(answer, context)
+
         except Exception as exc:
             self.error_ready.emit(ollama_api_error_message(exc))
+
+
+class PtyReaderThread(QThread):
+    output_ready = Signal(bytes)
+    finished_ready = Signal(int, object)
+    error_ready = Signal(str)
+
+    def __init__(self, pty_process, parent=None):
+        super().__init__(parent)
+        self.pty_process = pty_process
+
+    def run(self):
+        exit_code = 0
+        try:
+            while not self.isInterruptionRequested():
+                proc = self.pty_process
+                if proc is None:
+                    break
+                try:
+                    is_alive = bool(proc.isalive()) if hasattr(proc, "isalive") else False
+                except Exception:
+                    is_alive = False
+                if not is_alive:
+                    break
+
+                try:
+                    chunk = proc.read(4096)
+                except EOFError:
+                    break
+                except Exception as exc:
+                    if not self.isInterruptionRequested():
+                        self.error_ready.emit(str(exc))
+                    exit_code = 1
+                    break
+
+                if chunk is None:
+                    self.msleep(20)
+                    continue
+                data = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
+                if data:
+                    self.output_ready.emit(data)
+                else:
+                    self.msleep(20)
+        finally:
+            self.finished_ready.emit(exit_code, QProcess.ExitStatus.NormalExit)
+
+
+class PtyTerminalProcess(QThread):
+    """Optionaler PTY/ConPTY-Adapter mit QProcess-ähnlicher Oberfläche.
+
+    Der vorhandene QProcess-Pfad bleibt Standard. Dieser Adapter wird nur
+    benutzt, wenn die experimentelle Terminal-Engine gewählt wurde und
+    pywinpty verfügbar ist.
+    """
+
+    readyReadStandardOutput = Signal()
+    readyReadStandardError = Signal()
+    finished = Signal(int, object)
+    errorOccurred = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pty = None
+        self._reader = None
+        self._stdout_buffer = bytearray()
+        self._stderr_buffer = bytearray()
+        self._working_directory = ""
+        self._error_string = ""
+        self._running = False
+        self._shelldeck_engine = "pty"
+
+    @staticmethod
+    def availability_message():
+        if sys.platform != "win32":
+            return "PTY/ConPTY ist in dieser ShellDeck-Version zunächst nur für Windows/pywinpty aktiviert."
+        try:
+            import winpty  # noqa: F401
+            return ""
+        except Exception as exc:
+            return (
+                "pywinpty ist nicht installiert. Installiere es im App-Interpreter mit: "
+                "python -m pip install pywinpty. Details: " + str(exc)
+            )
+
+    @classmethod
+    def is_available(cls):
+        return not cls.availability_message()
+
+    def setWorkingDirectory(self, directory):
+        text = str(directory or "").strip()
+        if text and Path(text).exists():
+            self._working_directory = text
+
+    def workingDirectory(self):
+        return self._working_directory
+
+    def _command_line(self, program, args):
+        values = [str(program or "").strip(), *[str(arg) for arg in (args or [])]]
+        values = [value for value in values if value]
+        if not values:
+            return ""
+        if sys.platform == "win32":
+            return subprocess.list2cmdline(values)
+        try:
+            return shlex.join(values)
+        except AttributeError:
+            return " ".join(shlex.quote(value) for value in values)
+
+    def start(self, program, args=None):
+        message = self.availability_message()
+        if message:
+            self._error_string = message
+            self._running = False
+            QTimer.singleShot(0, lambda: self.errorOccurred.emit(QProcess.ProcessError.FailedToStart))
+            return
+
+        command_line = self._command_line(program, args or [])
+        if not command_line:
+            self._error_string = "Kein Startbefehl für PTY/ConPTY angegeben."
+            self._running = False
+            QTimer.singleShot(0, lambda: self.errorOccurred.emit(QProcess.ProcessError.FailedToStart))
+            return
+
+        try:
+            from winpty import PtyProcess
+            cwd = self._working_directory or None
+            try:
+                self._pty = PtyProcess.spawn(command_line, cwd=cwd)
+            except TypeError:
+                old_cwd = os.getcwd()
+                try:
+                    if cwd:
+                        os.chdir(cwd)
+                    self._pty = PtyProcess.spawn(command_line)
+                finally:
+                    os.chdir(old_cwd)
+            self._running = True
+            self._error_string = ""
+            self._reader = PtyReaderThread(self._pty, self)
+            self._reader.output_ready.connect(self._append_stdout)
+            self._reader.error_ready.connect(self._handle_reader_error)
+            self._reader.finished_ready.connect(self._handle_reader_finished)
+            self._reader.start()
+        except Exception as exc:
+            self._error_string = str(exc)
+            self._running = False
+            QTimer.singleShot(0, lambda: self.errorOccurred.emit(QProcess.ProcessError.FailedToStart))
+
+    def _append_stdout(self, data):
+        self._stdout_buffer.extend(bytes(data or b""))
+        self.readyReadStandardOutput.emit()
+
+    def _handle_reader_error(self, message):
+        self._error_string = str(message or "Unbekannter PTY/ConPTY-Fehler")
+        self._stderr_buffer.extend(("\n[PTY/ConPTY-Fehler] " + self._error_string + "\n").encode("utf-8", errors="replace"))
+        self.readyReadStandardError.emit()
+        self.errorOccurred.emit(QProcess.ProcessError.UnknownError)
+
+    def _handle_reader_finished(self, exit_code, exit_status):
+        self._running = False
+        self.finished.emit(int(exit_code), exit_status)
+
+    def readAllStandardOutput(self):
+        data = bytes(self._stdout_buffer)
+        self._stdout_buffer.clear()
+        return data
+
+    def readAllStandardError(self):
+        data = bytes(self._stderr_buffer)
+        self._stderr_buffer.clear()
+        return data
+
+    def state(self):
+        return QProcess.ProcessState.Running if self._running else QProcess.ProcessState.NotRunning
+
+    def waitForStarted(self, msecs=30000):
+        return self._running
+
+    def write(self, data):
+        if not self._running or self._pty is None:
+            self._error_string = "PTY/ConPTY-Prozess läuft nicht."
+            return -1
+        raw = bytes(data or b"")
+        for encoding in ("utf-8", "cp1252", "cp850", "latin-1"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("utf-8", errors="replace")
+        text = text.replace("\r\n", "\n").replace("\n", "\r")
+        try:
+            self._pty.write(text)
+            return len(raw)
+        except Exception as exc:
+            self._error_string = str(exc)
+            self.errorOccurred.emit(QProcess.ProcessError.WriteError)
+            return -1
+
+    def waitForBytesWritten(self, msecs=30000):
+        return self._running
+
+    def terminate(self):
+        if not self._pty:
+            return
+        try:
+            self._pty.write("exit\r")
+        except Exception:
+            self.kill()
+
+    def kill(self):
+        if self._reader is not None and self._reader.isRunning():
+            self._reader.requestInterruption()
+        if self._pty is not None:
+            for name in ("terminate", "kill", "close"):
+                method = getattr(self._pty, name, None)
+                if callable(method):
+                    try:
+                        method()
+                        break
+                    except Exception:
+                        continue
+        self._running = False
+
+    def waitForFinished(self, msecs=30000):
+        if self._reader is None:
+            return True
+        return self._reader.wait(max(0, int(msecs)))
+
+    def errorString(self):
+        return self._error_string
 
 
 class TerminalTab(QWidget):
@@ -193,7 +426,7 @@ class TerminalTab(QWidget):
         self.execute_button.clicked.connect(self.execute_command)
         layout.addWidget(self.execute_button)
 
-        self.process = QProcess(self)
+        self.process = self.create_shell_process()
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.finished.connect(self.handle_finished)
@@ -569,6 +802,15 @@ class TerminalTab(QWidget):
             return self.current_working_directory
         return str(Path.cwd())
 
+    def create_shell_process(self):
+        if self.window.should_use_pty_backend(self.shell_type):
+            process = PtyTerminalProcess(self)
+            self.output_area.append("[PTY/ConPTY experimentell aktiv]\n")
+            return process
+        process = QProcess(self)
+        process._shelldeck_engine = "qprocess"
+        return process
+
     def start_shell(self):
         shell_path = self.window.system_shell(self.shell_type)
         if not shell_path:
@@ -680,9 +922,10 @@ class TerminalTab(QWidget):
 
     def display_shell_status(self, shell_path=None):
         backend_label = self.window.shell_backend_label(self.shell_type)
+        engine_label = self.window.terminal_engine_label_for_process(getattr(self, "process", None))
         self.title = self.custom_title or backend_label
         self.window.update_tab_title(self)
-        self.window.statusBar().showMessage(f"Shell-Backend: {backend_label}")
+        self.window.statusBar().showMessage(f"Shell-Backend: {backend_label} | Engine: {engine_label}")
 
     def eventFilter(self, source, event):
         if source is self.output_area.viewport() and event.type() == QEvent.Type.MouseButtonRelease:
@@ -917,11 +1160,17 @@ class TerminalTab(QWidget):
             }
 
         if executable_name in {"node", "node.exe"}:
-            if args:
+            # Node.js erkennt bei QProcess-Pipes nicht immer automatisch einen
+            # interaktiven REPL. Mit -i wird der REPL-Modus erzwungen, damit
+            # Eingaben sofort ausgeführt werden und .exit zuverlässig beendet.
+            normalized_args = list(args)
+            if normalized_args and not all(str(arg).lower() in {"-i", "--interactive"} for arg in normalized_args):
                 return None
+            if not any(str(arg).lower() in {"-i", "--interactive"} for arg in normalized_args):
+                normalized_args.insert(0, "-i")
             return {
                 "program": resolved_program(executable_name),
-                "args": [],
+                "args": normalized_args,
                 "label": "Node.js",
                 "exit_command": ".exit",
             }
@@ -1293,7 +1542,8 @@ class TerminalTab(QWidget):
             self.execute_button.setEnabled(True)
             self.execute_button.setText("Befehl ausführen")
             self.input_line.setPlaceholderText("")
-            self.window.statusBar().showMessage(f"Shell-Backend: {self.window.shell_backend_label(self.shell_type)}")
+            engine_label = self.window.terminal_engine_label_for_process(getattr(self, "process", None))
+            self.window.statusBar().showMessage(f"Shell-Backend: {self.window.shell_backend_label(self.shell_type)} | Engine: {engine_label}")
 
     def send_client_input(self, text):
         if self.client_mode_kind in {"ollama_prompt", "ollama_api"}:
@@ -1378,15 +1628,27 @@ class TerminalTab(QWidget):
                 continue
         return data.decode("utf-8", errors="replace")
 
+    def process_uses_pty_engine(self):
+        return str(getattr(getattr(self, "process", None), "_shelldeck_engine", "") or "").lower() == "pty"
+
+    def decoded_terminal_output(self, raw):
+        text = self._decode_process_output(raw)
+        if self.process_uses_pty_engine():
+            cleaner = getattr(self.window, "clean_terminal_control_sequences", None)
+            if callable(cleaner):
+                return cleaner(text)
+            return self.window.clean_output_text(text)
+        return text
+
     def handle_stdout(self):
-        data = self._decode_process_output(self.process.readAllStandardOutput())
+        data = self.decoded_terminal_output(self.process.readAllStandardOutput())
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.insertPlainText(data)
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.ensureCursorVisible()
 
     def handle_stderr(self):
-        data = self._decode_process_output(self.process.readAllStandardError())
+        data = self.decoded_terminal_output(self.process.readAllStandardError())
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.setTextColor(QColor(self.window.terminal_color("stderr", "#FCA5A5")))
         self.output_area.insertPlainText(data)
@@ -1540,6 +1802,7 @@ class TerminalWindow(QMainWindow):
         self.window_opacity = 100
         self.theme_config = self.default_theme_config()
         self.shell_type = "cmd"
+        self.terminal_engine = "qprocess"
         self.max_history_size = 1000
         self.terminal_font = QFont("Courier New", 10)
         self.saved_tabs = []
@@ -1678,6 +1941,10 @@ class TerminalWindow(QMainWindow):
         shell_action = QAction("Shell-Backend", self)
         shell_action.triggered.connect(self.select_shell)
         settings_menu.addAction(shell_action)
+
+        terminal_engine_action = QAction("Terminal-Engine", self)
+        terminal_engine_action.triggered.connect(self.select_terminal_engine)
+        settings_menu.addAction(terminal_engine_action)
 
         settings_menu.addSeparator()
 
@@ -3620,6 +3887,54 @@ class TerminalWindow(QMainWindow):
             "sh": "#A3A3A3",
         }.get(lower, "#FFFFFF")
 
+    def terminal_engine_label(self, engine=None):
+        value = str(engine or getattr(self, "terminal_engine", "qprocess") or "qprocess").lower().strip()
+        if value == "pty":
+            return "PTY/ConPTY experimentell"
+        return "Standard QProcess"
+
+    def terminal_engine_label_for_process(self, process=None):
+        engine = str(getattr(process, "_shelldeck_engine", "") or "").lower().strip()
+        return self.terminal_engine_label(engine or "qprocess")
+
+    def should_use_pty_backend(self, shell_type=None):
+        if str(getattr(self, "terminal_engine", "qprocess") or "qprocess").lower().strip() != "pty":
+            return False
+        message = PtyTerminalProcess.availability_message()
+        if message:
+            QTimer.singleShot(0, lambda m=message: self.show_status(f"PTY/ConPTY nicht aktiv: {m}"))
+            return False
+        return True
+
+    def select_terminal_engine(self):
+        options = [
+            "Standard QProcess",
+            "PTY/ConPTY experimentell",
+        ]
+        current_engine = str(getattr(self, "terminal_engine", "qprocess") or "qprocess").lower().strip()
+        current_index = 1 if current_engine == "pty" else 0
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Terminal-Engine",
+            "Engine für neu gestartete Tabs:",
+            options,
+            current_index,
+            False,
+        )
+        if not ok:
+            return
+        new_engine = "pty" if choice.startswith("PTY/") else "qprocess"
+        if new_engine == "pty":
+            message = PtyTerminalProcess.availability_message()
+            if message:
+                self.show_status(f"PTY/ConPTY gewählt, aber noch nicht verfügbar: {message}")
+        self.terminal_engine = new_engine
+        self.save_settings()
+        self.show_status(
+            f"Terminal-Engine: {self.terminal_engine_label(new_engine)}. "
+            "Die Änderung gilt für neu gestartete Tabs."
+        )
+
     def system_shell(self, shell_type=None) -> str:
         shell_type = shell_type or self.shell_type
         if sys.platform != "win32":
@@ -3863,6 +4178,9 @@ class TerminalWindow(QMainWindow):
 
         self.history = self.history[-self.max_history_size:]
 
+        engine_value = str(settings.get("terminal_engine", self.terminal_engine or "qprocess") or "qprocess").lower().strip()
+        self.terminal_engine = engine_value if engine_value in {"qprocess", "pty"} else "qprocess"
+
         shell_type_val = str(settings.get("shell_type", self.shell_type or "cmd") or "cmd")
         known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh"}
         if shell_type_val in known_shells and self.system_shell(shell_type_val):
@@ -3903,6 +4221,7 @@ class TerminalWindow(QMainWindow):
             "default_command": self.default_command,
             "max_history_size": self.max_history_size,
             "shell_type": self.shell_type,
+            "terminal_engine": getattr(self, "terminal_engine", "qprocess"),
             "tabs": self.collect_tab_settings(),
             "view_layout_mode": getattr(self, "view_layout_mode", "single"),
             "saved_paths": self.saved_paths,
@@ -4478,11 +4797,21 @@ class TerminalWindow(QMainWindow):
     def show_status(self, message, timeout=5000):
         self.statusBar().showMessage(str(message or ""), timeout)
 
-    def clean_output_text(self, text):
+    def clean_terminal_control_sequences(self, text):
         value = str(text or "")
+        # OSC-Sequenzen, z.B. Fenstertitel: ESC ] ... BEL oder ESC ] ... ESC \\
+        value = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", value)
+        # CSI-Sequenzen, z.B. Farben, Cursorposition, Bildschirm löschen: ESC [ ... final
         value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
-        value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+        # Einzelne ESC-Sequenzen wie ESC c, ESC 7, ESC 8 usw.
+        value = re.sub(r"\x1b[@-Z\\-_]", "", value)
+        # C1-Steuerzeichen und übrige nicht druckbare Steuerzeichen entfernen,
+        # Zeilenumbrüche und Tabs aber erhalten.
+        value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", value)
         return value.replace("\r\n", "\n").replace("\r", "\n")
+
+    def clean_output_text(self, text):
+        return self.clean_terminal_control_sequences(text)
 
     def current_output_text(self, clean=False):
         tab = self.current_terminal()
@@ -4533,7 +4862,7 @@ class TerminalWindow(QMainWindow):
         return f"""{APP_NAME} {APP_VERSION}
 
 Übersicht
-- ShellDeck Terminal ist eine tabbasierte Terminal-Oberfläche mit mehreren Shell-Backends, Profilen, Workspaces, Split-/Rasteransichten, gespeicherten Pfaden und optionalem Ollama/KI-Modus.
+- ShellDeck Terminal ist eine tabbasierte Terminal-Oberfläche mit mehreren Shell-Backends, optionaler Terminal-Engine-Auswahl, Profilen, Workspaces, Split-/Rasteransichten, gespeicherten Pfaden und optionalem Ollama/KI-Modus.
 - Jeder Terminal-Tab besitzt einen eigenen Shell-Prozess, eine eigene Befehlshistorie, einen erkannten Arbeitsordner und optional einen eigenen Client-/Ollama-Modus.
 - Einstellungen wie Fenstergröße, Design, Schrift, Farben, Tabs, Workspaces, gespeicherte Pfade, Profile, KI-Menü, Vorbefehl-Leiste und History werden beim Beenden gespeichert und beim nächsten Start wiederhergestellt.
 - Die App bleibt bewusst kontrolliert: Befehle werden erst ausgeführt, wenn du Enter, den Button oder „Einfügen + Ausführen“ verwendest.
@@ -4649,10 +4978,13 @@ Befehlspalette
 - Aktionen lassen sich per Suchtext filtern, zum Beispiel Tab, Backend, Pfad, Profil, Workspace, Ollama, Systemprompt, Ausgabe oder Suche.
 - Gespeicherte Pfade, Profile und Workspaces erscheinen automatisch als Aktionen.
 
-Backends
+Backends und Terminal-Engine
 - Unterstützt werden je nach System CMD, PowerShell, PowerShell 7, Git Bash, WSL, Bash, Zsh, Fish und sh.
 - Nicht installierte Backends werden nicht oder nur eingeschränkt angeboten.
 - Das Backend kann pro neuem Tab gewählt werden.
+- Einstellungen → Terminal-Engine wählt die interne Ausführungsart für neu gestartete Tabs.
+- Standard QProcess bleibt der stabile Standard und verhält sich wie bisher.
+- PTY/ConPTY experimentell nutzt unter Windows pywinpty, wenn es installiert ist; fehlt pywinpty, fällt ShellDeck kontrolliert auf QProcess zurück.
 - Beim Öffnen gespeicherter Pfade wird der passende cd-Befehl für das jeweilige Backend erzeugt.
 
 Virtuelle Umgebungen und Restore
@@ -4693,7 +5025,8 @@ Modulare Dateien
 - src/shelldeck_file_context.py liest Textdateien als Prompt-Kontext.
 
 Hinweise
-- ShellDeck ist keine echte PTY-/ConPTY-Emulation. Normale Shell-Befehle funktionieren gut; Programme mit Vollbild-Terminalsteuerung können eingeschränkt sein.
+- Standard QProcess ist der stabile Kompatibilitätsmodus. Normale Shell-Befehle funktionieren gut; Programme mit Vollbild-Terminalsteuerung können eingeschränkt sein.
+- PTY/ConPTY experimentell ist zum Testen echterer Terminal-Interaktion gedacht und sollte erst nach einem gesicherten Git-Stand genutzt werden.
 - Welche Backends, Clients und Ollama-Modelle nutzbar sind, hängt davon ab, was auf dem System installiert ist.
 - Unter Linux funktioniert die App grundsätzlich mit PySide6 und verfügbaren Shells wie bash, zsh, fish oder sh.
 """
@@ -4726,7 +5059,8 @@ Hinweise
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends, "
             "gespeicherten Ordnerpfaden, Tab-Profilen, Workspaces, Befehlspalette "
-            "flexiblen Split-/Raster-Ansichten und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts und Chat-artigen Codeblöcken.</p>"
+            "flexiblen Split-/Raster-Ansichten, optionaler experimenteller PTY/ConPTY-Engine "
+            "und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts und Chat-artigen Codeblöcken.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
             "<p>Modulare Helferdateien: shelldeck_profiles.py, "
