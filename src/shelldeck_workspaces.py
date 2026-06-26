@@ -7,6 +7,11 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _clean_terminal_engine(value: Any) -> str:
+    text = _clean_text(value).lower() or "qprocess"
+    return text if text in {"qprocess", "pty"} else "qprocess"
+
+
 def normalize_workspace(value: Any) -> Dict[str, Any]:
     data = value if isinstance(value, dict) else {}
     name = _clean_text(data.get("name")) or "Workspace"
@@ -18,6 +23,7 @@ def normalize_workspace(value: Any) -> Dict[str, Any]:
                 continue
             normalized_tabs.append({
                 "shell_type": _clean_text(item.get("shell_type")) or "cmd",
+                "terminal_engine": _clean_terminal_engine(item.get("terminal_engine")),
                 "title": _clean_text(item.get("title")),
                 "working_directory": _clean_text(item.get("working_directory")),
                 "command_history": [str(value or "").strip() for value in item.get("command_history", []) if str(value or "").strip()] if isinstance(item.get("command_history"), list) else [],
@@ -36,6 +42,7 @@ def normalize_workspace(value: Any) -> Dict[str, Any]:
         "default_start_directory": _clean_text(data.get("default_start_directory")),
         "selected_ollama_model": _clean_text(data.get("selected_ollama_model")),
         "shell_type": _clean_text(data.get("shell_type")) or "cmd",
+        "terminal_engine": _clean_terminal_engine(data.get("terminal_engine")),
         "layout_mode": _clean_text(data.get("layout_mode")) or "single",
     }
 
@@ -62,6 +69,7 @@ def workspace_from_tabs(
     default_start_directory: str = "",
     selected_ollama_model: str = "",
     shell_type: str = "cmd",
+    terminal_engine: str = "qprocess",
     layout_mode: str = "single",
 ) -> Dict[str, Any]:
     return normalize_workspace({
@@ -70,6 +78,7 @@ def workspace_from_tabs(
         "default_start_directory": default_start_directory,
         "selected_ollama_model": selected_ollama_model,
         "shell_type": shell_type,
+        "terminal_engine": terminal_engine,
         "layout_mode": layout_mode,
     })
 

@@ -370,10 +370,11 @@ class PtyTerminalProcess(QThread):
 
 
 class TerminalTab(QWidget):
-    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None, restore_command="", venv_path=""):
+    def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None, restore_command="", venv_path="", terminal_engine=None):
         super().__init__(window)
         self.window = window
         self.shell_type = shell_type or window.shell_type
+        self.terminal_engine = self.window.normalize_terminal_engine(terminal_engine or getattr(window, "terminal_engine", "qprocess"))
         self.custom_title = custom_title or ""
         self.start_directory = self.normalize_start_directory(start_directory)
         self.current_working_directory = self.start_directory or str(Path.cwd())
@@ -427,10 +428,7 @@ class TerminalTab(QWidget):
         layout.addWidget(self.execute_button)
 
         self.process = self.create_shell_process()
-        self.process.readyReadStandardOutput.connect(self.handle_stdout)
-        self.process.readyReadStandardError.connect(self.handle_stderr)
-        self.process.finished.connect(self.handle_finished)
-        self.process.errorOccurred.connect(self.handle_process_error)
+        self.connect_shell_process(self.process)
 
         self.apply_theme()
         self.start_shell()
@@ -755,21 +753,34 @@ class TerminalTab(QWidget):
         self.execute_command()
 
     def command_sequence_from_text(self, command_text, *, include_prefix=True):
-        parts = []
-        if include_prefix and not self.client_mode_active:
-            prefix_commands = self.window.active_pre_command_text()
-            if prefix_commands:
-                self.window.remember_pre_command_text(prefix_commands)
-                parts.append(prefix_commands)
-        parts.append(str(command_text or ""))
-
         commands = []
-        for block in parts:
-            for line in str(block or "").splitlines():
+
+        def append_split_commands(text_block):
+            for line in str(text_block or "").splitlines():
                 for cmd in line.split(";"):
                     text = cmd.strip()
                     if text:
                         commands.append(text)
+
+        if include_prefix and not self.client_mode_active:
+            prefix_commands = self.window.active_pre_command_text()
+            if prefix_commands:
+                self.window.remember_pre_command_text(prefix_commands)
+                append_split_commands(prefix_commands)
+
+        raw_command_text = str(command_text or "").strip()
+        if not raw_command_text:
+            return commands
+
+        # Mehrzeilige Shell-Eingaben müssen als Block an die Shell gehen.
+        # Sonst zerlegt ShellDeck z.B. PowerShell-Kommandos mit Backtick-
+        # Fortsetzung in einzelne Zeilen und PowerShell bleibt im ">>"-Prompt
+        # hängen. Einzeilige Befehle werden weiter wie bisher an Semikolon
+        # getrennt, damit Vorbefehl und Spezialerkennung stabil bleiben.
+        if "\n" in raw_command_text or "\r" in raw_command_text:
+            commands.append(raw_command_text.replace("\r\n", "\n").replace("\r", "\n"))
+        else:
+            append_split_commands(raw_command_text)
         return commands
 
     def run_text_command(self, command):
@@ -803,13 +814,58 @@ class TerminalTab(QWidget):
         return str(Path.cwd())
 
     def create_shell_process(self):
-        if self.window.should_use_pty_backend(self.shell_type):
+        requested_engine = self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+        if self.window.should_use_pty_backend(self.shell_type, engine=requested_engine):
             process = PtyTerminalProcess(self)
             self.output_area.append("[PTY/ConPTY experimentell aktiv]\n")
             return process
         process = QProcess(self)
         process._shelldeck_engine = "qprocess"
+        if requested_engine == "pty":
+            self.terminal_engine = "qprocess"
         return process
+
+    def connect_shell_process(self, process):
+        if process is None:
+            return
+        process.readyReadStandardOutput.connect(self.handle_stdout)
+        process.readyReadStandardError.connect(self.handle_stderr)
+        process.finished.connect(self.handle_finished)
+        process.errorOccurred.connect(self.handle_process_error)
+
+    def actual_terminal_engine(self):
+        process_engine = str(getattr(getattr(self, "process", None), "_shelldeck_engine", "") or "").lower().strip()
+        if process_engine in {"qprocess", "pty"}:
+            return process_engine
+        return self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+
+    def set_terminal_engine(self, engine, *, restart=True):
+        new_engine = self.window.normalize_terminal_engine(engine)
+        old_engine = self.actual_terminal_engine()
+        self.terminal_engine = new_engine
+        if not restart or new_engine == old_engine:
+            self.display_shell_status()
+            return True
+
+        current_dir = self.refresh_current_working_directory()
+        restore_command = self.current_restore_command()
+        self.stop_process(fast=False)
+        old_process = getattr(self, "process", None)
+        if old_process is not None:
+            try:
+                old_process.deleteLater()
+            except Exception:
+                pass
+        self.output_area.clear()
+        self.current_working_directory = current_dir or self.current_working_directory
+        self.start_directory = current_dir or self.start_directory
+        self.process = self.create_shell_process()
+        self.connect_shell_process(self.process)
+        self.start_shell()
+        if restore_command:
+            self.restore_command = restore_command
+            self.schedule_restore_command(restore_command)
+        return True
 
     def start_shell(self):
         shell_path = self.window.system_shell(self.shell_type)
@@ -1577,6 +1633,13 @@ class TerminalTab(QWidget):
         self.process.write(payload.encode() + b"\n")
         self.input_line.clear()
 
+    def write_shell_command(self, command):
+        text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not text.endswith("\n"):
+            text += "\n"
+        self.process.write(text.encode())
+        self.process.waitForBytesWritten(1000)
+
     def execute_command(self):
         command_text = self.input_line.toPlainText().strip()
         if not command_text:
@@ -1613,8 +1676,8 @@ class TerminalTab(QWidget):
                 )
                 break
             else:
-                self.process.write(command.encode() + b"\n")
-                client_name = self.detect_client_mode_name(command)
+                self.write_shell_command(command)
+                client_name = "" if ("\n" in command or "\r" in command) else self.detect_client_mode_name(command)
                 if client_name:
                     self.set_client_mode(True, client_name)
         self.input_line.clear()
@@ -1822,6 +1885,7 @@ class TerminalWindow(QMainWindow):
         workspace_config_base = Path(os.environ.get("APPDATA") or Path.home()) / "ShellDeckTerminal"
         self.workspace_store_file = workspace_config_base / "workspaces.json"
         self.pre_command_store_file = workspace_config_base / "pre_command.json"
+        self.terminal_engine_store_file = workspace_config_base / "terminal_engine.json"
         self.load_history()
 
         menubar = self.menuBar()
@@ -2011,6 +2075,17 @@ class TerminalWindow(QMainWindow):
         pre_command_layout.setContentsMargins(8, 0, 8, 0)
         pre_command_layout.setSpacing(6)
 
+        self.terminal_engine_combo = QComboBox(self.pre_command_bar)
+        self.terminal_engine_combo.setToolTip(
+            "Terminal-Engine für neu gestartete Tabs. "
+            "QProcess bleibt Standard; PTY/ConPTY ist experimentell."
+        )
+        self.terminal_engine_combo.addItem("Standard QProcess", "qprocess")
+        self.terminal_engine_combo.addItem("PTY/ConPTY experimentell", "pty")
+        self.terminal_engine_combo.setFixedWidth(210)
+        self.terminal_engine_combo.currentIndexChanged.connect(self.set_terminal_engine_from_combo)
+        pre_command_layout.addWidget(self.terminal_engine_combo)
+
         self.pre_command_enabled_checkbox = QCheckBox("Vorbefehl aktiv", self.pre_command_bar)
         self.pre_command_enabled_checkbox.setToolTip(
             "Führt den Vorbefehl vor normalen Eingaben aus dem unteren Eingabefeld aus."
@@ -2050,6 +2125,7 @@ class TerminalWindow(QMainWindow):
         layout.addWidget(self.view_container)
 
         self.load_settings()
+        self.update_terminal_engine_ui()
         self.update_pre_command_ui()
         self.apply_view_layout(move_tabs=False)
         self.update_ai_menu_visibility()
@@ -2073,6 +2149,96 @@ class TerminalWindow(QMainWindow):
 
         self.shortcut_command_palette = QShortcut("Ctrl+Shift+P", self)
         self.shortcut_command_palette.activated.connect(self.show_command_palette)
+
+    def normalize_terminal_engine(self, engine):
+        value = str(engine or "qprocess").lower().strip()
+        return value if value in {"qprocess", "pty"} else "qprocess"
+
+    def terminal_engine_settings_snapshot(self):
+        return {"terminal_engine": self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))}
+
+    def load_terminal_engine_persistent_settings(self):
+        store_file = getattr(self, "terminal_engine_store_file", None)
+        if store_file is None or not Path(store_file).exists():
+            return {}
+        try:
+            data = json.loads(Path(store_file).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save_terminal_engine_persistent_settings(self, settings=None):
+        store_file = getattr(self, "terminal_engine_store_file", None)
+        if store_file is None:
+            return False
+        payload = settings if isinstance(settings, dict) else self.terminal_engine_settings_snapshot()
+        try:
+            Path(store_file).parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = Path(store_file).with_suffix(Path(store_file).suffix + ".tmp")
+            tmp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=4), encoding="utf-8")
+            tmp_file.replace(Path(store_file))
+            return True
+        except OSError:
+            return False
+
+    def apply_terminal_engine_settings_mapping(self, mapping):
+        if not isinstance(mapping, dict):
+            return
+        self.terminal_engine = self.normalize_terminal_engine(
+            mapping.get("terminal_engine", getattr(self, "terminal_engine", "qprocess"))
+        )
+
+    def terminal_engine_combo_value(self):
+        combo = getattr(self, "terminal_engine_combo", None)
+        if combo is None:
+            return self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+        try:
+            data = combo.currentData()
+            if data:
+                return self.normalize_terminal_engine(data)
+            return self.normalize_terminal_engine(combo.currentText())
+        except RuntimeError:
+            return self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+
+    def set_terminal_engine(self, engine, *, show_message=True, save=True, apply_to_current_tab=True):
+        new_engine = self.normalize_terminal_engine(engine)
+        if new_engine == "pty":
+            message = PtyTerminalProcess.availability_message()
+            if message and show_message:
+                self.show_status(f"PTY/ConPTY gewählt, aber noch nicht verfügbar: {message}")
+        current_tab = self.current_terminal() if apply_to_current_tab else None
+        old_display_engine = self.current_terminal_engine()
+        self.terminal_engine = new_engine
+        if isinstance(current_tab, TerminalTab):
+            current_tab.set_terminal_engine(new_engine, restart=True)
+        self.update_terminal_engine_ui()
+        if save:
+            self.save_terminal_engine_persistent_settings()
+            self.save_settings()
+        if show_message:
+            changed = new_engine != old_display_engine
+            suffix = "Der aktuelle Tab wurde mit dieser Engine neu gestartet." if isinstance(current_tab, TerminalTab) else "Die Änderung gilt für neu gestartete Tabs."
+            if changed or save:
+                self.show_status(f"Terminal-Engine: {self.terminal_engine_label(new_engine)}. {suffix}")
+
+    def set_terminal_engine_from_combo(self, index=0):
+        self.set_terminal_engine(self.terminal_engine_combo_value(), show_message=True, save=True)
+
+    def update_terminal_engine_ui(self):
+        combo = getattr(self, "terminal_engine_combo", None)
+        if combo is None:
+            return
+        engine = self.current_terminal_engine()
+        combo.blockSignals(True)
+        for index in range(combo.count()):
+            if self.normalize_terminal_engine(combo.itemData(index)) == engine:
+                combo.setCurrentIndex(index)
+                break
+        combo.blockSignals(False)
+        combo.setToolTip(
+            f"Terminal-Engine des aktuellen Tabs: {self.terminal_engine_label(engine)}. "
+            "Eine Änderung startet den aktuellen Tab mit der gewählten Engine neu und wird als Vorgabe gespeichert."
+        )
 
     def normalize_pre_command_text(self, text):
         return str(text or "").strip()
@@ -2248,7 +2414,11 @@ class TerminalWindow(QMainWindow):
     def update_pre_command_ui(self):
         bar = getattr(self, "pre_command_bar", None)
         if bar is not None:
-            bar.setVisible(bool(getattr(self, "pre_command_visible", True)))
+            # Die Engine-Anzeige sitzt in derselben rechten Menüleisten-Gruppe
+            # und bleibt immer sichtbar. Die Ansicht-Option blendet nur die
+            # Vorbefehl-Bedienelemente aus.
+            bar.setVisible(True)
+        visible = bool(getattr(self, "pre_command_visible", True))
         action = getattr(self, "pre_command_bar_action", None)
         if action is not None:
             action.blockSignals(True)
@@ -2258,9 +2428,11 @@ class TerminalWindow(QMainWindow):
         if checkbox is not None:
             checkbox.blockSignals(True)
             checkbox.setChecked(bool(getattr(self, "pre_command_enabled", False)))
+            checkbox.setVisible(visible)
             checkbox.blockSignals(False)
         combo = getattr(self, "pre_command_input", None)
         if combo is not None:
+            combo.setVisible(visible)
             current_text = self.normalize_pre_command_text(getattr(self, "pre_command_text", ""))
             history = self.normalize_pre_command_history(getattr(self, "pre_command_history", []))
             combo.blockSignals(True)
@@ -2281,6 +2453,11 @@ class TerminalWindow(QMainWindow):
         tab_widget.tabBar().customContextMenuRequested.connect(
             lambda pos, w=tab_widget: self.show_tab_context_menu(pos, w)
         )
+        plus_button = QPushButton("+", tab_widget)
+        plus_button.setToolTip("Neuen Tab in dieser Ansicht öffnen")
+        plus_button.setFixedSize(28, 24)
+        plus_button.clicked.connect(lambda checked=False, w=tab_widget: self.new_tab(target_tab_widget=w))
+        tab_widget.setCornerWidget(plus_button, Qt.Corner.TopRightCorner)
         return tab_widget
 
     def main_terminal_tab_widgets(self):
@@ -2710,7 +2887,7 @@ class TerminalWindow(QMainWindow):
         self.show_status("KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.")
         return False
 
-    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path=""):
+    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path="", terminal_engine=None):
         effective_start_directory = start_directory
         if effective_start_directory is None:
             effective_start_directory = self.default_start_directory
@@ -2722,6 +2899,7 @@ class TerminalWindow(QMainWindow):
             command_history=command_history,
             restore_command=restore_command,
             venv_path=venv_path,
+            terminal_engine=terminal_engine or self.terminal_engine,
         )
         target = target_tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
         if target not in self.terminal_tab_widgets() or (not target.isVisible() and not self.is_detached_tab_widget(target)):
@@ -2955,6 +3133,7 @@ class TerminalWindow(QMainWindow):
             shell_type=shell_type,
             title=title,
             start_directory=working_directory,
+            terminal_engine=profile.get("terminal_engine", self.terminal_engine),
         )
         if not isinstance(tab, TerminalTab):
             return
@@ -3085,6 +3264,7 @@ class TerminalWindow(QMainWindow):
             default_start_directory=self.default_start_directory,
             selected_ollama_model=self.selected_ollama_model,
             shell_type=self.shell_type,
+            terminal_engine=self.current_terminal_engine(),
             layout_mode=getattr(self, "view_layout_mode", "single"),
         )
         self.workspaces = [
@@ -3160,6 +3340,7 @@ class TerminalWindow(QMainWindow):
         shell_type = workspace.get("shell_type", "")
         if shell_type and self.system_shell(shell_type):
             self.shell_type = shell_type
+        self.terminal_engine = self.normalize_terminal_engine(workspace.get("terminal_engine", self.terminal_engine))
 
         layout_mode = str(workspace.get("layout_mode", "single") or "single")
         self.set_view_layout_mode(layout_mode if layout_mode in {"single", "horizontal", "vertical", "quad"} else "single", move_tabs=False)
@@ -3180,6 +3361,7 @@ class TerminalWindow(QMainWindow):
                 command_history=item.get("command_history", []),
                 restore_command=item.get("restore_command", ""),
                 venv_path=item.get("venv_path", ""),
+                terminal_engine=item.get("terminal_engine", self.terminal_engine),
                 target_tab_widget=self.target_widget_for_saved_tab(item),
             )
             if isinstance(tab, TerminalTab):
@@ -3418,7 +3600,9 @@ class TerminalWindow(QMainWindow):
             self.active_tab_widget = tab_widget
         tab = self.current_terminal()
         if tab is not None:
-            self.statusBar().showMessage(f"Shell-Backend: {self.shell_backend_label(tab.shell_type)}")
+            self.update_terminal_engine_ui()
+            engine_label = self.terminal_engine_label_for_tab(tab)
+            self.statusBar().showMessage(f"Shell-Backend: {self.shell_backend_label(tab.shell_type)} | Engine: {engine_label}")
 
     def search_current_output(self):
         tab = self.current_terminal()
@@ -3658,6 +3842,7 @@ class TerminalWindow(QMainWindow):
                 command_history=list(tab.command_history),
                 restore_command=tab.current_restore_command(),
                 venv_path=tab.current_venv_path(),
+                terminal_engine=tab.actual_terminal_engine(),
                 target_tab_widget=source_widget if source_widget is not None else self.active_tab_widget,
             )
 
@@ -3678,6 +3863,7 @@ class TerminalWindow(QMainWindow):
                 command_history=item.get("command_history", []),
                 restore_command=item.get("restore_command", ""),
                 venv_path=item.get("venv_path", ""),
+                terminal_engine=item.get("terminal_engine", self.terminal_engine),
                 target_tab_widget=self.target_widget_for_saved_tab(item),
             )
             if isinstance(tab, TerminalTab):
@@ -3697,6 +3883,7 @@ class TerminalWindow(QMainWindow):
     def tab_settings_item(self, tab, tab_widget, detached_window=None):
         item = {
             "shell_type": tab.shell_type,
+            "terminal_engine": tab.actual_terminal_engine(),
             "title": tab.custom_title,
             "working_directory": tab.refresh_current_working_directory(),
             "command_history": list(tab.command_history)[-self.max_history_size:],
@@ -3897,8 +4084,19 @@ class TerminalWindow(QMainWindow):
         engine = str(getattr(process, "_shelldeck_engine", "") or "").lower().strip()
         return self.terminal_engine_label(engine or "qprocess")
 
-    def should_use_pty_backend(self, shell_type=None):
-        if str(getattr(self, "terminal_engine", "qprocess") or "qprocess").lower().strip() != "pty":
+    def current_terminal_engine(self):
+        tab = self.current_terminal() if hasattr(self, "tab_widget") else None
+        if isinstance(tab, TerminalTab):
+            return tab.actual_terminal_engine()
+        return self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+
+    def terminal_engine_label_for_tab(self, tab=None):
+        if isinstance(tab, TerminalTab):
+            return self.terminal_engine_label(tab.actual_terminal_engine())
+        return self.terminal_engine_label(self.current_terminal_engine())
+
+    def should_use_pty_backend(self, shell_type=None, engine=None):
+        if self.normalize_terminal_engine(engine or getattr(self, "terminal_engine", "qprocess")) != "pty":
             return False
         message = PtyTerminalProcess.availability_message()
         if message:
@@ -3911,12 +4109,12 @@ class TerminalWindow(QMainWindow):
             "Standard QProcess",
             "PTY/ConPTY experimentell",
         ]
-        current_engine = str(getattr(self, "terminal_engine", "qprocess") or "qprocess").lower().strip()
+        current_engine = self.current_terminal_engine()
         current_index = 1 if current_engine == "pty" else 0
         choice, ok = QInputDialog.getItem(
             self,
             "Terminal-Engine",
-            "Engine für neu gestartete Tabs:",
+            "Engine für den aktuellen Tab:",
             options,
             current_index,
             False,
@@ -3924,16 +4122,7 @@ class TerminalWindow(QMainWindow):
         if not ok:
             return
         new_engine = "pty" if choice.startswith("PTY/") else "qprocess"
-        if new_engine == "pty":
-            message = PtyTerminalProcess.availability_message()
-            if message:
-                self.show_status(f"PTY/ConPTY gewählt, aber noch nicht verfügbar: {message}")
-        self.terminal_engine = new_engine
-        self.save_settings()
-        self.show_status(
-            f"Terminal-Engine: {self.terminal_engine_label(new_engine)}. "
-            "Die Änderung gilt für neu gestartete Tabs."
-        )
+        self.set_terminal_engine(new_engine, show_message=True, save=True)
 
     def system_shell(self, shell_type=None) -> str:
         shell_type = shell_type or self.shell_type
@@ -4180,6 +4369,7 @@ class TerminalWindow(QMainWindow):
 
         engine_value = str(settings.get("terminal_engine", self.terminal_engine or "qprocess") or "qprocess").lower().strip()
         self.terminal_engine = engine_value if engine_value in {"qprocess", "pty"} else "qprocess"
+        self.apply_terminal_engine_settings_mapping(self.load_terminal_engine_persistent_settings())
 
         shell_type_val = str(settings.get("shell_type", self.shell_type or "cmd") or "cmd")
         known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh"}
@@ -4211,7 +4401,9 @@ class TerminalWindow(QMainWindow):
     def save_settings(self):
         self.sync_pre_command_state_from_ui()
         pre_command_settings = self.pre_command_settings_snapshot()
+        terminal_engine_settings = self.terminal_engine_settings_snapshot()
         self.save_pre_command_persistent_settings(pre_command_settings)
+        self.save_terminal_engine_persistent_settings(terminal_engine_settings)
         settings = {
             "font": self.terminal_font.toString(),
             "color_scheme_name": self.color_scheme_name,
@@ -4221,7 +4413,7 @@ class TerminalWindow(QMainWindow):
             "default_command": self.default_command,
             "max_history_size": self.max_history_size,
             "shell_type": self.shell_type,
-            "terminal_engine": getattr(self, "terminal_engine", "qprocess"),
+            **terminal_engine_settings,
             "tabs": self.collect_tab_settings(),
             "view_layout_mode": getattr(self, "view_layout_mode", "single"),
             "saved_paths": self.saved_paths,

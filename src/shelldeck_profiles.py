@@ -13,6 +13,18 @@ KNOWN_PROFILE_SHELLS = {
     "sh",
 }
 
+KNOWN_TERMINAL_ENGINES = {"qprocess", "pty"}
+
+
+def normalize_terminal_engine(value):
+    text = str(value or "qprocess").strip().lower()
+    return text if text in KNOWN_TERMINAL_ENGINES else "qprocess"
+
+
+def terminal_engine_display_label(value):
+    engine = normalize_terminal_engine(value)
+    return "PTY/ConPTY" if engine == "pty" else "QProcess"
+
 
 def normalize_profile(profile):
     """Return a stable ShellDeck tab profile dictionary."""
@@ -29,6 +41,7 @@ def normalize_profile(profile):
     startup_command = str(profile.get("startup_command", "") or "").strip()
     client_mode = str(profile.get("client_mode", "") or "").strip()
     ollama_model = str(profile.get("ollama_model", "") or "").strip()
+    terminal_engine = normalize_terminal_engine(profile.get("terminal_engine", "qprocess"))
 
     if not name:
         name = title or ollama_model or Path(working_directory).name or shell_type or "Profil"
@@ -41,6 +54,7 @@ def normalize_profile(profile):
         "startup_command": startup_command,
         "client_mode": client_mode,
         "ollama_model": ollama_model,
+        "terminal_engine": terminal_engine,
     }
 
 
@@ -69,6 +83,7 @@ def profile_display_label(profile):
 
     if profile["shell_type"]:
         details.append(profile["shell_type"])
+    details.append(terminal_engine_display_label(profile.get("terminal_engine")))
     if profile["working_directory"]:
         details.append(profile["working_directory"])
     if profile["ollama_model"]:
@@ -98,6 +113,14 @@ def profile_from_tab(tab, *, name="", startup_command=""):
 
     client_mode = str(getattr(tab, "client_mode_kind", "") or "").strip()
     ollama_model = str(getattr(tab, "ollama_model", "") or "").strip()
+    actual_engine = getattr(tab, "actual_terminal_engine", None)
+    if callable(actual_engine):
+        try:
+            terminal_engine = actual_engine()
+        except Exception:
+            terminal_engine = getattr(tab, "terminal_engine", "qprocess")
+    else:
+        terminal_engine = getattr(tab, "terminal_engine", "qprocess")
 
     return normalize_profile({
         "name": name or title or Path(working_directory).name or shell_type or "Profil",
@@ -107,4 +130,5 @@ def profile_from_tab(tab, *, name="", startup_command=""):
         "startup_command": startup_command,
         "client_mode": client_mode,
         "ollama_model": ollama_model,
+        "terminal_engine": terminal_engine,
     })
