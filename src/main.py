@@ -335,6 +335,30 @@ class PtyTerminalProcess(QThread):
             self.errorOccurred.emit(QProcess.ProcessError.WriteError)
             return -1
 
+    def write_bracketed_paste(self, text):
+        """Write a command as bracketed paste to reduce PSReadLine redraw noise.
+
+        PowerShell/PSReadLine repaints long input lines character by character
+        in a PTY. QTextEdit is not a terminal emulator, so those redraws can
+        become visible. Bracketed paste lets PSReadLine receive the whole
+        command as one paste operation and then execute it with Enter.
+        """
+        if not self._running or self._pty is None:
+            self._error_string = "PTY/ConPTY-Prozess läuft nicht."
+            return -1
+        value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        value = value.rstrip("\n")
+        if not value:
+            return 0
+        payload = "\x1b[200~" + value + "\x1b[201~\r"
+        try:
+            self._pty.write(payload)
+            return len(value.encode("utf-8", errors="replace"))
+        except Exception as exc:
+            self._error_string = str(exc)
+            self.errorOccurred.emit(QProcess.ProcessError.WriteError)
+            return -1
+
     def waitForBytesWritten(self, msecs=30000):
         return self._running
 
@@ -397,6 +421,7 @@ class TerminalTab(QWidget):
         self.direct_client_start_error_reported = False
         self.output_search_text = ""
         self.last_ollama_code_blocks = []
+        self._pending_pty_command_echoes = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -877,6 +902,21 @@ class TerminalTab(QWidget):
             except Exception:
                 pass
         shell_args = self.window.shell_start_args(self.shell_type)
+        if self.process_uses_pty_engine() and str(self.shell_type or "").lower() in {"powershell", "pwsh"}:
+            # PSReadLine repaints long input lines in a real terminal using
+            # carriage-return redraws. QTextEdit is not a terminal emulator and
+            # would show those intermediate redraws as duplicated fragments.
+            # In ShellDeck the lower input widget already handles editing and
+            # history, so disabling PSReadLine only for the experimental PTY
+            # PowerShell path keeps command output readable without affecting
+            # the standard QProcess engine.
+            shell_args = [
+                "-NoLogo",
+                "-NoProfile",
+                "-NoExit",
+                "-Command",
+                "try { Remove-Module PSReadLine -ErrorAction SilentlyContinue } catch {}",
+            ]
         self.process.start(shell_path, shell_args)
         self.display_shell_status(shell_path)
 
@@ -984,24 +1024,42 @@ class TerminalTab(QWidget):
         self.window.statusBar().showMessage(f"Shell-Backend: {backend_label} | Engine: {engine_label}")
 
     def eventFilter(self, source, event):
-        if source is self.output_area.viewport() and event.type() == QEvent.Type.MouseButtonRelease:
+        """Handle terminal/input events safely during widget construction.
+
+        Qt can already deliver events while a TerminalTab is still being
+        constructed. At that point output_area may exist while input_line does
+        not yet exist. Access both widgets through getattr() so startup never
+        fails with AttributeError.
+        """
+        output_area = getattr(self, "output_area", None)
+        input_line = getattr(self, "input_line", None)
+
+        if (
+            output_area is not None
+            and source is output_area.viewport()
+            and event.type() == QEvent.Type.MouseButtonRelease
+        ):
             if getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton:
                 try:
                     pos = event.position().toPoint()
                 except AttributeError:
                     pos = event.pos()
-                anchor = self.output_area.anchorAt(pos)
+                anchor = output_area.anchorAt(pos)
                 if str(anchor).startswith("shelldeck-copy-code:"):
                     index_text = str(anchor).split(":", 1)[1]
                     self.copy_ollama_code_block(index_text)
                     return True
 
-        if source is self.input_line and event.type() == QEvent.Type.KeyPress:
+        if (
+            input_line is not None
+            and source is input_line
+            and event.type() == QEvent.Type.KeyPress
+        ):
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 self.execute_command()
                 return True
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                self.input_line.insertPlainText("\n")
+                input_line.insertPlainText("\n")
                 return True
             if event.key() == Qt.Key.Key_Up:
                 self.show_previous_command()
@@ -1010,6 +1068,7 @@ class TerminalTab(QWidget):
                 self.show_next_command()
                 return True
         return super().eventFilter(source, event)
+
 
     def normalize_command_history(self, history):
         if not isinstance(history, list):
@@ -1635,6 +1694,16 @@ class TerminalTab(QWidget):
 
     def write_shell_command(self, command):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not text:
+            return
+
+        # In PTY/ConPTY PowerShell the shell is started without PSReadLine.
+        # That avoids the redraw storm that produced duplicated command
+        # fragments. Send the command normally; the pending-echo filter remains
+        # as a safety net for already emitted redraw fragments.
+        if self.process_uses_pty_engine() and str(self.shell_type or "").lower() in {"powershell", "pwsh"}:
+            self.remember_pending_pty_command_echo(text)
+
         if not text.endswith("\n"):
             text += "\n"
         self.process.write(text.encode())
@@ -1699,9 +1768,86 @@ class TerminalTab(QWidget):
         if self.process_uses_pty_engine():
             cleaner = getattr(self.window, "clean_terminal_control_sequences", None)
             if callable(cleaner):
-                return cleaner(text)
-            return self.window.clean_output_text(text)
+                text = cleaner(text)
+            else:
+                text = self.window.clean_output_text(text)
+            return self.suppress_pending_pty_command_echo(text)
         return text
+
+    def remember_pending_pty_command_echo(self, command):
+        text = str(command or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            return
+        pending = getattr(self, "_pending_pty_command_echoes", [])
+        pending.append({"command": text, "ttl": 8})
+        self._pending_pty_command_echoes = pending[-8:]
+
+    def compact_echo_text(self, value):
+        text = re.sub(r"\s+", "", str(value or "").lower())
+        text = re.sub(r"[^a-z0-9äöüß_./:;\\-]+", "", text)
+        collapsed = []
+        previous = ""
+        for char in text:
+            if char == previous and char.isalpha():
+                continue
+            collapsed.append(char)
+            previous = char
+        return "".join(collapsed)
+
+    def line_looks_like_pending_pty_echo(self, line, command):
+        raw_line = str(line or "").strip()
+        raw_command = str(command or "").strip()
+        if not raw_line or not raw_command:
+            return False
+
+        # A finished PowerShell prompt should remain visible. Only suppress the
+        # noisy PSReadLine redraw fragments of the command itself.
+        if re.search(r"(?:^|\s)PS\s+[^>]+>\s*$", raw_line):
+            return False
+
+        line_key = self.compact_echo_text(raw_line)
+        command_key = self.compact_echo_text(raw_command)
+        if len(command_key) < 3 or len(line_key) < 3:
+            return False
+
+        if command_key.startswith(line_key) or line_key.startswith(command_key):
+            return True
+
+        prefix = command_key[: min(18, len(command_key))]
+        if len(prefix) >= 6 and line_key.startswith(prefix) and len(line_key) <= max(len(command_key) * 3, 40):
+            return True
+
+        # Long PowerShell/PSReadLine redraws can contain several partial copies
+        # of the command in one physical output chunk. If the line starts like
+        # the command and repeatedly contains its first token, treat it as echo.
+        first_token = self.compact_echo_text(raw_command.split(None, 1)[0])
+        if first_token and line_key.startswith(first_token) and line_key.count(first_token) >= 2:
+            return True
+
+        return False
+
+    def suppress_pending_pty_command_echo(self, text):
+        pending = list(getattr(self, "_pending_pty_command_echoes", []) or [])
+        if not pending:
+            return text
+
+        kept_lines = []
+        removed_any = False
+        for line in str(text or "").splitlines(True):
+            line_body = line.rstrip("\n")
+            if any(self.line_looks_like_pending_pty_echo(line_body, item.get("command", "")) for item in pending):
+                removed_any = True
+                continue
+            kept_lines.append(line)
+
+        next_pending = []
+        for item in pending:
+            ttl = int(item.get("ttl", 0)) - 1
+            if ttl > 0 and not removed_any:
+                item["ttl"] = ttl
+                next_pending.append(item)
+        self._pending_pty_command_echoes = next_pending
+        return "".join(kept_lines)
 
     def handle_stdout(self):
         data = self.decoded_terminal_output(self.process.readAllStandardOutput())
@@ -1886,6 +2032,7 @@ class TerminalWindow(QMainWindow):
         self.workspace_store_file = workspace_config_base / "workspaces.json"
         self.pre_command_store_file = workspace_config_base / "pre_command.json"
         self.terminal_engine_store_file = workspace_config_base / "terminal_engine.json"
+        self.theme_store_file = workspace_config_base / "theme.json"
         self.load_history()
 
         menubar = self.menuBar()
@@ -2149,6 +2296,122 @@ class TerminalWindow(QMainWindow):
 
         self.shortcut_command_palette = QShortcut("Ctrl+Shift+P", self)
         self.shortcut_command_palette.activated.connect(self.show_command_palette)
+
+    def normalize_color_scheme_name(self, value):
+        text = str(value or "Dunkel").strip()
+        aliases = {
+            "system": "System",
+            "dunkel": "Dunkel",
+            "dark": "Dunkel",
+            "hell": "Hell",
+            "light": "Hell",
+            "hoher kontrast": "Hoher Kontrast",
+            "kontrast": "Hoher Kontrast",
+            "high contrast": "Hoher Kontrast",
+        }
+        return aliases.get(text.lower(), text if text in {"System", "Dunkel", "Hell", "Hoher Kontrast"} else "Dunkel")
+
+    def theme_settings_snapshot(self):
+        return {
+            "color_scheme_name": self.normalize_color_scheme_name(getattr(self, "color_scheme_name", "Dunkel")),
+            "theme_mode": str(getattr(self, "theme_mode", "dark") or "dark").lower().strip(),
+        }
+
+    def apply_theme_settings_mapping(self, mapping):
+        if not isinstance(mapping, dict):
+            return
+        if "color_scheme_name" in mapping:
+            self.color_scheme_name = self.normalize_color_scheme_name(mapping.get("color_scheme_name"))
+        mode = str(mapping.get("theme_mode", "") or "").lower().strip()
+        if mode in {"light", "dark", "system"}:
+            self.theme_mode = mode
+        else:
+            scheme = self.normalize_color_scheme_name(getattr(self, "color_scheme_name", "Dunkel"))
+            if scheme == "System":
+                self.theme_mode = "system"
+            elif scheme == "Hell":
+                self.theme_mode = "light"
+            else:
+                self.theme_mode = "dark"
+
+    def load_theme_persistent_settings(self):
+        store_file = getattr(self, "theme_store_file", None)
+        if store_file is None or not Path(store_file).exists():
+            return {}
+        try:
+            data = json.loads(Path(store_file).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save_theme_persistent_settings(self, settings=None):
+        store_file = getattr(self, "theme_store_file", None)
+        if store_file is None:
+            return False
+        payload = settings if isinstance(settings, dict) else self.theme_settings_snapshot()
+        try:
+            Path(store_file).parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = Path(store_file).with_suffix(Path(store_file).suffix + ".tmp")
+            tmp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=4), encoding="utf-8")
+            tmp_file.replace(Path(store_file))
+            return True
+        except OSError:
+            return False
+
+    def system_theme_key(self):
+        """Return light/dark from the OS setting when possible."""
+        try:
+            color_scheme = QApplication.styleHints().colorScheme()
+            if color_scheme == Qt.ColorScheme.Dark:
+                return "dark"
+            if color_scheme == Qt.ColorScheme.Light:
+                return "light"
+        except Exception:
+            pass
+
+        if sys.platform == "win32":
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                ) as key:
+                    value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                    return "light" if int(value) else "dark"
+            except Exception:
+                pass
+        else:
+            for command in (
+                ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+                ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+            ):
+                try:
+                    result = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=1,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    value = str(result.stdout or "").strip().lower()
+                    if "dark" in value:
+                        return "dark"
+                    if "light" in value:
+                        return "light"
+                except Exception:
+                    pass
+
+        try:
+            palette_color = QApplication.palette().color(QPalette.ColorRole.Window)
+            brightness = (
+                palette_color.red() * 0.299
+                + palette_color.green() * 0.587
+                + palette_color.blue() * 0.114
+            )
+            return "dark" if brightness < 128 else "light"
+        except Exception:
+            return "dark"
 
     def normalize_terminal_engine(self, engine):
         value = str(engine or "qprocess").lower().strip()
@@ -4273,23 +4536,16 @@ class TerminalWindow(QMainWindow):
         return fallback
 
     def theme_key_from_scheme(self, scheme_name=None):
-        name = str(scheme_name or self.color_scheme_name or "Dunkel").strip().lower()
-        if name == "hell":
+        name = self.normalize_color_scheme_name(scheme_name or self.color_scheme_name or "Dunkel")
+        if name == "Hell":
             return "light"
+        if name == "System":
+            return self.system_theme_key()
         return "dark"
 
     def current_theme_key(self):
         if self.theme_mode == "system":
-            try:
-                palette_color = QApplication.palette().color(QPalette.ColorRole.Window)
-                brightness = (
-                    palette_color.red() * 0.299
-                    + palette_color.green() * 0.587
-                    + palette_color.blue() * 0.114
-                )
-                return "dark" if brightness < 128 else "light"
-            except Exception:
-                return self.theme_key_from_scheme()
+            return self.system_theme_key()
         if self.theme_mode in ("light", "dark"):
             return self.theme_mode
         return self.theme_key_from_scheme()
@@ -4326,6 +4582,7 @@ class TerminalWindow(QMainWindow):
 
     def load_settings(self):
         if not self.settings_file.exists():
+            self.apply_theme_settings_mapping(self.load_theme_persistent_settings())
             self.apply_pre_command_settings_mapping(self.load_pre_command_persistent_settings())
             self.workspaces = self.merge_workspaces_by_name(self.workspaces, self.load_persistent_workspaces())
             return
@@ -4333,6 +4590,7 @@ class TerminalWindow(QMainWindow):
         try:
             settings = json.loads(self.settings_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            self.apply_theme_settings_mapping(self.load_theme_persistent_settings())
             self.apply_pre_command_settings_mapping(self.load_pre_command_persistent_settings())
             self.workspaces = self.merge_workspaces_by_name(self.workspaces, self.load_persistent_workspaces())
             return
@@ -4344,7 +4602,7 @@ class TerminalWindow(QMainWindow):
                 self.terminal_font = font
 
         self.default_command = str(settings.get("default_command", self.default_command or "") or "")
-        self.color_scheme_name = str(settings.get("color_scheme_name", self.color_scheme_name or "Dunkel") or "Dunkel")
+        self.color_scheme_name = self.normalize_color_scheme_name(settings.get("color_scheme_name", self.color_scheme_name or "Dunkel"))
         self.theme_config = self.merge_theme_config(settings.get("theme_config", self.theme_config))
 
         loaded_theme_mode = str(settings.get("theme_mode", "") or "").lower().strip()
@@ -4352,6 +4610,7 @@ class TerminalWindow(QMainWindow):
             self.theme_mode = loaded_theme_mode
         else:
             self.theme_mode = self.theme_key_from_scheme(self.color_scheme_name)
+        self.apply_theme_settings_mapping(self.load_theme_persistent_settings())
 
         try:
             self.window_opacity = max(20, min(100, int(settings.get("window_opacity", self.window_opacity))))
@@ -4402,12 +4661,13 @@ class TerminalWindow(QMainWindow):
         self.sync_pre_command_state_from_ui()
         pre_command_settings = self.pre_command_settings_snapshot()
         terminal_engine_settings = self.terminal_engine_settings_snapshot()
+        theme_settings = self.theme_settings_snapshot()
         self.save_pre_command_persistent_settings(pre_command_settings)
         self.save_terminal_engine_persistent_settings(terminal_engine_settings)
+        self.save_theme_persistent_settings(theme_settings)
         settings = {
             "font": self.terminal_font.toString(),
-            "color_scheme_name": self.color_scheme_name,
-            "theme_mode": self.theme_mode,
+            **theme_settings,
             "theme_config": self.theme_config,
             "window_opacity": self.window_opacity,
             "default_command": self.default_command,
@@ -4490,16 +4750,161 @@ class TerminalWindow(QMainWindow):
             opacity = 100
         return f"rgba({color.red()}, {color.green()}, {color.blue()}, {opacity / 100.0:.2f})"
 
+    def apply_application_palette(self, background, foreground, accent, input_background, background_opacity):
+        """Apply the selected ShellDeck theme to Qt's application chrome.
+
+        Unter Linux folgen Menüs, Comboboxen und Dialoge sonst oft weiterhin
+        dem hellen Desktop-Theme. Eine zentrale Palette plus globales
+        Stylesheet sorgt dafür, dass Dunkel/Hell/Hoher Kontrast überall
+        sichtbar wird und nicht nur im Terminal-Ausgabefeld.
+        """
+        app = QApplication.instance()
+        if app is None:
+            return
+
+        border = self.readable_border_color(background)
+        muted = self.rgba_color(foreground, 70)
+        hover = self.rgba_color(accent, 25)
+        panel = self.rgba_color(input_background, max(background_opacity, 92))
+        base = self.rgba_color(background, max(background_opacity, 96))
+
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor(background))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(foreground))
+        palette.setColor(QPalette.ColorRole.Base, QColor(input_background))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor(background))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(input_background))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor(foreground))
+        palette.setColor(QPalette.ColorRole.Text, QColor(foreground))
+        palette.setColor(QPalette.ColorRole.Button, QColor(input_background))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(foreground))
+        palette.setColor(QPalette.ColorRole.BrightText, QColor("#FFFFFF"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(accent))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+        app.setPalette(palette)
+
+        app.setStyleSheet(
+            "QMainWindow, QDialog, QWidget {"
+            f" background-color: {base};"
+            f" color: {foreground};"
+            "}"
+            "QMenuBar {"
+            f" background-color: {base};"
+            f" color: {foreground};"
+            " border: 0;"
+            " padding: 2px;"
+            "}"
+            "QMenuBar::item {"
+            " padding: 4px 8px;"
+            " background: transparent;"
+            "}"
+            "QMenuBar::item:selected, QMenuBar::item:pressed {"
+            f" background-color: {hover};"
+            f" color: {foreground};"
+            " border-radius: 4px;"
+            "}"
+            "QMenu {"
+            f" background-color: {panel};"
+            f" color: {foreground};"
+            f" border: 1px solid {border};"
+            " padding: 4px;"
+            "}"
+            "QMenu::item {"
+            " padding: 5px 22px 5px 22px;"
+            "}"
+            "QMenu::item:selected {"
+            f" background-color: {accent};"
+            " color: #FFFFFF;"
+            "}"
+            "QMenu::separator {"
+            f" background-color: {border};"
+            " height: 1px;"
+            " margin: 5px 8px;"
+            "}"
+            "QToolBar {"
+            f" background-color: {base};"
+            f" color: {foreground};"
+            f" border-bottom: 1px solid {border};"
+            "}"
+            "QLabel, QCheckBox, QRadioButton, QGroupBox {"
+            f" color: {foreground};"
+            "}"
+            "QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QPlainTextEdit, QListWidget {"
+            f" background-color: {panel};"
+            f" color: {foreground};"
+            f" border: 1px solid {border};"
+            " border-radius: 4px;"
+            " padding: 3px;"
+            f" selection-background-color: {accent};"
+            " selection-color: #FFFFFF;"
+            "}"
+            "QComboBox {"
+            f" background-color: {panel};"
+            f" color: {foreground};"
+            f" border: 1px solid {border};"
+            " border-radius: 4px;"
+            " padding: 3px 20px 3px 3px;"
+            f" selection-background-color: {accent};"
+            " selection-color: #FFFFFF;"
+            "}"
+            "QComboBox QAbstractItemView {"
+            f" background-color: {panel};"
+            f" color: {foreground};"
+            f" border: 1px solid {border};"
+            f" selection-background-color: {accent};"
+            " selection-color: #FFFFFF;"
+            "}"
+            "QPushButton {"
+            f" background-color: {accent};"
+            " color: #FFFFFF;"
+            " border: none;"
+            " border-radius: 5px;"
+            " padding: 5px 10px;"
+            "}"
+            "QPushButton:hover {"
+            f" background-color: {self.rgba_color(accent, 85)};"
+            "}"
+            "QPushButton:disabled {"
+            f" background-color: {border};"
+            f" color: {self.rgba_color(foreground, 55)};"
+            "}"
+            "QTabWidget::pane {"
+            f" border: 1px solid {border};"
+            "}"
+            "QStatusBar {"
+            f" background-color: {base};"
+            f" color: {foreground};"
+            f" border-top: 1px solid {border};"
+            "}"
+            "QScrollBar:vertical, QScrollBar:horizontal {"
+            f" background-color: {base};"
+            " width: 12px;"
+            " height: 12px;"
+            "}"
+            "QScrollBar::handle:vertical, QScrollBar::handle:horizontal {"
+            f" background-color: {border};"
+            " border-radius: 5px;"
+            " min-height: 24px;"
+            " min-width: 24px;"
+            "}"
+            "QScrollBar::add-line, QScrollBar::sub-line {"
+            " width: 0px; height: 0px;"
+            "}"
+        )
+
     def apply_color_scheme(self):
         theme = self.active_theme()
         background = self.normalize_hex_color(theme.get("background"), "#181818")
         foreground = self.normalize_hex_color(theme.get("foreground"), "#FFFFFF")
+        input_background = self.normalize_hex_color(theme.get("input_background"), background)
         accent = self.normalize_hex_color(theme.get("accent"), "#339CFF")
         try:
             background_opacity = max(0, min(100, int(theme.get("background_opacity", 100))))
         except (TypeError, ValueError):
             background_opacity = 100
         translucent = background_opacity < 100
+
+        self.apply_application_palette(background, foreground, accent, input_background, background_opacity)
 
         try:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
@@ -4550,8 +4955,9 @@ class TerminalWindow(QMainWindow):
             self.save_settings()
 
     def show_color_dialog(self):
-        schemes = ["Dunkel", "Hell", "Hoher Kontrast"]
-        current_index = schemes.index(self.color_scheme_name) if self.color_scheme_name in schemes else 0
+        schemes = ["System", "Dunkel", "Hell", "Hoher Kontrast"]
+        current_scheme = self.normalize_color_scheme_name(self.color_scheme_name)
+        current_index = schemes.index(current_scheme) if current_scheme in schemes else 1
         scheme, ok = QInputDialog.getItem(
             self,
             "Farbschema",
@@ -4561,8 +4967,11 @@ class TerminalWindow(QMainWindow):
             False,
         )
         if ok and scheme:
+            scheme = self.normalize_color_scheme_name(scheme)
             self.color_scheme_name = scheme
-            if scheme == "Hell":
+            if scheme == "System":
+                self.theme_mode = "system"
+            elif scheme == "Hell":
                 self.theme_mode = "light"
             elif scheme == "Hoher Kontrast":
                 self.theme_mode = "dark"
@@ -4989,6 +5398,31 @@ class TerminalWindow(QMainWindow):
     def show_status(self, message, timeout=5000):
         self.statusBar().showMessage(str(message or ""), timeout)
 
+    def collapse_terminal_redraws(self, text):
+        """Reduce PTY/ConPTY carriage-return redraws to visible text.
+
+        PowerShell/PSReadLine redraws the current input line repeatedly via
+        carriage return. QTextEdit is not a terminal emulator, so without this
+        cleanup every intermediate redraw becomes a new visible line. Keep the
+        last redraw state per physical line and apply simple backspace edits.
+        """
+        value = str(text or "").replace("\r\n", "\n")
+        lines = []
+        for line in value.split("\n"):
+            if "\r" in line:
+                line = line.split("\r")[-1]
+            if "\b" in line:
+                chars = []
+                for char in line:
+                    if char == "\b":
+                        if chars:
+                            chars.pop()
+                    else:
+                        chars.append(char)
+                line = "".join(chars)
+            lines.append(line)
+        return "\n".join(lines)
+
     def clean_terminal_control_sequences(self, text):
         value = str(text or "")
         # OSC-Sequenzen, z.B. Fenstertitel: ESC ] ... BEL oder ESC ] ... ESC \\
@@ -4997,6 +5431,7 @@ class TerminalWindow(QMainWindow):
         value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
         # Einzelne ESC-Sequenzen wie ESC c, ESC 7, ESC 8 usw.
         value = re.sub(r"\x1b[@-Z\\-_]", "", value)
+        value = self.collapse_terminal_redraws(value)
         # C1-Steuerzeichen und übrige nicht druckbare Steuerzeichen entfernen,
         # Zeilenumbrüche und Tabs aber erhalten.
         value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", value)
@@ -5282,6 +5717,10 @@ Hinweise
 def main() -> int:
     install_crash_logging()
     app = QApplication(sys.argv)
+    try:
+        app.setStyle("Fusion")
+    except Exception:
+        pass
     w = TerminalWindow()
     w.resize(800, 600)
     screen = w.screen() or QApplication.primaryScreen()
