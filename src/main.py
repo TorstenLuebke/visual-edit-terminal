@@ -8,6 +8,8 @@ import faulthandler
 import shutil
 import subprocess
 import shlex
+import socket
+import getpass
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -182,12 +184,124 @@ class PtyReaderThread(QThread):
             self.finished_ready.emit(exit_code, QProcess.ExitStatus.NormalExit)
 
 
+class PosixPtyChild:
+    """Kleiner POSIX-PTY-Adapter für Linux/macOS.
+
+    Er stellt die wenigen Methoden bereit, die PtyReaderThread und
+    PtyTerminalProcess bereits vom Windows-pywinpty-Objekt erwarten. Dadurch
+    kann ShellDeck unter Linux eine echte Terminal-Sitzung mit Job-Control,
+    TTY-Erkennung und interaktiven Programmen nutzen.
+    """
+
+    def __init__(self, pid, fd):
+        self.pid = int(pid)
+        self.fd = int(fd)
+        self.exitstatus = None
+        try:
+            os.set_blocking(self.fd, False)
+        except Exception:
+            pass
+
+    @classmethod
+    def spawn(cls, command_line, cwd=None):
+        import pty
+
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                if cwd:
+                    os.chdir(cwd)
+                os.environ.setdefault("TERM", "xterm-256color")
+                args = shlex.split(str(command_line or ""), posix=True)
+                if not args:
+                    os._exit(127)
+                os.execvp(args[0], args)
+            except BaseException:
+                os._exit(127)
+        return cls(pid, fd)
+
+    def isalive(self):
+        if self.exitstatus is not None:
+            return False
+        try:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            self.exitstatus = 0
+            return False
+        except OSError:
+            self.exitstatus = 1
+            return False
+        if pid == 0:
+            return True
+        if os.WIFEXITED(status):
+            self.exitstatus = os.WEXITSTATUS(status)
+        elif os.WIFSIGNALED(status):
+            self.exitstatus = 128 + os.WTERMSIG(status)
+        else:
+            self.exitstatus = 0
+        return False
+
+    def read(self, size=4096):
+        import select
+
+        if not self.isalive():
+            raise EOFError()
+        ready, _, _ = select.select([self.fd], [], [], 0.05)
+        if not ready:
+            return b""
+        try:
+            return os.read(self.fd, int(size))
+        except BlockingIOError:
+            return b""
+        except OSError:
+            raise EOFError()
+
+    def write(self, text):
+        if not self.isalive():
+            raise OSError("PTY-Prozess läuft nicht.")
+        raw = str(text or "").encode("utf-8", errors="replace")
+        return os.write(self.fd, raw)
+
+    def terminate(self):
+        import signal
+
+        if not self.isalive():
+            return
+        try:
+            os.killpg(os.getpgid(self.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except Exception:
+                pass
+
+    def kill(self):
+        import signal
+
+        if not self.isalive():
+            return
+        try:
+            os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
+
+
+
 class PtyTerminalProcess(QThread):
     """Optionaler PTY/ConPTY-Adapter mit QProcess-ähnlicher Oberfläche.
 
     Der vorhandene QProcess-Pfad bleibt Standard. Dieser Adapter wird nur
-    benutzt, wenn die experimentelle Terminal-Engine gewählt wurde und
-    pywinpty verfügbar ist.
+    benutzt, wenn die experimentelle Terminal-Engine gewählt wurde. Unter
+    Windows nutzt er pywinpty, unter Linux/macOS ein echtes POSIX-PTY.
     """
 
     readyReadStandardOutput = Signal()
@@ -208,16 +322,20 @@ class PtyTerminalProcess(QThread):
 
     @staticmethod
     def availability_message():
-        if sys.platform != "win32":
-            return "PTY/ConPTY ist in dieser ShellDeck-Version zunächst nur für Windows/pywinpty aktiviert."
-        try:
-            import winpty  # noqa: F401
-            return ""
-        except Exception as exc:
-            return (
-                "pywinpty ist nicht installiert. Installiere es im App-Interpreter mit: "
-                "python -m pip install pywinpty. Details: " + str(exc)
-            )
+        if sys.platform == "win32":
+            try:
+                import winpty  # noqa: F401
+                return ""
+            except Exception as exc:
+                return (
+                    "pywinpty ist nicht installiert. Installiere es im App-Interpreter mit: "
+                    "python -m pip install pywinpty. Details: " + str(exc)
+                )
+        if os.name == "posix":
+            if Path("/dev/ptmx").exists() or Path("/dev/pts").exists():
+                return ""
+            return "Kein POSIX-PTY-Gerät gefunden (/dev/ptmx oder /dev/pts fehlt)."
+        return "PTY ist auf diesem Betriebssystem noch nicht unterstützt."
 
     @classmethod
     def is_available(cls):
@@ -259,18 +377,21 @@ class PtyTerminalProcess(QThread):
             return
 
         try:
-            from winpty import PtyProcess
             cwd = self._working_directory or None
-            try:
-                self._pty = PtyProcess.spawn(command_line, cwd=cwd)
-            except TypeError:
-                old_cwd = os.getcwd()
+            if sys.platform == "win32":
+                from winpty import PtyProcess
                 try:
-                    if cwd:
-                        os.chdir(cwd)
-                    self._pty = PtyProcess.spawn(command_line)
-                finally:
-                    os.chdir(old_cwd)
+                    self._pty = PtyProcess.spawn(command_line, cwd=cwd)
+                except TypeError:
+                    old_cwd = os.getcwd()
+                    try:
+                        if cwd:
+                            os.chdir(cwd)
+                        self._pty = PtyProcess.spawn(command_line)
+                    finally:
+                        os.chdir(old_cwd)
+            else:
+                self._pty = PosixPtyChild.spawn(command_line, cwd=cwd)
             self._running = True
             self._error_string = ""
             self._reader = PtyReaderThread(self._pty, self)
@@ -397,7 +518,9 @@ class TerminalTab(QWidget):
     def __init__(self, window, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None, restore_command="", venv_path="", terminal_engine=None):
         super().__init__(window)
         self.window = window
-        self.shell_type = shell_type or window.shell_type
+        normalize_shell = getattr(window, "normalize_shell_type", None)
+        requested_shell = shell_type or window.shell_type
+        self.shell_type = normalize_shell(requested_shell) if callable(normalize_shell) else requested_shell
         self.terminal_engine = self.window.normalize_terminal_engine(terminal_engine or getattr(window, "terminal_engine", "qprocess"))
         self.custom_title = custom_title or ""
         self.start_directory = self.normalize_start_directory(start_directory)
@@ -440,6 +563,13 @@ class TerminalTab(QWidget):
 
         self.highlighter = TerminalHighlighter(self.output_area.document(), self.window.terminal_colors())
 
+        self.input_prompt_label = QLineEdit()
+        self.input_prompt_label.setReadOnly(True)
+        self.input_prompt_label.setFont(self.window.terminal_font)
+        self.input_prompt_label.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.input_prompt_label.setCursorPosition(0)
+        layout.addWidget(self.input_prompt_label)
+
         self.input_line = QPlainTextEdit()
         self.input_line.setMaximumHeight(110)
         self.input_line.setFont(self.window.terminal_font)
@@ -447,6 +577,7 @@ class TerminalTab(QWidget):
         self.input_line.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.input_line.customContextMenuRequested.connect(self.show_terminal_context_menu)
         layout.addWidget(self.input_line)
+        self.update_input_prompt_label()
 
         self.execute_button = QPushButton("Befehl ausführen")
         self.execute_button.clicked.connect(self.execute_command)
@@ -459,7 +590,283 @@ class TerminalTab(QWidget):
         self.start_shell()
 
         if self.window.default_command and self.process.waitForStarted(2000):
-            self.process.write(self.window.default_command.encode() + b"\n")
+            self.run_startup_command(self.window.default_command)
+
+    def compact_display_path(self, path_text):
+        text = str(path_text or "").strip()
+        if not text:
+            return ""
+        try:
+            path = Path(text).expanduser()
+            home = Path.home().resolve()
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            try:
+                rel = resolved.relative_to(home)
+                return "~" if not str(rel) else "~/" + str(rel)
+            except ValueError:
+                return str(resolved)
+        except OSError:
+            return text
+
+    def terminal_user_host_label(self):
+        try:
+            user = getpass.getuser()
+        except Exception:
+            user = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
+        try:
+            host = socket.gethostname().split(".", 1)[0]
+        except Exception:
+            host = os.environ.get("HOSTNAME") or "host"
+        return f"{user}@{host}"
+
+    def active_venv_label(self):
+        venv_text = str(getattr(self, "venv_path", "") or "").strip()
+        if venv_text:
+            try:
+                return Path(venv_text).name or "venv"
+            except OSError:
+                return "venv"
+        restore = str(getattr(self, "restore_command", "") or "")
+        if re.search(r"(?:^|[\\/\s])\.venv(?:[\\/\s]|$)", restore):
+            return ".venv"
+        if re.search(r"(?:^|[\\/\s])venv(?:[\\/\s]|$)", restore):
+            return "venv"
+        output = ""
+        area = getattr(self, "output_area", None)
+        if area is not None:
+            try:
+                output = area.toPlainText()
+            except Exception:
+                output = ""
+        match = re.search(r"\(([^()\s]+venv[^()\s]*)\)", output, re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    def input_prompt_text(self):
+        directory = str(getattr(self, "current_working_directory", "") or "").strip()
+        path_label = self.compact_display_path(directory) if directory else "ShellDeck"
+        prefix = ""
+        venv_name = self.active_venv_label()
+        if venv_name:
+            prefix = f"({venv_name}) "
+        return f"{prefix}{self.terminal_user_host_label()}: {path_label} $"
+
+    def update_input_prompt_label(self):
+        prompt = getattr(self, "input_prompt_label", None)
+        if prompt is not None:
+            full_path = str(getattr(self, "current_working_directory", "") or "")
+            prompt.setText(self.input_prompt_text())
+            prompt.setToolTip(full_path)
+            try:
+                prompt.setCursorPosition(0)
+            except Exception:
+                pass
+
+    def shell_command_words(self, command):
+        text = str(command or "").strip()
+        if not text:
+            return []
+        try:
+            return shlex.split(text, posix=(sys.platform != "win32"))
+        except ValueError:
+            return text.split()
+
+    def translate_cross_platform_command(self, command):
+        """Translate common commands between Windows and POSIX shells.
+
+        ShellDeck keeps the user's intent portable: commands like ``cls`` should
+        clear the screen on Linux too, while ``clear`` should work in CMD. This
+        is intentionally conservative and only maps small, unambiguous shell
+        conveniences.
+        """
+        text = str(command or "").strip()
+        if not text or "\n" in text or "\r" in text:
+            return text
+        words = self.shell_command_words(text)
+        if not words:
+            return text
+        first = str(words[0] or "").lower()
+        lower_shell = str(self.shell_type or "").lower()
+        if sys.platform != "win32" and lower_shell in {"bash", "zsh", "fish", "sh"}:
+            if first == "cls":
+                return "clear"
+            if first == "dir":
+                rest = words[1:]
+                if rest:
+                    return "ls -la " + " ".join(shlex.quote(str(item)) for item in rest)
+                return "ls -la"
+        if sys.platform == "win32" and lower_shell == "cmd" and first == "clear":
+            return "cls"
+        return text
+
+    def run_startup_command(self, command_text):
+        for command in self.command_sequence_from_text(command_text, include_prefix=False):
+            translated = self.translate_cross_platform_command(command)
+            if translated.lower() in {"cls", "clear"}:
+                self.output_area.clear()
+                self.update_input_prompt_label()
+                continue
+            if self.process.state() == QProcess.ProcessState.Running:
+                self.update_working_context_from_shell_command(translated)
+                self.write_shell_command(translated)
+
+    def update_working_directory_from_cd_command(self, command):
+        text = str(command or "").strip()
+        if not text:
+            return False
+        try:
+            parts = shlex.split(text, posix=(sys.platform != "win32"))
+        except ValueError:
+            parts = text.split()
+        if not parts or str(parts[0]).lower() not in {"cd", "chdir"}:
+            return False
+        if len(parts) == 1:
+            target = str(Path.home())
+        else:
+            target = str(parts[1]).strip()
+        if not target:
+            target = str(Path.home())
+        try:
+            if target == "-":
+                return False
+            candidate = Path(target).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(self.current_working_directory or Path.cwd()) / candidate
+            candidate = candidate.resolve()
+            if candidate.exists() and candidate.is_dir():
+                self.current_working_directory = str(candidate)
+                self.update_input_prompt_label()
+                return True
+        except OSError:
+            return False
+        return False
+
+    def update_venv_path_from_activation_command(self, command):
+        text = str(command or "").strip()
+        if not self.command_looks_like_venv_activation(text):
+            return False
+        try:
+            parts = shlex.split(text, posix=(sys.platform != "win32"))
+        except ValueError:
+            parts = text.split()
+        if not parts:
+            return False
+
+        script_text = ""
+        if str(parts[0]).lower() in {"source", "."} and len(parts) >= 2:
+            script_text = str(parts[1])
+        elif "activate" in str(parts[0]).lower():
+            script_text = str(parts[0])
+        if not script_text:
+            return False
+
+        try:
+            script_path = Path(script_text).expanduser()
+            if not script_path.is_absolute():
+                script_path = Path(self.current_working_directory or Path.cwd()) / script_path
+            script_path = script_path.resolve()
+            if script_path.name.startswith("activate"):
+                venv_dir = script_path.parent.parent
+                if venv_dir.exists() and venv_dir.is_dir():
+                    self.venv_path = str(venv_dir)
+                    project_dir = venv_dir.parent
+                    if project_dir.exists() and project_dir.is_dir():
+                        self.current_working_directory = str(project_dir)
+                    self.update_input_prompt_label()
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def split_shell_commands_for_context(self, command):
+        text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
+        result = []
+        for line in text.split("\n"):
+            for part in line.split(";"):
+                clean = part.strip()
+                if clean:
+                    result.append(clean)
+        return result
+
+    def update_working_context_from_shell_command(self, command):
+        changed = False
+        for part in self.split_shell_commands_for_context(command):
+            if self.update_working_directory_from_cd_command(part):
+                changed = True
+                continue
+            if self.update_venv_path_from_activation_command(part):
+                changed = True
+        if changed:
+            self.update_input_prompt_label()
+        return changed
+
+    def shell_supports_context_probe(self):
+        if sys.platform == "win32":
+            return False
+        return str(self.shell_type or "").lower() in {"bash", "zsh", "sh", "fish"}
+
+    def shell_context_probe_command(self):
+        # Die Ausgabe wird in consume_shell_context_markers() sofort wieder
+        # aus dem Terminaltext entfernt. Sie dient nur dazu, den echten
+        # Arbeitsordner nach cd/pushd/popd exakt von der laufenden Shell zu lesen.
+        return "printf '__SHELLDECK_CONTEXT__%s\\t%s\\n' \"$PWD\" \"$VIRTUAL_ENV\""
+
+    def append_shell_context_probe(self, command_text):
+        text = str(command_text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not text.strip() or not self.shell_supports_context_probe():
+            return text
+        if "__SHELLDECK_CONTEXT__" in text:
+            return text
+        # Für interaktive Clients ist der Probe-Befehl unerwünscht, weil er dort
+        # als Eingabe beim Client landen könnte. Diese Fälle werden normalerweise
+        # vor write_shell_command() abgefangen; die Prüfung bleibt als Schutz.
+        first_line = text.strip().splitlines()[0] if text.strip() else ""
+        if self.detect_client_mode_name(first_line):
+            return text
+        return text.rstrip("\n") + "\n" + self.shell_context_probe_command() + "\n"
+
+    def consume_shell_context_markers(self, text):
+        marker = "__SHELLDECK_CONTEXT__"
+        value = str(text or "")
+        if marker not in value:
+            return value
+
+        kept = []
+        changed = False
+        for line in value.splitlines(True):
+            body = line.rstrip("\r\n")
+            if marker not in body:
+                kept.append(line)
+                continue
+            payload = body.split(marker, 1)[1]
+            parts = payload.split("\t", 1)
+            pwd = parts[0].strip() if parts else ""
+            venv = parts[1].strip() if len(parts) > 1 else ""
+            try:
+                if pwd:
+                    candidate = Path(pwd).expanduser().resolve()
+                    if candidate.exists() and candidate.is_dir():
+                        self.current_working_directory = str(candidate)
+                        changed = True
+                if venv:
+                    venv_path = Path(venv).expanduser().resolve()
+                    if venv_path.exists() and venv_path.is_dir():
+                        self.venv_path = str(venv_path)
+                        changed = True
+                else:
+                    # Eine leere VIRTUAL_ENV-Marke bedeutet: Die Shell hat keine
+                    # aktive venv mehr. Der Restore-Befehl bleibt erhalten, aber
+                    # die Statusanzeige soll dann kein (.venv) vortäuschen.
+                    if str(getattr(self, "venv_path", "") or ""):
+                        self.venv_path = ""
+                        changed = True
+            except OSError:
+                pass
+        if changed:
+            QTimer.singleShot(0, self.update_input_prompt_label)
+        return "".join(kept)
 
     def normalize_start_directory(self, directory):
         text = str(directory or "").strip().strip('"')
@@ -540,6 +947,13 @@ class TerminalTab(QWidget):
             except (OSError, ValueError):
                 return command_prefix + str(script_path)
 
+        def posix_activation_command(script_path):
+            # POSIX-sh kennt kein "source". Bash/Zsh können es, aber "." ist
+            # ebenfalls gültig und funktioniert auch in /bin/sh. Damit bleiben
+            # Workspace-/Profil-Restore-Befehle auf Linux robust, egal ob der
+            # Tab als Bash oder sh gestartet wurde.
+            return relative_or_absolute(script_path, ". ").replace("\\", "/")
+
         if sys.platform == "win32" and shell in {"powershell", "pwsh"}:
             script = venv / "Scripts" / "Activate.ps1"
             if script.exists():
@@ -551,19 +965,24 @@ class TerminalTab(QWidget):
             script = venv / "Scripts" / "activate.bat"
             if script.exists():
                 return relative_or_absolute(script)
+        elif shell == "fish":
+            script = venv / "bin" / "activate.fish"
+            if script.exists():
+                return relative_or_absolute(script, "source ").replace("\\", "/")
         else:
             script = venv / "bin" / "activate"
             if script.exists():
-                return relative_or_absolute(script, "source ").replace("\\", "/")
+                return posix_activation_command(script)
             script = venv / "Scripts" / "activate"
             if script.exists():
-                return relative_or_absolute(script, "source ").replace("\\", "/")
+                return posix_activation_command(script)
         return ""
 
     def refresh_current_working_directory(self):
         directory = self.guess_current_directory()
         if directory:
             self.current_working_directory = directory
+            self.update_input_prompt_label()
         return self.current_working_directory
 
     def show_terminal_context_menu(self, pos):
@@ -831,18 +1250,31 @@ class TerminalTab(QWidget):
                         candidate = os.path.expanduser(candidate)
                     if Path(candidate).exists():
                         return str(Path(candidate))
+        # Bei PTY-Shells liefert process.workingDirectory() nur das Start-
+        # verzeichnis des Adapter-Prozesses, nicht zuverlässig den aktuellen
+        # Ordner der laufenden Shell. Deshalb zuerst den von ShellDeck gepflegten
+        # Zustand verwenden. Sonst kann ein Speichern/Umschalten der Vorbefehle
+        # die Anzeige wieder auf den Home-Ordner zurücksetzen.
+        current_dir = str(getattr(self, "current_working_directory", "") or "").strip()
+        if current_dir and Path(current_dir).exists():
+            return current_dir
         working_dir = self.process.workingDirectory()
         if working_dir and Path(working_dir).exists():
             return working_dir
-        if self.current_working_directory and Path(self.current_working_directory).exists():
-            return self.current_working_directory
         return str(Path.cwd())
 
     def create_shell_process(self):
         requested_engine = self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+        if sys.platform != "win32" and str(self.shell_type or "").lower() in {"bash", "zsh", "fish", "sh"}:
+            # Auf Linux/macOS sollen interaktive Shells standardmäßig über ein
+            # echtes PTY laufen. QProcess-Pipes erzeugen bei Bash sonst Meldungen
+            # wie "Keine Jobsteuerung in dieser Shell".
+            if PtyTerminalProcess.is_available():
+                requested_engine = "pty"
+                self.terminal_engine = "pty"
         if self.window.should_use_pty_backend(self.shell_type, engine=requested_engine):
             process = PtyTerminalProcess(self)
-            self.output_area.append("[PTY/ConPTY experimentell aktiv]\n")
+            self.output_area.append("[PTY/ConPTY/Linux-PTY experimentell aktiv]\n")
             return process
         process = QProcess(self)
         process._shelldeck_engine = "qprocess"
@@ -1121,7 +1553,8 @@ class TerminalTab(QWidget):
     def update_restore_command_from_command(self, command):
         text = str(command or "").strip()
         if self.command_looks_like_venv_activation(text):
-            self.restore_command = text
+            normalizer = getattr(self.window, "normalize_restore_command_for_shell", None)
+            self.restore_command = normalizer(text, self.shell_type) if callable(normalizer) else text
             detected = self.local_project_venv_path() or self.inherited_venv_path_for_directory()
             if detected:
                 self.venv_path = detected
@@ -1166,9 +1599,15 @@ class TerminalTab(QWidget):
     def current_restore_command(self):
         explicit = str(self.restore_command or "").strip()
         if explicit:
-            return explicit
+            normalizer = getattr(self.window, "normalize_restore_command_for_shell", None)
+            normalized = normalizer(explicit, self.shell_type) if callable(normalizer) else explicit
+            if normalized != explicit:
+                self.restore_command = normalized
+            return normalized
         inferred = self.infer_venv_restore_command()
         if inferred:
+            normalizer = getattr(self.window, "normalize_restore_command_for_shell", None)
+            inferred = normalizer(inferred, self.shell_type) if callable(normalizer) else inferred
             self.restore_command = inferred
         return inferred
 
@@ -1189,6 +1628,9 @@ class TerminalTab(QWidget):
         text = str(command or "").strip() or self.current_restore_command()
         if not text:
             return False
+        normalizer = getattr(self.window, "normalize_restore_command_for_shell", None)
+        if callable(normalizer):
+            text = normalizer(text, self.shell_type)
         self.restore_command = text
         if self.client_mode_active:
             return False
@@ -1197,9 +1639,11 @@ class TerminalTab(QWidget):
         if self.process.state() != QProcess.ProcessState.Running:
             self.output_area.append(f"\n[Wiederherstellungsbefehl konnte nicht ausgeführt werden: Shell ist nicht aktiv] {text}\n")
             return False
+        self.update_working_context_from_shell_command(text)
         self.output_area.append(f"\n[Restore] Führe aus: {text}\n")
         self.process.write(text.encode() + b"\n")
         self.process.waitForBytesWritten(1000)
+        QTimer.singleShot(250, self.update_input_prompt_label)
         return True
 
     def show_previous_command(self):
@@ -1696,6 +2140,13 @@ class TerminalTab(QWidget):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
         if not text:
             return
+        self.update_working_context_from_shell_command(text)
+
+        # Nach jedem normalen POSIX-Shell-Befehl fragt ShellDeck den echten
+        # Arbeitsordner direkt in der laufenden Shell ab. Dadurch bleibt die
+        # Anzeige auch nach cd .., cd Unterordner, pushd/popd und deaktivierter
+        # Vorbefehlszeile synchron.
+        text = self.append_shell_context_probe(text)
 
         # In PTY/ConPTY PowerShell the shell is started without PSReadLine.
         # That avoids the redraw storm that produced duplicated command
@@ -1704,6 +2155,7 @@ class TerminalTab(QWidget):
         if self.process_uses_pty_engine() and str(self.shell_type or "").lower() in {"powershell", "pwsh"}:
             self.remember_pending_pty_command_echo(text)
 
+        self.update_working_context_from_shell_command(text)
         if not text.endswith("\n"):
             text += "\n"
         self.process.write(text.encode())
@@ -1729,6 +2181,7 @@ class TerminalTab(QWidget):
         self.current_command = ""
 
         for command in commands:
+            command = self.translate_cross_platform_command(command)
             ollama_model = self.parse_ollama_run_model(command)
             if ollama_model:
                 self.start_ollama_prompt_mode(ollama_model)
@@ -1739,6 +2192,7 @@ class TerminalTab(QWidget):
                 continue
             if command.lower() in ("cls", "clear"):
                 self.output_area.clear()
+                self.update_input_prompt_label()
             elif self.process.state() != QProcess.ProcessState.Running:
                 self.output_area.append(
                     f"Shell ist nicht aktiv: {self.process.errorString() or 'Prozess wurde beendet.'}"
@@ -1771,8 +2225,9 @@ class TerminalTab(QWidget):
                 text = cleaner(text)
             else:
                 text = self.window.clean_output_text(text)
-            return self.suppress_pending_pty_command_echo(text)
-        return text
+            text = self.suppress_pending_pty_command_echo(text)
+            return self.consume_shell_context_markers(text)
+        return self.consume_shell_context_markers(text)
 
     def remember_pending_pty_command_echo(self, command):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -1855,6 +2310,7 @@ class TerminalTab(QWidget):
         self.output_area.insertPlainText(data)
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.ensureCursorVisible()
+        QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_stderr(self):
         data = self.decoded_terminal_output(self.process.readAllStandardError())
@@ -1864,6 +2320,7 @@ class TerminalTab(QWidget):
         self.output_area.setTextColor(QColor(self.window.terminal_color("stdout", "#FFFFFF")))
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.ensureCursorVisible()
+        QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_finished(self, exit_code, exit_status):
         self.set_client_mode(False)
@@ -1876,6 +2333,8 @@ class TerminalTab(QWidget):
     def set_terminal_font(self, font):
         self.output_area.setFont(font)
         self.input_line.setFont(font)
+        if hasattr(self, "input_prompt_label"):
+            self.input_prompt_label.setFont(font)
 
     def apply_theme(self):
         theme = self.window.active_theme()
@@ -1935,6 +2394,17 @@ class TerminalTab(QWidget):
             f" border: {border_width}px solid {accent};"
             "}"
         )
+        if hasattr(self, "input_prompt_label"):
+            self.input_prompt_label.setStyleSheet(
+                "QLineEdit {"
+                f" background-color: {input_background_rgba};"
+                f" color: {input_text_color};"
+                f" border: {border_width}px solid {input_border_color};"
+                f" border-radius: {radius}px;"
+                " padding: 5px 8px;"
+                f" selection-background-color: {selection_color};"
+                "}"
+            )
         self.execute_button.setStyleSheet(
             "QPushButton {"
             f" background-color: {accent};"
@@ -2010,7 +2480,7 @@ class TerminalWindow(QMainWindow):
         self.theme_mode = "dark"
         self.window_opacity = 100
         self.theme_config = self.default_theme_config()
-        self.shell_type = "cmd"
+        self.shell_type = self.default_shell_type()
         self.terminal_engine = "qprocess"
         self.max_history_size = 1000
         self.terminal_font = QFont("Courier New", 10)
@@ -3153,7 +3623,11 @@ class TerminalWindow(QMainWindow):
     def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path="", terminal_engine=None):
         effective_start_directory = start_directory
         if effective_start_directory is None:
-            effective_start_directory = self.default_start_directory
+            current_tab = self.current_terminal()
+            if isinstance(current_tab, TerminalTab):
+                effective_start_directory = str(getattr(current_tab, "current_working_directory", "") or "")
+            if not effective_start_directory:
+                effective_start_directory = self.default_start_directory
         tab = TerminalTab(
             self,
             shell_type=shell_type or self.shell_type,
@@ -3600,7 +4074,7 @@ class TerminalWindow(QMainWindow):
         workspace = normalize_workspace(workspace)
         self.default_start_directory = workspace.get("default_start_directory", "")
         self.selected_ollama_model = workspace.get("selected_ollama_model", "")
-        shell_type = workspace.get("shell_type", "")
+        shell_type = self.normalize_shell_type(workspace.get("shell_type", ""))
         if shell_type and self.system_shell(shell_type):
             self.shell_type = shell_type
         self.terminal_engine = self.normalize_terminal_engine(workspace.get("terminal_engine", self.terminal_engine))
@@ -3614,7 +4088,7 @@ class TerminalWindow(QMainWindow):
         for item in workspace.get("tabs", []):
             if not isinstance(item, dict):
                 continue
-            tab_shell = str(item.get("shell_type", self.shell_type) or self.shell_type)
+            tab_shell = self.normalize_shell_type(item.get("shell_type", self.shell_type) or self.shell_type)
             if not self.system_shell(tab_shell):
                 tab_shell = self.shell_type
             tab = self.new_tab(
@@ -4069,7 +4543,7 @@ class TerminalWindow(QMainWindow):
         )
         if ok and selected_label:
             selected_index = labels.index(selected_label)
-            selected_shell = ids[selected_index]
+            selected_shell = self.normalize_shell_type(ids[selected_index])
             self.shell_type = selected_shell
             if isinstance(current_tab, TerminalTab):
                 current_tab.shell_type = selected_shell
@@ -4114,7 +4588,7 @@ class TerminalWindow(QMainWindow):
         for item in getattr(self, "saved_tabs", []):
             if not isinstance(item, dict):
                 continue
-            shell_type = str(item.get("shell_type", self.shell_type) or self.shell_type)
+            shell_type = self.normalize_shell_type(item.get("shell_type", self.shell_type) or self.shell_type)
             if not self.system_shell(shell_type):
                 shell_type = self.shell_type
             title = str(item.get("title", "") or "")
@@ -4148,7 +4622,7 @@ class TerminalWindow(QMainWindow):
             "shell_type": tab.shell_type,
             "terminal_engine": tab.actual_terminal_engine(),
             "title": tab.custom_title,
-            "working_directory": tab.refresh_current_working_directory(),
+            "working_directory": str(getattr(tab, "current_working_directory", "") or tab.refresh_current_working_directory()),
             "command_history": list(tab.command_history)[-self.max_history_size:],
             "restore_command": tab.current_restore_command(),
             "venv_path": tab.current_venv_path(),
@@ -4225,6 +4699,49 @@ class TerminalWindow(QMainWindow):
     
         return text.splitlines()[0].strip()
 
+    def default_shell_type(self):
+        """Return the best platform default shell backend for new tabs.
+
+        On Linux, ShellDeck should prefer Bash when it is available. The
+        previous Windows-oriented default of ``cmd`` could fall back to sh on
+        Linux and then persisted tabs restored ``source .venv/bin/activate``
+        in /bin/sh, where ``source`` does not exist.
+        """
+        if sys.platform != "win32":
+            if shutil.which("bash"):
+                return "bash"
+            if shutil.which("sh"):
+                return "sh"
+            return "sh"
+        if shutil.which("pwsh.exe"):
+            return "pwsh"
+        if shutil.which("powershell.exe"):
+            return "powershell"
+        return "cmd"
+
+    def normalize_shell_type(self, shell_type=None):
+        text = str(shell_type or "").strip().lower()
+        known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh"}
+        if text not in known_shells:
+            return self.default_shell_type()
+        if sys.platform != "win32":
+            if text in {"cmd", "powershell", "pwsh", "git_bash", "wsl"}:
+                return self.default_shell_type()
+            if text == "sh" and shutil.which("bash"):
+                return "bash"
+        return text
+
+    def normalize_restore_command_for_shell(self, command, shell_type=None):
+        text = str(command or "").strip()
+        if not text or sys.platform == "win32":
+            return text
+        shell = str(shell_type or self.shell_type or "").strip().lower()
+        if shell in {"fish"}:
+            return text
+        # POSIX shells do not all support ``source``. Dot-sourcing works in
+        # bash, zsh and /bin/sh, so old saved restore commands remain usable.
+        return re.sub(r"^\s*source\s+", ". ", text, count=1)
+
     def available_shell_backends(self):
         options = []
     
@@ -4277,7 +4794,7 @@ class TerminalWindow(QMainWindow):
                     add(shell_id, label, executable, None)
     
         if not options:
-            fallback = "cmd" if sys.platform == "win32" else "sh"
+            fallback = self.default_shell_type()
             options.append({
                 "id": fallback,
                 "label": self.shell_backend_label(fallback),
@@ -4370,7 +4887,7 @@ class TerminalWindow(QMainWindow):
     def select_terminal_engine(self):
         options = [
             "Standard QProcess",
-            "PTY/ConPTY experimentell",
+            "PTY/ConPTY/Linux-PTY experimentell",
         ]
         current_engine = self.current_terminal_engine()
         current_index = 1 if current_engine == "pty" else 0
@@ -4388,11 +4905,14 @@ class TerminalWindow(QMainWindow):
         self.set_terminal_engine(new_engine, show_message=True, save=True)
 
     def system_shell(self, shell_type=None) -> str:
-        shell_type = shell_type or self.shell_type
+        shell_type = self.normalize_shell_type(shell_type or self.shell_type)
         if sys.platform != "win32":
             if shell_type in ("bash", "zsh", "fish", "sh"):
                 return shutil.which(shell_type) or shell_type
-            return os.environ.get("SHELL") or shutil.which("bash") or "sh"
+            # Unter Linux bevorzugen wir Bash als Standard, weil sie source,
+            # History-/Prompt-Verhalten und typische venv-Workflows besser
+            # abdeckt als /bin/sh. Die konkrete Login-Shell bleibt nur Fallback.
+            return shutil.which("bash") or os.environ.get("SHELL") or shutil.which("sh") or "sh"
         shell_map = {
             "cmd": "cmd.exe",
             "powershell": "powershell.exe",
@@ -4414,6 +4934,8 @@ class TerminalWindow(QMainWindow):
         if sys.platform == "win32":
             if lower in {"powershell", "pwsh"}:
                 return ["-NoLogo"]
+        if lower == "bash":
+            return ["--noprofile", "--norc", "-i"]
         return []
 
     def new_tab_with_backend(self, shell_type):
@@ -4630,9 +5152,8 @@ class TerminalWindow(QMainWindow):
         self.terminal_engine = engine_value if engine_value in {"qprocess", "pty"} else "qprocess"
         self.apply_terminal_engine_settings_mapping(self.load_terminal_engine_persistent_settings())
 
-        shell_type_val = str(settings.get("shell_type", self.shell_type or "cmd") or "cmd")
-        known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh"}
-        if shell_type_val in known_shells and self.system_shell(shell_type_val):
+        shell_type_val = self.normalize_shell_type(settings.get("shell_type", self.shell_type))
+        if self.system_shell(shell_type_val):
             self.shell_type = shell_type_val
 
         saved_tabs = settings.get("tabs", [])
