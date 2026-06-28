@@ -545,6 +545,9 @@ class TerminalTab(QWidget):
         self.output_search_text = ""
         self.last_ollama_code_blocks = []
         self._pending_pty_command_echoes = []
+        self.password_prompt_active = False
+        self._password_dialog_open = False
+        self._password_prompt_tail = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -2104,6 +2107,192 @@ class TerminalTab(QWidget):
             engine_label = self.window.terminal_engine_label_for_process(getattr(self, "process", None))
             self.window.statusBar().showMessage(f"Shell-Backend: {self.window.shell_backend_label(self.shell_type)} | Engine: {engine_label}")
 
+    def password_prompt_patterns(self):
+        """Erkennungsregeln für interaktive Passwortabfragen.
+
+        sudo/ssh/passphrase-Prompts schreiben bewusst kein lokales Echo. ShellDeck
+        nutzt dafür keinen normalen Befehlsmodus, sondern sendet die nächste
+        Eingabe roh an den laufenden PTY/QProcess. So werden Vorbefehle,
+        Verlauf, Kontext-Probes und Log-Ausgabe nicht mit dem Passwort vermischt.
+
+        Die Muster sind absichtlich tolerant: lokalisierte sudo-Ausgaben können
+        durch Terminal-Encoding/Font-Fallbacks leicht anders aussehen
+        (z.B. "Passwort fuer", "Passwort für" oder mojibake). Entscheidend ist,
+        dass eine frische Zeile wie ein Passwort-Prompt endet.
+        """
+        return [
+            re.compile(r"(?:^|\n)\s*\[sudo\].{0,160}(?:password|passwort|kennwort|passphrase).{0,160}:\s*$", re.IGNORECASE | re.DOTALL),
+            re.compile(r"(?:^|\n)\s*(?:password|passwort|kennwort)\s*(?:for|fuer|für)?\s*[^:\n]*:\s*$", re.IGNORECASE),
+            re.compile(r"(?:^|\n)\s*enter\s+passphrase\s+for\s+[^:\n]+:\s*$", re.IGNORECASE),
+            re.compile(r"(?:^|\n)\s*passphrase\s*(?:for)?\s*[^:\n]*:\s*$", re.IGNORECASE),
+        ]
+
+    def output_contains_password_prompt(self, text):
+        value = str(text or "")
+        if not value.strip():
+            return False
+        tail = value[-2000:]
+        return any(pattern.search(tail) for pattern in self.password_prompt_patterns())
+
+    def visible_output_waits_for_password(self):
+        """Return True if the visible terminal tail currently ends in a password prompt."""
+        try:
+            return self.output_contains_password_prompt(self.output_area.toPlainText())
+        except Exception:
+            return False
+
+    def handle_possible_password_prompt(self, text):
+        # PTY-Ausgaben kommen oft in kleinen Chunks. Bei sudo kann die aktuelle
+        # Ausgabe nur das Ende des Prompts enthalten, waehrend der Anfang bereits
+        # im QTextEdit steht. Deshalb gegen Chunk + sichtbares Terminalende
+        # pruefen, nicht nur gegen den aktuellen Chunk. Zusaetzlich merken wir
+        # einen kleinen Tail, weil sudo den Prompt typischerweise ohne Newline
+        # ausgibt und Qt/PTY ihn in mehrere readyRead-Ereignisse aufteilen kann.
+        combined = str(getattr(self, "_password_prompt_tail", "") or "") + str(text or "")
+        try:
+            current_tail = self.output_area.toPlainText()[-2000:]
+            combined = current_tail + combined
+        except Exception:
+            pass
+        self._password_prompt_tail = combined[-3000:]
+        if not self.output_contains_password_prompt(combined):
+            return
+        self.activate_password_prompt_mode(open_dialog=True)
+
+    def activate_password_prompt_mode(self, *, open_dialog=True):
+        if getattr(self, "client_mode_active", False):
+            return False
+        self.password_prompt_active = True
+        self.input_line.clear()
+        self.input_line.setPlaceholderText("Passwort wird angefordert – Eingabe wird nicht gespeichert")
+        self.execute_button.setText("Passwort senden")
+        self.execute_button.setEnabled(True)
+        if open_dialog and not getattr(self, "_password_dialog_open", False):
+            # sudo gibt den Prompt ohne Zeilenumbruch aus. Ein kurzer Delay sorgt
+            # dafuer, dass der Prompt sichtbar ist, bevor der Dialog den Fokus
+            # nimmt. Dadurch entstehen keine leeren/versehentlichen Antworten.
+            QTimer.singleShot(180, self.show_password_prompt_dialog)
+        return True
+
+    def reset_password_prompt_mode(self, status_message=""):
+        """Return the tab to normal command mode after a password prompt ended.
+
+        This is intentionally separate from set_client_mode(False), because
+        sudo/ssh password prompts are not a real ShellDeck client mode. It also
+        prevents a stale password dialog from sending text after sudo has
+        already finished and the shell prompt is visible again.
+        """
+        self.password_prompt_active = False
+        self._password_prompt_tail = ""
+        self.input_line.clear()
+        self.input_line.setPlaceholderText("")
+        self.execute_button.setText("Befehl ausführen")
+        self.execute_button.setEnabled(True)
+        if status_message:
+            try:
+                self.window.show_status(status_message)
+            except Exception:
+                pass
+
+    def password_prompt_still_visible(self):
+        return self.password_prompt_active and self.visible_output_waits_for_password()
+
+    def refresh_password_prompt_state_after_output(self):
+        """Clear stale password mode once normal command output/prompt appears."""
+        if not getattr(self, "password_prompt_active", False):
+            return
+        if getattr(self, "_password_dialog_open", False):
+            # The dialog may still be open while sudo already finished. Do not
+            # close it forcefully here; send_password_input() will reject stale
+            # input before anything can be written to the shell.
+            return
+        if not self.visible_output_waits_for_password():
+            self.reset_password_prompt_mode()
+
+    def show_password_prompt_dialog(self):
+        if not getattr(self, "password_prompt_active", False):
+            return
+        if getattr(self, "_password_dialog_open", False):
+            return
+        if self.process is None or self.process.state() != QProcess.ProcessState.Running:
+            self.reset_password_prompt_mode()
+            return
+        if not self.visible_output_waits_for_password():
+            # A delayed dialog can become stale if the command already finished
+            # or if sudo accepted a password entered through the lower field.
+            self.reset_password_prompt_mode()
+            return
+
+        self._password_dialog_open = True
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Passwort benötigt")
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        label = QLabel(
+            "Die laufende Shell fordert ein Passwort an.\n"
+            "Es wird direkt an den Prozess gesendet und nicht im Verlauf gespeichert."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        password_edit = QLineEdit(dialog)
+        password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        password_edit.setPlaceholderText("Passwort eingeben")
+        layout.addWidget(password_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        QTimer.singleShot(0, password_edit.setFocus)
+        try:
+            result = dialog.exec()
+            if result == QDialog.DialogCode.Accepted:
+                password = password_edit.text()
+                if password:
+                    # Before sending, verify again that the terminal still ends
+                    # in a password prompt. This prevents a delayed/stale dialog
+                    # from turning the password into a normal shell command after
+                    # sudo has already completed.
+                    if self.visible_output_waits_for_password():
+                        self.send_password_input(password)
+                    else:
+                        self.reset_password_prompt_mode("Veraltete Passworteingabe ignoriert")
+                else:
+                    # Leere OK-Klicks nicht als Passwort senden. Genau das kann
+                    # bei sudo sonst wie ein falscher erster Versuch wirken und
+                    # eine zweite Passwortabfrage erzeugen.
+                    self.window.show_status("Leere Passworteingabe ignoriert")
+                    if self.visible_output_waits_for_password():
+                        self.activate_password_prompt_mode(open_dialog=False)
+                    else:
+                        self.reset_password_prompt_mode()
+            else:
+                self.output_area.append("\n[Passworteingabe abgebrochen]\n")
+                self.reset_password_prompt_mode()
+        finally:
+            self._password_dialog_open = False
+
+    def send_password_input(self, password):
+        if self.process is None or self.process.state() != QProcess.ProcessState.Running:
+            self.output_area.append("\nShell ist nicht aktiv; Passwort wurde nicht gesendet.\n")
+            self.reset_password_prompt_mode()
+            return
+        if not self.visible_output_waits_for_password():
+            # The prompt has disappeared since the dialog/input mode was opened.
+            # Do not write the secret to the normal shell.
+            self.reset_password_prompt_mode("Veraltete Passworteingabe ignoriert")
+            return
+        payload = str(password or "") + "\n"
+        self.process.write(payload.encode("utf-8", errors="replace"))
+        self.process.waitForBytesWritten(1000)
+        self.reset_password_prompt_mode("Passwort wurde an den laufenden Prozess gesendet")
+
     def send_client_input(self, text):
         if self.client_mode_kind in {"ollama_prompt", "ollama_api"}:
             self.send_ollama_prompt(text)
@@ -2166,6 +2355,20 @@ class TerminalTab(QWidget):
         if not command_text:
             return
 
+        if self.password_prompt_active or self.visible_output_waits_for_password():
+            # Sicherheitsnetz: Wenn kein Popup sichtbar ist oder der Benutzer es
+            # geschlossen hat, darf die naechste Eingabe bei einem sichtbaren
+            # sudo/ssh-Passwortprompt trotzdem nicht als normaler Shell-Befehl
+            # ausgefuehrt und nicht im Verlauf gespeichert werden. Wenn der
+            # Prompt inzwischen verschwunden ist, wird die Eingabe verworfen
+            # statt als normaler Befehl mit Passwortinhalt zu laufen.
+            if self.visible_output_waits_for_password():
+                self.activate_password_prompt_mode(open_dialog=False)
+                self.send_password_input(command_text)
+            else:
+                self.reset_password_prompt_mode("Veraltete Passworteingabe ignoriert")
+            return
+
         if self.client_mode_active:
             self.send_client_input(command_text)
             return
@@ -2207,7 +2410,15 @@ class TerminalTab(QWidget):
 
     def _decode_process_output(self, raw) -> str:
         data = bytes(raw)
-        for encoding in ("cp850", "mbcs", "cp1252", "utf-8", "latin-1"):
+        # Linux/macOS-PTYs liefern normalerweise UTF-8. Wenn zuerst cp850
+        # versucht wird, wird z.B. "für" als Mojibake dekodiert und lokalisierte
+        # Passwort-Prompts werden schlechter erkannt. Unter Windows bleibt die
+        # bisherige Codepage-Reihenfolge erhalten.
+        if sys.platform == "win32":
+            encodings = ("cp850", "mbcs", "cp1252", "utf-8", "latin-1")
+        else:
+            encodings = ("utf-8", "latin-1", "cp850", "cp1252")
+        for encoding in encodings:
             try:
                 return data.decode(encoding)
             except (UnicodeDecodeError, LookupError):
@@ -2310,6 +2521,8 @@ class TerminalTab(QWidget):
         self.output_area.insertPlainText(data)
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.ensureCursorVisible()
+        self.handle_possible_password_prompt(data)
+        self.refresh_password_prompt_state_after_output()
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_stderr(self):
@@ -2320,6 +2533,8 @@ class TerminalTab(QWidget):
         self.output_area.setTextColor(QColor(self.window.terminal_color("stdout", "#FFFFFF")))
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.ensureCursorVisible()
+        self.handle_possible_password_prompt(data)
+        self.refresh_password_prompt_state_after_output()
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_finished(self, exit_code, exit_status):
