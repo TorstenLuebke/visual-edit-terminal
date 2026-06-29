@@ -1,4 +1,3 @@
-@"
 # Python
 __pycache__/
 *.py[cod]
@@ -20,6 +19,10 @@ env/
 build/
 dist/
 *.spec
+App/
+
+# Nuitka
+nuitka-crash-report.xml
 
 # IDE / OS
 .vscode/
@@ -29,6 +32,3 @@ Thumbs.db
 
 # Logs
 *.log
-"@ | Set-Content .gitignore -Encoding UTF8
-# Nuitka crash reports
-nuitka-crash-report.xml
