@@ -545,9 +545,15 @@ class TerminalTab(QWidget):
         self.output_search_text = ""
         self.last_ollama_code_blocks = []
         self._pending_pty_command_echoes = []
+        self._pending_interactive_response_echoes = []
         self.password_prompt_active = False
         self._password_dialog_open = False
         self._password_prompt_tail = ""
+        self.interaction_prompt_active = False
+        self._interaction_prompt_tail = ""
+        self._interaction_prompt_text = ""
+        self._awaiting_command_completion = False
+        self._last_sent_shell_command = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -660,8 +666,25 @@ class TerminalTab(QWidget):
         prompt = getattr(self, "input_prompt_label", None)
         if prompt is not None:
             full_path = str(getattr(self, "current_working_directory", "") or "")
-            prompt.setText(self.input_prompt_text())
-            prompt.setToolTip(full_path)
+            if getattr(self, "password_prompt_active", False):
+                prompt_text = "Passwort erwartet"
+                tooltip = "Die nächste Eingabe wird als Passwort roh an den laufenden Prozess gesendet."
+            elif getattr(self, "interaction_prompt_active", False):
+                question = str(getattr(self, "_interaction_prompt_text", "") or "").strip()
+                if question:
+                    prompt_text = f"Antwort/Eingabe erwartet: {question}"
+                    tooltip = question
+                else:
+                    prompt_text = "Antwort/Eingabe an laufenden Prozess"
+                    tooltip = "Die nächste Eingabe wird roh an den laufenden Prozess gesendet."
+            elif self.command_appears_to_be_running():
+                prompt_text = "Laufender Prozess aktiv – Eingabe wird an den Prozess gesendet"
+                tooltip = "Solange kein normaler Shell-Prompt zurück ist, kann die nächste Eingabe als Antwort/Interaktion gesendet werden."
+            else:
+                prompt_text = self.input_prompt_text()
+                tooltip = full_path
+            prompt.setText(prompt_text)
+            prompt.setToolTip(tooltip)
             try:
                 prompt.setCursorPosition(0)
             except Exception:
@@ -816,11 +839,38 @@ class TerminalTab(QWidget):
         # Arbeitsordner nach cd/pushd/popd exakt von der laufenden Shell zu lesen.
         return "printf '__SHELLDECK_CONTEXT__%s\\t%s\\n' \"$PWD\" \"$VIRTUAL_ENV\""
 
+    def shell_command_needs_context_probe(self, command_text):
+        """Return True only for commands where a post-command cwd probe is useful.
+
+        A probe is an extra line sent to the live shell. For commands that ask
+        questions (rm -i, apt, git clean, overwrite prompts, etc.) that extra
+        line can accidentally become the answer to the prompt. Therefore
+        ShellDeck only appends the probe for shell-state commands where it is
+        needed to keep the displayed working directory/venv in sync.
+        """
+        text = str(command_text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not text.strip():
+            return False
+        for part in self.split_shell_commands_for_context(text):
+            lowered = part.strip().lower()
+            if not lowered:
+                continue
+            first = lowered.split(None, 1)[0]
+            if first in {"cd", "chdir", "pushd", "popd", "deactivate"}:
+                return True
+            if first in {"source", "."}:
+                return True
+            if self.command_looks_like_venv_activation(part):
+                return True
+        return False
+
     def append_shell_context_probe(self, command_text):
         text = str(command_text or "").replace("\r\n", "\n").replace("\r", "\n")
         if not text.strip() or not self.shell_supports_context_probe():
             return text
         if "__SHELLDECK_CONTEXT__" in text:
+            return text
+        if not self.shell_command_needs_context_probe(text):
             return text
         # Für interaktive Clients ist der Probe-Befehl unerwünscht, weil er dort
         # als Eingabe beim Client landen könnte. Diese Fälle werden normalerweise
@@ -2104,6 +2154,10 @@ class TerminalTab(QWidget):
             self.execute_button.setEnabled(True)
             self.execute_button.setText("Befehl ausführen")
             self.input_line.setPlaceholderText("")
+            self.interaction_prompt_active = False
+            self._interaction_prompt_tail = ""
+            self._interaction_prompt_text = ""
+            self._awaiting_command_completion = False
             engine_label = self.window.terminal_engine_label_for_process(getattr(self, "process", None))
             self.window.statusBar().showMessage(f"Shell-Backend: {self.window.shell_backend_label(self.shell_type)} | Engine: {engine_label}")
 
@@ -2293,6 +2347,247 @@ class TerminalTab(QWidget):
         self.process.waitForBytesWritten(1000)
         self.reset_password_prompt_mode("Passwort wurde an den laufenden Prozess gesendet")
 
+    def shell_prompt_patterns(self):
+        return [
+            re.compile(r"(?:^|\n)\s*PS\s+[^\r\n>]+>\s*$"),
+            re.compile(r"(?:^|\n)\s*\([^\r\n()]+\)\s*PS\s+[^\r\n>]+>\s*$"),
+            re.compile(r"(?:^|\n)\s*[A-Za-z]:[\\/][^\r\n>]*>\s*$"),
+            re.compile(r"(?:^|\n)\s*(?:\([^\r\n()]+\)\s*)?[^@\s:\r\n]+@[^:\r\n]+:[^\r\n#$]*[#$]\s*$"),
+        ]
+
+    def output_ends_with_shell_prompt(self, text):
+        value = str(text or "")
+        if not value.strip():
+            return False
+        tail = value[-2500:]
+        return any(pattern.search(tail) for pattern in self.shell_prompt_patterns())
+
+    def output_ends_with_continuation_prompt(self, text):
+        value = str(text or "")
+        if not value.strip():
+            return False
+        tail = value[-1200:].replace("\r", "\n")
+        lines = [line.rstrip() for line in tail.split("\n") if line.strip()]
+        if not lines:
+            return False
+        last = lines[-1]
+        return bool(re.search(r"^(?:>>|\.\.>|>>>|\.\.\.|dquote>|quote>|pipe>)\s*$", last, re.IGNORECASE))
+
+    def command_appears_to_be_running(self):
+        if not getattr(self, "_awaiting_command_completion", False):
+            return False
+        if getattr(self, "client_mode_active", False) or getattr(self, "password_prompt_active", False):
+            return False
+        try:
+            output = self.output_area.toPlainText()
+        except Exception:
+            return False
+        return not self.output_ends_with_shell_prompt(output)
+
+    def update_command_completion_state_from_output(self):
+        try:
+            output = self.output_area.toPlainText()
+        except Exception:
+            output = ""
+        if self.output_ends_with_shell_prompt(output):
+            self._awaiting_command_completion = False
+            if getattr(self, "interaction_prompt_active", False):
+                self.reset_interaction_prompt_mode()
+            return
+        if self.output_ends_with_continuation_prompt(output):
+            self.activate_interaction_prompt_mode(
+                "mehrzeilige Eingabe fortsetzen oder leere Zeile zum Abschließen senden",
+                clear_input=False,
+                status_message="Shell wartet auf die Fortsetzung einer mehrzeiligen Eingabe",
+            )
+
+    def compact_interactive_prompt_text(self, text, *, max_len=180):
+        if hasattr(self.window, "clean_output_text"):
+            value = self.window.clean_output_text(str(text or ""))
+        else:
+            value = str(text or "")
+        value = value.replace("\r", "\n")
+        value = re.sub(r"\s+", " ", value).strip()
+        value = re.sub(r"^(?:PS\s+[^>]+>|[A-Za-z]:[^>]*>|[^@\s:]+@[^:]+:[^#$]*[#$])\s*", "", value)
+        if len(value) > int(max_len):
+            value = "…" + value[-int(max_len):]
+        return value
+
+    def interactive_prompt_patterns(self):
+        """Breite Erkennung für sichtbare Rückfragen laufender Prozesse.
+
+        Diese Liste ist bewusst nicht nur auf j/n beschränkt. Sie erkennt
+        typische Auswahl-/Bestätigungs-/Fortsetzungsfragen, PowerShell-Confirm,
+        Choice-Menüs und Prompts ohne Zeilenumbruch. Zusätzlich kann ShellDeck
+        jederzeit in den allgemeinen Prozess-Eingabemodus wechseln, wenn noch
+        kein normaler Shell-Prompt zurück ist.
+        """
+        return [
+            re.compile(r"(?:^|\n).{0,260}(?:\[[^\]\r\n]{1,80}\]|\([^()\r\n]{1,80}\))\s*[:?]?\s*$", re.IGNORECASE),
+            re.compile(r"(?:^|\n).{0,260}(?:yes/no|y/n|j/n|ja/nein|yes to all|no to all|all/none|a/w/n|abort|retry|ignore|abbrechen|wiederholen|weiter|neu versuchen).{0,160}[:?]\s*$", re.IGNORECASE),
+            re.compile(r"(?:^|\n).{0,260}(?:fortfahren|weiter|löschen|loeschen|überschreiben|ueberschreiben|overwrite|delete|remove|continue|proceed|confirm|bestätigen|bestaetigen|abbrechen|retry|ignore|wiederholen|neu versuchen).{0,180}\?\s*$", re.IGNORECASE),
+            re.compile(r"(?:^|\n).{0,260}\[[A-Za-zÄÖÜäöü?]\].{0,260}(?:\[[A-Za-zÄÖÜäöü?]\].{0,260}){1,}:\s*$", re.IGNORECASE | re.DOTALL),
+            re.compile(r"(?:^|\n).{0,260}(?:press any key|drücken sie eine beliebige taste|beliebige taste|enter drücken|press enter|hit enter).{0,120}$", re.IGNORECASE),
+        ]
+
+    def extract_interactive_prompt_from_output(self, text):
+        value = str(text or "")
+        if not value.strip():
+            return ""
+        if self.output_contains_password_prompt(value) or self.output_ends_with_shell_prompt(value):
+            return ""
+        tail = value[-2500:].replace("\r", "\n")
+        lines = [line.strip() for line in tail.split("\n") if line.strip()]
+        if not lines:
+            return ""
+        if self.output_ends_with_continuation_prompt(tail):
+            return "mehrzeilige Eingabe fortsetzen oder leere Zeile zum Abschließen senden"
+        last_line = lines[-1]
+        check_text = tail if re.search(r"\[[A-Za-zÄÖÜäöü?]\].*\[[A-Za-zÄÖÜäöü?]\]", tail, re.DOTALL) else last_line
+        for pattern in self.interactive_prompt_patterns():
+            if pattern.search(check_text):
+                return self.compact_interactive_prompt_text(check_text)
+        return ""
+
+    def output_contains_interactive_prompt(self, text):
+        return bool(self.extract_interactive_prompt_from_output(text))
+
+    def visible_output_waits_for_interaction(self):
+        try:
+            return self.output_contains_interactive_prompt(self.output_area.toPlainText())
+        except Exception:
+            return False
+
+    def extract_interactive_prompt_from_command(self, command):
+        """Best-effort-Erkennung für Befehle, deren Frage nicht sichtbar wird.
+
+        PowerShell Read-Host über QProcess zeigt die Frage je nach Host nicht
+        als normales stdout. Auch choice, set /p und read -p werden hier erfasst,
+        damit unten trotzdem ein verständlicher Antwort-Hinweis steht.
+        """
+        text = str(command or "").strip()
+        if not text:
+            return ""
+        patterns = [
+            r"(?is)\bread-host\b\s+(?:-prompt\s+)?(?P<quote>['\"])(?P<prompt>.*?)(?P=quote)",
+            r"(?is)\bread-host\b\s+-prompt\s+(?P<prompt>[^;\r\n]+)",
+            r"(?is)\bchoice\b.*?\s/(?:m|message)\s+(?P<quote>['\"])(?P<prompt>.*?)(?P=quote)",
+            r"(?is)\bset\s+/p\s+[^=\s]+\s*=\s*(?P<prompt>[^\r\n]+)",
+            r"(?is)\bread\b.*?\s-p\s+(?P<quote>['\"])(?P<prompt>.*?)(?P=quote)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            prompt = str(match.groupdict().get("prompt", "") or "").strip().strip('"\'')
+            if prompt:
+                return self.compact_interactive_prompt_text(prompt)
+        lowered = text.lower()
+        if re.search(r"\b(pause|read-host|choice|set\s+/p|read\b|ssh|sudo|su|passwd)\b", lowered):
+            return "laufender Befehl wartet auf Eingabe"
+        return ""
+
+    def command_may_request_interactive_input(self, command):
+        return bool(self.extract_interactive_prompt_from_command(command))
+
+    def handle_possible_interactive_prompt(self, text):
+        if getattr(self, "password_prompt_active", False):
+            return
+        combined = str(getattr(self, "_interaction_prompt_tail", "") or "") + str(text or "")
+        try:
+            current_tail = self.output_area.toPlainText()[-2500:]
+            combined = current_tail + combined
+        except Exception:
+            pass
+        self._interaction_prompt_tail = combined[-3500:]
+        prompt_text = self.extract_interactive_prompt_from_output(combined)
+        if not prompt_text:
+            return
+        self.activate_interaction_prompt_mode(prompt_text, clear_input=True)
+
+    def activate_interaction_prompt_mode(self, prompt_text="", *, clear_input=True, status_message=""):
+        if getattr(self, "client_mode_active", False):
+            return False
+        if getattr(self, "password_prompt_active", False):
+            return False
+        self.interaction_prompt_active = True
+        self._interaction_prompt_text = self.compact_interactive_prompt_text(prompt_text) if prompt_text else ""
+        if clear_input:
+            self.input_line.clear()
+        if self._interaction_prompt_text:
+            self.input_line.setPlaceholderText("Antwort/Eingabe an laufenden Prozess senden …")
+        else:
+            self.input_line.setPlaceholderText("Eingabe wird roh an den laufenden Prozess gesendet …")
+        self.execute_button.setText("Eingabe senden" if not self._interaction_prompt_text else "Antwort senden")
+        self.execute_button.setEnabled(True)
+        self.update_input_prompt_label()
+        try:
+            self.window.show_status(status_message or "Laufender Prozess wartet möglicherweise auf Eingabe")
+        except Exception:
+            pass
+        return True
+
+    def reset_interaction_prompt_mode(self, status_message=""):
+        self.interaction_prompt_active = False
+        self._interaction_prompt_tail = ""
+        self._interaction_prompt_text = ""
+        if not getattr(self, "password_prompt_active", False) and not getattr(self, "client_mode_active", False):
+            self.input_line.clear()
+            self.input_line.setPlaceholderText("")
+            self.execute_button.setText("Befehl ausführen")
+            self.execute_button.setEnabled(True)
+            self.update_input_prompt_label()
+        if status_message:
+            try:
+                self.window.show_status(status_message)
+            except Exception:
+                pass
+
+    def refresh_interaction_prompt_state_after_output(self):
+        if getattr(self, "password_prompt_active", False):
+            self.reset_interaction_prompt_mode()
+            return
+        self.update_command_completion_state_from_output()
+        if getattr(self, "interaction_prompt_active", False):
+            try:
+                output = self.output_area.toPlainText()
+            except Exception:
+                output = ""
+            prompt_text = self.extract_interactive_prompt_from_output(output)
+            if prompt_text:
+                self._interaction_prompt_text = prompt_text
+                self.update_input_prompt_label()
+            elif self.output_ends_with_shell_prompt(output):
+                self.reset_interaction_prompt_mode()
+
+    def refresh_process_input_mode_hint(self):
+        if getattr(self, "client_mode_active", False) or getattr(self, "password_prompt_active", False):
+            return
+        if getattr(self, "interaction_prompt_active", False):
+            return
+        if self.command_appears_to_be_running():
+            self.activate_interaction_prompt_mode(
+                self.extract_interactive_prompt_from_command(getattr(self, "_last_sent_shell_command", "")) or "laufender Prozess nimmt Eingaben an",
+                clear_input=False,
+                status_message="Laufender Prozess ist noch aktiv; Eingaben werden direkt dorthin gesendet",
+            )
+
+    def send_interactive_input(self, answer):
+        if self.process is None or self.process.state() != QProcess.ProcessState.Running:
+            self.output_area.append("\nShell ist nicht aktiv; Eingabe wurde nicht gesendet.\n")
+            self.reset_interaction_prompt_mode()
+            return
+        payload = str(answer or "")
+        # Leere Eingaben sind wichtig: Sie schließen z.B. PowerShell-Continuation
+        # (>>) ab oder bestätigen "Press Enter"-Prompts.
+        payload = payload.rstrip("\n") + "\n"
+        self.remember_pending_interactive_response_echo(answer)
+        self.process.write(payload.encode("utf-8", errors="replace"))
+        self.process.waitForBytesWritten(1000)
+        self.input_line.clear()
+        self._awaiting_command_completion = True
+        QTimer.singleShot(250, self.refresh_interaction_prompt_state_after_output)
+
     def send_client_input(self, text):
         if self.client_mode_kind in {"ollama_prompt", "ollama_api"}:
             self.send_ollama_prompt(text)
@@ -2332,9 +2627,9 @@ class TerminalTab(QWidget):
         self.update_working_context_from_shell_command(text)
 
         # Nach jedem normalen POSIX-Shell-Befehl fragt ShellDeck den echten
-        # Arbeitsordner direkt in der laufenden Shell ab. Dadurch bleibt die
-        # Anzeige auch nach cd .., cd Unterordner, pushd/popd und deaktivierter
-        # Vorbefehlszeile synchron.
+        # Arbeitsordner nur bei Shell-State-Befehlen direkt ab. Ein pauschaler
+        # Probe-Befehl nach jeder Eingabe könnte sonst als Antwort in
+        # interaktiven Programmen landen.
         text = self.append_shell_context_probe(text)
 
         # In PTY/ConPTY PowerShell the shell is started without PSReadLine.
@@ -2345,10 +2640,21 @@ class TerminalTab(QWidget):
             self.remember_pending_pty_command_echo(text)
 
         self.update_working_context_from_shell_command(text)
+        shell = str(self.shell_type or "").lower()
+        is_powershell = shell in {"powershell", "pwsh"}
+        is_multiline = "\n" in text
         if not text.endswith("\n"):
             text += "\n"
+        # PowerShell-Mehrzeiler mit Backtick/Fortsetzung brauchen über
+        # QProcess häufig eine zusätzliche Abschluss-Eingabe. Diese leere Zeile
+        # verhindert, dass ShellDeck im ">>"-Prompt stehen bleibt.
+        if is_powershell and is_multiline and not text.endswith("\n\n"):
+            text += "\n"
+        self._last_sent_shell_command = str(command or "")
+        self._awaiting_command_completion = True
         self.process.write(text.encode())
         self.process.waitForBytesWritten(1000)
+        QTimer.singleShot(300, self.refresh_process_input_mode_hint)
 
     def execute_command(self):
         command_text = self.input_line.toPlainText().strip()
@@ -2367,6 +2673,20 @@ class TerminalTab(QWidget):
                 self.send_password_input(command_text)
             else:
                 self.reset_password_prompt_mode("Veraltete Passworteingabe ignoriert")
+            return
+
+        if self.interaction_prompt_active or self.visible_output_waits_for_interaction() or self.command_appears_to_be_running():
+            # Laufender Prozess/Continuation/Confirm: Eingabe roh senden. Keine
+            # Historie, kein Vorbefehl und keine Kontext-Probe. So können auch
+            # allgemeine Rückfragen, Menüs, Read-Host, a/w/n-Auswahlen oder eine
+            # abschließende Leerzeile beantwortet werden.
+            prompt = ""
+            try:
+                prompt = self.extract_interactive_prompt_from_output(self.output_area.toPlainText())
+            except Exception:
+                prompt = ""
+            self.activate_interaction_prompt_mode(prompt, clear_input=False)
+            self.send_interactive_input(command_text)
             return
 
         if self.client_mode_active:
@@ -2403,6 +2723,9 @@ class TerminalTab(QWidget):
                 break
             else:
                 self.write_shell_command(command)
+                prompt_text = self.extract_interactive_prompt_from_command(command)
+                if prompt_text:
+                    self.activate_interaction_prompt_mode(prompt_text, clear_input=True)
                 client_name = "" if ("\n" in command or "\r" in command) else self.detect_client_mode_name(command)
                 if client_name:
                     self.set_client_mode(True, client_name)
@@ -2437,8 +2760,60 @@ class TerminalTab(QWidget):
             else:
                 text = self.window.clean_output_text(text)
             text = self.suppress_pending_pty_command_echo(text)
-            return self.consume_shell_context_markers(text)
+        text = self.suppress_pending_interactive_response_echo(text)
         return self.consume_shell_context_markers(text)
+
+    def normalize_response_echo_text(self, value):
+        return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def remember_pending_interactive_response_echo(self, answer):
+        # Viele Shells/Programme echoen die Antwort direkt wieder. Im
+        # Antwortmodus unterdrücken wir höchstens die erste unmittelbar
+        # folgende Echo-Zeile, damit echte Programmausgaben sichtbar bleiben.
+        text = self.normalize_response_echo_text(answer)
+        pending = list(getattr(self, "_pending_interactive_response_echoes", []) or [])
+        pending.append({"answer": text, "ttl": 4})
+        self._pending_interactive_response_echoes = pending[-4:]
+
+    def line_looks_like_interactive_response_echo(self, line, answer):
+        raw_line = self.normalize_response_echo_text(line)
+        raw_answer = self.normalize_response_echo_text(answer)
+        if raw_answer == "":
+            return raw_line == ""
+        if raw_line != raw_answer:
+            return False
+        if "\n" in raw_answer or len(raw_answer) > 120:
+            return False
+        return True
+
+    def suppress_pending_interactive_response_echo(self, text):
+        pending = list(getattr(self, "_pending_interactive_response_echoes", []) or [])
+        if not pending:
+            return text
+
+        kept_lines = []
+        removed_index = None
+        for line in str(text or "").splitlines(True):
+            line_body = line.rstrip("\r\n")
+            if removed_index is None:
+                for index, item in enumerate(pending):
+                    if self.line_looks_like_interactive_response_echo(line_body, item.get("answer", "")):
+                        removed_index = index
+                        break
+                if removed_index is not None:
+                    continue
+            kept_lines.append(line)
+
+        next_pending = []
+        for index, item in enumerate(pending):
+            if index == removed_index:
+                continue
+            ttl = int(item.get("ttl", 0)) - 1
+            if ttl > 0:
+                item["ttl"] = ttl
+                next_pending.append(item)
+        self._pending_interactive_response_echoes = next_pending
+        return "".join(kept_lines)
 
     def remember_pending_pty_command_echo(self, command):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -2522,7 +2897,9 @@ class TerminalTab(QWidget):
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.ensureCursorVisible()
         self.handle_possible_password_prompt(data)
+        self.handle_possible_interactive_prompt(data)
         self.refresh_password_prompt_state_after_output()
+        self.refresh_interaction_prompt_state_after_output()
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_stderr(self):
@@ -2534,7 +2911,9 @@ class TerminalTab(QWidget):
         self.output_area.moveCursor(QTextCursor.MoveOperation.End)
         self.output_area.ensureCursorVisible()
         self.handle_possible_password_prompt(data)
+        self.handle_possible_interactive_prompt(data)
         self.refresh_password_prompt_state_after_output()
+        self.refresh_interaction_prompt_state_after_output()
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_finished(self, exit_code, exit_status):
