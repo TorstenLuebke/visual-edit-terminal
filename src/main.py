@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog,
     QLineEdit, QListWidget, QListWidgetItem, QSplitter
 )
-from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer, QByteArray
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor, QSyntaxHighlighter,
     QAction, QShortcut, QPalette
@@ -3954,6 +3954,10 @@ class TerminalWindow(QMainWindow):
                 self.move_all_tabs(self.quaternary_tab_widget, self.secondary_tab_widget)
 
         self.clear_view_grid()
+        self.view_grid.setColumnStretch(0, 0)
+        self.view_grid.setColumnStretch(1, 0)
+        self.view_grid.setRowStretch(0, 0)
+        self.view_grid.setRowStretch(1, 0)
         if mode == "single":
             self.view_grid.addWidget(self.tab_widget, 0, 0, 1, 1)
             visible = [self.tab_widget]
@@ -3988,6 +3992,9 @@ class TerminalWindow(QMainWindow):
         self.update_view_actions()
         self.rebuild_move_view_menu()
         self.apply_color_scheme()
+        if mode == "single":
+            self.tab_widget.show()
+            self.tab_widget.raise_()
 
     def update_view_actions(self):
         mode = str(getattr(self, "view_layout_mode", "single") or "single")
@@ -5717,6 +5724,15 @@ class TerminalWindow(QMainWindow):
             if font.fromString(font_text):
                 self.terminal_font = font
 
+        self._window_geometry_restored = False
+        geometry_text = str(settings.get("window_geometry", "") or "").strip()
+        if geometry_text:
+            try:
+                geometry_bytes = QByteArray.fromBase64(geometry_text.encode("ascii"))
+                self._window_geometry_restored = bool(self.restoreGeometry(geometry_bytes))
+            except Exception:
+                self._window_geometry_restored = False
+
         self.default_command = str(settings.get("default_command", self.default_command or "") or "")
         self.color_scheme_name = self.normalize_color_scheme_name(settings.get("color_scheme_name", self.color_scheme_name or "Dunkel"))
         self.theme_config = self.merge_theme_config(settings.get("theme_config", self.theme_config))
@@ -5788,6 +5804,7 @@ class TerminalWindow(QMainWindow):
             "default_command": self.default_command,
             "max_history_size": self.max_history_size,
             "shell_type": self.shell_type,
+            "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
             **terminal_engine_settings,
             "tabs": self.collect_tab_settings(),
             "view_layout_mode": getattr(self, "view_layout_mode", "single"),
@@ -6837,12 +6854,13 @@ def main() -> int:
     except Exception:
         pass
     w = TerminalWindow()
-    w.resize(800, 600)
-    screen = w.screen() or QApplication.primaryScreen()
-    if screen:
-        frame = w.frameGeometry()
-        frame.moveCenter(screen.availableGeometry().center())
-        w.move(frame.topLeft())
+    if not getattr(w, "_window_geometry_restored", False):
+        w.resize(800, 600)
+        screen = w.screen() or QApplication.primaryScreen()
+        if screen:
+            frame = w.frameGeometry()
+            frame.moveCenter(screen.availableGeometry().center())
+            w.move(frame.topLeft())
     w.show()
     return app.exec()
 
