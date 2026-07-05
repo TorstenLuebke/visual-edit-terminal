@@ -1050,68 +1050,83 @@ class TerminalTab(QWidget):
 
         menu = QMenu(self)
 
+        menu.setToolTipsVisible(True)
         if sender is self.output_area:
             copy_action = QAction("Kopieren", self)
+            copy_action.setToolTip("Markierten Text aus der Ausgabe kopieren")
             copy_action.setEnabled(bool(self.output_area.textCursor().hasSelection()))
             copy_action.triggered.connect(self.output_area.copy)
             menu.addAction(copy_action)
 
             copy_all_action = QAction("Alles kopieren", self)
+            copy_all_action.setToolTip("Gesamte Ausgabe kopieren")
             copy_all_action.triggered.connect(self.copy_all_output)
             menu.addAction(copy_all_action)
 
             copy_plain_action = QAction("Kopieren ohne Steuerzeichen", self)
+            copy_plain_action.setToolTip("Markierten Text ohne Steuerzeichen kopieren")
             copy_plain_action.setEnabled(bool(self.output_area.textCursor().hasSelection()))
             copy_plain_action.triggered.connect(self.copy_output_plain_text)
             menu.addAction(copy_plain_action)
 
             copy_all_plain_action = QAction("Alles kopieren ohne Steuerzeichen", self)
+            copy_all_plain_action.setToolTip("Gesamte Ausgabe ohne Steuerzeichen kopieren")
             copy_all_plain_action.triggered.connect(self.copy_all_output_plain_text)
             menu.addAction(copy_all_plain_action)
 
             clear_action = QAction("Ausgabe leeren", self)
+            clear_action.setToolTip("Ausgabe des Terminals leeren")
             clear_action.triggered.connect(self.output_area.clear)
             menu.addAction(clear_action)
 
             save_output_action = QAction("Ausgabe speichern...", self)
+            save_output_action.setToolTip("Aktuelle Ausgabe in eine Datei speichern")
             save_output_action.triggered.connect(self.window.save_current_output)
             menu.addAction(save_output_action)
 
             save_markdown_action = QAction("Ausgabe als Markdown speichern", self)
+            save_markdown_action.setToolTip("Ausgabe im Markdown-Format speichern")
             save_markdown_action.triggered.connect(lambda: self.window.save_current_output("md"))
             menu.addAction(save_markdown_action)
 
             save_text_action = QAction("Ausgabe als Text speichern", self)
+            save_text_action.setToolTip("Ausgabe im Klartext-Format speichern")
             save_text_action.triggered.connect(lambda: self.window.save_current_output("txt"))
             menu.addAction(save_text_action)
 
             if self.client_mode_kind == "ollama_api":
                 save_ollama_md_action = QAction("Ollama-Chat als Markdown speichern", self)
+                save_ollama_md_action.setToolTip("Aktuellen Ollama-Chat im Markdown-Format speichern")
                 save_ollama_md_action.triggered.connect(self.window.save_current_ollama_chat_markdown)
                 menu.addAction(save_ollama_md_action)
 
                 stop_ollama_action = QAction("Ollama-Antwort stoppen", self)
+                stop_ollama_action.setToolTip("Laufende Ollama-Antwort abbrechen")
                 stop_ollama_action.setEnabled(self.ollama_worker is not None and self.ollama_worker.isRunning())
                 stop_ollama_action.triggered.connect(self.window.stop_current_ollama_response)
                 menu.addAction(stop_ollama_action)
 
                 copy_last_code_action = QAction("Letzten Codeblock kopieren", self)
+                copy_last_code_action.setToolTip("Letzten Codeblock aus der Ausgabe kopieren")
                 copy_last_code_action.setEnabled(bool(self.last_ollama_code_blocks))
                 copy_last_code_action.triggered.connect(self.copy_last_ollama_code_block)
                 menu.addAction(copy_last_code_action)
 
             search_action = QAction("Suchen", self)
+            search_action.setToolTip("In der Ausgabe suchen")
             search_action.setShortcut("Ctrl+F")
             search_action.triggered.connect(self.show_output_search_dialog)
             menu.addAction(search_action)
 
             find_next_action = QAction("Nächster Treffer", self)
+            find_next_action.setToolTip("Nächsten Suchtreffer in der Ausgabe finden")
             find_next_action.setShortcut("F3")
             find_next_action.setEnabled(bool(self.output_search_text))
             find_next_action.triggered.connect(lambda: self.find_output_text(backward=False))
             menu.addAction(find_next_action)
 
             find_previous_action = QAction("Vorheriger Treffer", self)
+            find_previous_action.setToolTip("Vorherigen Suchtreffer in der Ausgabe finden")
             find_previous_action.setShortcut("Shift+F3")
             find_previous_action.setEnabled(bool(self.output_search_text))
             find_previous_action.triggered.connect(lambda: self.find_output_text(backward=True))
@@ -1121,24 +1136,29 @@ class TerminalTab(QWidget):
 
         elif sender is self.input_line:
             copy_action = QAction("Kopieren", self)
+            copy_action.setToolTip("Markierten Text aus der Eingabe kopieren")
             copy_action.setEnabled(bool(self.input_line.textCursor().hasSelection()))
             copy_action.triggered.connect(self.input_line.copy)
             menu.addAction(copy_action)
 
             paste_action = QAction("Einfügen", self)
+            paste_action.setToolTip("Inhalt aus der Zwischenablage einfügen")
             paste_action.triggered.connect(self.input_line.paste)
             menu.addAction(paste_action)
 
             paste_execute_action = QAction("Einfügen + Ausführen", self)
+            paste_execute_action.setToolTip("Inhalt aus der Zwischenablage einfügen und ausführen")
             paste_execute_action.triggered.connect(self.paste_and_execute_command)
             menu.addAction(paste_execute_action)
 
             cut_action = QAction("Ausschneiden", self)
+            cut_action.setToolTip("Markierten Text aus der Eingabe ausschneiden")
             cut_action.setEnabled(bool(self.input_line.textCursor().hasSelection()))
             cut_action.triggered.connect(self.input_line.cut)
             menu.addAction(cut_action)
 
             select_all_action = QAction("Alles auswählen", self)
+            select_all_action.setToolTip("Gesamte Eingabe auswählen")
             select_all_action.triggered.connect(self.input_line.selectAll)
             menu.addAction(select_all_action)
 
@@ -5297,22 +5317,22 @@ class TerminalWindow(QMainWindow):
             )
         except Exception:
             return ""
-    
+
         raw = result.stdout or result.stderr or b""
         if not raw:
             return ""
-    
+
         for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "cp850", "cp1252"):
             try:
                 text = raw.decode(encoding, errors="replace")
                 break
             except Exception:
                 text = ""
-    
+
         text = text.replace("\x00", "").strip()
         if not text:
             return ""
-    
+
         return text.splitlines()[0].strip()
 
     def default_shell_type(self):
@@ -5360,19 +5380,19 @@ class TerminalWindow(QMainWindow):
 
     def available_shell_backends(self):
         options = []
-    
+
         def add(shell_id, label, executable=None, args=None):
             executable = executable or self.system_shell(shell_id)
             if not executable:
                 return
-    
+
             # Versionen werden nur noch genutzt, wenn ausdrücklich gewünscht.
             # Für PowerShell/WSL vermeiden wir bewusst Versionsausgaben,
             # weil Windows je nach Umgebung kaputte Kodierungen liefern kann.
             version = ""
             if args is not None:
                 version = self._command_version_text(executable, args)
-    
+
             full_label = f"{label} — {version}" if version else label
             if shell_id not in [item["id"] for item in options]:
                 options.append({
@@ -5380,24 +5400,24 @@ class TerminalWindow(QMainWindow):
                     "label": full_label,
                     "executable": executable,
                 })
-    
+
         if sys.platform == "win32":
             if shutil.which("powershell.exe"):
                 add("powershell", "PowerShell", "powershell.exe", None)
-    
+
             if shutil.which("pwsh.exe"):
                 add("pwsh", "PowerShell 7", "pwsh.exe", None)
-    
+
             if shutil.which("cmd.exe"):
                 add("cmd", "CMD", "cmd.exe", None)
-    
+
             git_bash = self.find_git_bash()
             if git_bash:
                 add("git_bash", "Git Bash", git_bash, None)
-    
+
             if shutil.which("wsl.exe"):
                 add("wsl", "WSL", "wsl.exe", None)
-    
+
         else:
             for shell_id, label in (
                 ("bash", "Bash"),
@@ -5408,7 +5428,7 @@ class TerminalWindow(QMainWindow):
                 executable = shutil.which(shell_id)
                 if executable:
                     add(shell_id, label, executable, None)
-    
+
         if not options:
             fallback = self.default_shell_type()
             options.append({
@@ -5416,7 +5436,7 @@ class TerminalWindow(QMainWindow):
                 "label": self.shell_backend_label(fallback),
                 "executable": self.system_shell(fallback) or fallback,
             })
-    
+
         return options
 
     def shell_backend_label(self, shell_name=None) -> str:
