@@ -1038,6 +1038,11 @@ class TerminalTab(QWidget):
             self.update_input_prompt_label()
         return self.current_working_directory
 
+    def send_control_character(self, byte_value):
+        if self.process and self.process.state() == QProcess.ProcessState.Running:
+            self.process.write(byte_value)
+            self.process.waitForBytesWritten(1000)
+
     def show_terminal_context_menu(self, pos):
         sender = self.sender()
         if not hasattr(sender, "mapToGlobal"):
@@ -1172,6 +1177,16 @@ class TerminalTab(QWidget):
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.window.close_current_tab)
         menu.addAction(close_tab_action)
+
+        signal_menu = menu.addMenu("Signal senden")
+        sigint_action = signal_menu.addAction("Strg+C (SIGINT)")
+        sigint_action.triggered.connect(lambda: self.send_control_character(b"\x03"))
+        sigtstp_action = signal_menu.addAction("Strg+Z (SIGTSTP/Pause)")
+        sigtstp_action.triggered.connect(lambda: self.send_control_character(b"\x1a"))
+        eof_action = signal_menu.addAction("Strg+D (EOF)")
+        eof_action.triggered.connect(lambda: self.send_control_character(b"\x04"))
+        sigquit_action = signal_menu.addAction("Strg+\\ (SIGQUIT)")
+        sigquit_action.triggered.connect(lambda: self.send_control_character(b"\x1c"))
 
         menu.exec(sender.mapToGlobal(pos))
 
