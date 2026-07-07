@@ -2,6 +2,7 @@
 import sys
 import re
 import json
+import time
 import os
 import traceback
 import faulthandler
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer, QByteArray
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor, QSyntaxHighlighter,
-    QAction, QShortcut, QPalette
+    QAction, QShortcut, QPalette, QTextOption
 )
 
 
@@ -36,6 +37,27 @@ LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
 APP_VERSION = "2.16.0"
+
+# Terminal-Ausgaben dürfen den Qt-UI-Thread nicht mit einem einzigen
+# riesigen QTextEdit-Insert blockieren. Der Drain läuft deshalb
+# zeitbudgetiert: Intervall 0 = im nächsten Event-Loop-Durchlauf
+# (quasi Echtzeit), und pro Durchlauf wird so viel Text eingefügt,
+# wie in das Zeitbudget passt. Dazwischen kann Qt zeichnen und
+# Eingaben verarbeiten.
+TERMINAL_OUTPUT_DRAIN_INTERVAL_MS = 0
+# Etwa eine halbe Frame-Zeit bei 60 Hz: flüssiges Scrollen, keine
+# spürbaren Hänger, automatische Anpassung an die reale Einfügegeschwindigkeit.
+TERMINAL_OUTPUT_DRAIN_TIME_BUDGET_MS = 8
+# Ein Slice pro Edit-Block: groß genug für hohen Durchsatz, klein genug,
+# damit die Zeitbudget-Prüfung zwischen den Slices greifen kann.
+TERMINAL_OUTPUT_DRAIN_SLICE_CHARS = 65536
+TERMINAL_OUTPUT_LARGE_CHUNK_CHARS = 60000
+TERMINAL_OUTPUT_MAX_BLOCKS = 25000
+TERMINAL_OUTPUT_HARD_WRAP_COLUMN = 12000
+TERMINAL_HIGHLIGHT_MAX_DOCUMENT_CHARS = 450000
+TERMINAL_HIGHLIGHT_MAX_BLOCKS = 3500
+TERMINAL_HIGHLIGHT_MAX_LINE_CHARS = 3000
+OLLAMA_HTML_INLINE_RENDER_LIMIT = 180000
 
 
 def install_crash_logging():
@@ -87,12 +109,15 @@ class TerminalHighlighter(QSyntaxHighlighter):
         number_format.setForeground(QColor(self.color_value("number", "#C084FC")))
         self.highlighting_rules.append((re.compile(r"\b\d+\b"), number_format))
 
-    def set_terminal_colors(self, colors):
+    def set_terminal_colors(self, colors, rehighlight=True):
         self.colors = dict(colors or {})
         self.rebuild_rules()
-        self.rehighlight()
+        if rehighlight:
+            self.rehighlight()
 
     def highlightBlock(self, text):
+        if len(text) > TERMINAL_HIGHLIGHT_MAX_LINE_CHARS:
+            return
         for pattern, fmt in self.highlighting_rules:
             for match in pattern.finditer(text):
                 start = match.start()
@@ -562,6 +587,9 @@ class TerminalTab(QWidget):
         self.output_area = QTextEdit()
         self.output_area.setReadOnly(True)
         self.output_area.setFont(self.window.terminal_font)
+        self.output_area.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.output_area.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.output_area.document().setMaximumBlockCount(TERMINAL_OUTPUT_MAX_BLOCKS)
         self.output_area.setTextInteractionFlags(
             self.output_area.textInteractionFlags() | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
@@ -570,7 +598,32 @@ class TerminalTab(QWidget):
         self.output_area.customContextMenuRequested.connect(self.show_terminal_context_menu)
         layout.addWidget(self.output_area)
 
+        self.command_tasks = []
+        self.active_command_task = None
+        self.command_task_panel_expanded = False
+        self.command_task_header = QPushButton()
+        self.command_task_header.setCheckable(True)
+        self.command_task_header.setChecked(self.command_task_panel_expanded)
+        self.command_task_header.setToolTip("Letzte Befehle ein- oder ausklappen")
+        self.command_task_header.clicked.connect(self.set_command_task_panel_expanded)
+        layout.addWidget(self.command_task_header)
+
+        self.command_task_list = QListWidget()
+        self.command_task_list.setMaximumHeight(150)
+        self.command_task_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.command_task_list.customContextMenuRequested.connect(self.show_command_task_context_menu)
+        self.command_task_list.itemDoubleClicked.connect(lambda item: self.rerun_command_task(self.command_task_from_item(item)))
+        layout.addWidget(self.command_task_list)
+        self.set_command_task_panel_expanded(self.command_task_panel_expanded)
+
         self.highlighter = TerminalHighlighter(self.output_area.document(), self.window.terminal_colors())
+        self._output_queue = []
+        self._output_drain_timer = QTimer(self)
+        self._output_drain_timer.setInterval(TERMINAL_OUTPUT_DRAIN_INTERVAL_MS)
+        self._output_drain_timer.timeout.connect(self.drain_terminal_output_queue)
+        self._highlighter_restore_timer = QTimer(self)
+        self._highlighter_restore_timer.setSingleShot(True)
+        self._highlighter_restore_timer.timeout.connect(self.restore_terminal_highlighter_if_safe)
 
         self.input_prompt_label = QLineEdit()
         self.input_prompt_label.setReadOnly(True)
@@ -600,6 +653,149 @@ class TerminalTab(QWidget):
 
         if self.window.default_command and self.process.waitForStarted(2000):
             self.run_startup_command(self.window.default_command)
+
+    def terminal_stdout_color(self):
+        return QColor(self.window.terminal_color("stdout", "#FFFFFF"))
+
+    def terminal_stderr_color(self):
+        return QColor(self.window.terminal_color("stderr", "#FCA5A5"))
+
+    def terminal_queue_split_index(self, text, limit):
+        if len(text) <= limit:
+            return len(text)
+        newline = text.rfind("\n", 0, limit)
+        if newline >= max(1, limit // 2):
+            return newline + 1
+        return limit
+
+    def wrap_extremely_long_output_lines(self, text):
+        """Avoid pathological single QTextDocument blocks.
+
+        QTextEdit and QSyntaxHighlighter become very expensive when one physical
+        line is hundreds of thousands of characters long, which can happen with
+        escaped JSON/diagnostic blobs containing literal "\\n" sequences.
+        Soft wrapping keeps normal text intact; this hard fallback only splits
+        extreme single lines so the UI stays responsive.
+        """
+        value = str(text or "")
+        limit = TERMINAL_OUTPUT_HARD_WRAP_COLUMN
+        if len(value) <= limit or max((len(line) for line in value.splitlines() or [value]), default=0) <= limit:
+            return value
+
+        wrapped = []
+        for line in value.splitlines(True):
+            line_break = ""
+            body = line
+            if body.endswith("\n"):
+                body = body[:-1]
+                line_break = "\n"
+            while len(body) > limit:
+                wrapped.append(body[:limit])
+                wrapped.append("\n")
+                body = body[limit:]
+            wrapped.append(body)
+            wrapped.append(line_break)
+        return "".join(wrapped)
+
+    def prepare_terminal_output_for_display(self, text):
+        return self.wrap_extremely_long_output_lines(str(text or ""))
+
+    def terminal_document_is_small_enough_for_highlighting(self):
+        document = self.output_area.document()
+        return (
+            document.characterCount() <= TERMINAL_HIGHLIGHT_MAX_DOCUMENT_CHARS
+            and document.blockCount() <= TERMINAL_HIGHLIGHT_MAX_BLOCKS
+        )
+
+    def suspend_terminal_highlighter_for_bulk_output(self):
+        if self.highlighter.document() is not None:
+            self.highlighter.setDocument(None)
+
+    def restore_terminal_highlighter_if_safe(self):
+        if self._output_queue:
+            return
+        if self.client_mode_active and self.client_mode_kind == "ollama_api":
+            return
+        if not self.terminal_document_is_small_enough_for_highlighting():
+            self.highlighter.set_terminal_colors(self.window.terminal_colors(), rehighlight=False)
+            return
+        if self.highlighter.document() is None:
+            self.highlighter.setDocument(self.output_area.document())
+        self.highlighter.set_terminal_colors(self.window.terminal_colors())
+
+    def queue_terminal_output(self, text, color=None):
+        value = self.prepare_terminal_output_for_display(text)
+        if not value:
+            return
+        qcolor = QColor(color) if color is not None else self.terminal_stdout_color()
+        if len(value) >= TERMINAL_OUTPUT_LARGE_CHUNK_CHARS or self._output_queue:
+            self.suspend_terminal_highlighter_for_bulk_output()
+        if self._output_queue and self._output_queue[-1][1] == qcolor:
+            # Gleichfarbige Chunks zusammenfassen: QProcess liefert oft viele
+            # kleine Häppchen, ein zusammenhängender Text lässt sich in einem
+            # Rutsch einfügen.
+            self._output_queue[-1][0] += value
+        else:
+            self._output_queue.append([value, qcolor])
+        if not self._output_drain_timer.isActive():
+            self._output_drain_timer.start()
+
+    def drain_terminal_output_queue(self):
+        if not self._output_queue:
+            self._output_drain_timer.stop()
+            self._highlighter_restore_timer.start(750)
+            return
+
+        pending = sum(len(item[0]) for item in self._output_queue)
+        if pending >= TERMINAL_OUTPUT_LARGE_CHUNK_CHARS:
+            self.suspend_terminal_highlighter_for_bulk_output()
+
+        deadline = time.perf_counter() + TERMINAL_OUTPUT_DRAIN_TIME_BUDGET_MS / 1000.0
+        self.output_area.setUpdatesEnabled(False)
+        try:
+            while self._output_queue:
+                # Eigener Cursor auf dem Dokument statt des Widget-Cursors:
+                # vermeidet Cursor-Signale/Auto-Scroll pro Einfügung, und
+                # begin/endEditBlock fasst einen ganzen Slice zu einer
+                # einzigen Dokumentänderung (= einer Layout-Neuvermessung)
+                # zusammen. Nach jedem Slice wird das Zeitbudget geprüft,
+                # sodass auch teure Layout-Läufe (z.B. beim Kürzen alter
+                # Blöcke) den UI-Thread nie länger als ~ein halbes Frame
+                # blockieren.
+                budget = TERMINAL_OUTPUT_DRAIN_SLICE_CHARS
+                cursor = QTextCursor(self.output_area.document())
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.beginEditBlock()
+                try:
+                    while self._output_queue and budget > 0:
+                        text, color = self._output_queue[0]
+                        take = self.terminal_queue_split_index(text, budget)
+                        part = text[:take]
+                        rest = text[take:]
+                        fmt = QTextCharFormat()
+                        fmt.setForeground(color)
+                        cursor.insertText(part, fmt)
+                        budget -= len(part)
+                        if rest:
+                            self._output_queue[0][0] = rest
+                            break
+                        self._output_queue.pop(0)
+                finally:
+                    cursor.endEditBlock()
+                if time.perf_counter() >= deadline:
+                    break
+        finally:
+            self.output_area.setUpdatesEnabled(True)
+
+        scrollbar = self.output_area.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+        if not self._output_queue:
+            self.output_area.setTextColor(self.terminal_stdout_color())
+            self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+            self.output_area.ensureCursorVisible()
+            self._output_drain_timer.stop()
+            self._highlighter_restore_timer.start(750)
 
     def compact_display_path(self, path_text):
         text = str(path_text or "").strip()
@@ -732,6 +928,9 @@ class TerminalTab(QWidget):
             translated = self.translate_cross_platform_command(command)
             if translated.lower() in {"cls", "clear"}:
                 self.output_area.clear()
+                self._awaiting_command_completion = False
+                if getattr(self, "interaction_prompt_active", False):
+                    self.reset_interaction_prompt_mode()
                 self.update_input_prompt_label()
                 continue
             if self.process.state() == QProcess.ProcessState.Running:
@@ -1043,6 +1242,22 @@ class TerminalTab(QWidget):
             self.process.write(byte_value)
             self.process.waitForBytesWritten(1000)
 
+    def send_return_key(self):
+        """Send a plain Return/Enter to the currently running process.
+
+        This is useful for prompts where the process expects an empty answer,
+        a confirmation with the default choice, or the final blank line of an
+        interactive command. It deliberately bypasses the lower input field and
+        the normal command history/task path.
+        """
+        if self.process and self.process.state() == QProcess.ProcessState.Running:
+            self.process.write(b"\n")
+            self.process.waitForBytesWritten(1000)
+            try:
+                self.window.show_status("Return/Enter an laufenden Prozess gesendet")
+            except Exception:
+                pass
+
     def show_terminal_context_menu(self, pos):
         sender = self.sender()
         if not hasattr(sender, "mapToGlobal"):
@@ -1199,6 +1414,10 @@ class TerminalTab(QWidget):
         menu.addAction(close_tab_action)
 
         signal_menu = menu.addMenu("Signal senden")
+        enter_action = signal_menu.addAction("Return/Enter")
+        enter_action.setToolTip("Eine leere Return-/Enter-Eingabe an den laufenden Prozess senden")
+        enter_action.triggered.connect(self.send_return_key)
+        signal_menu.addSeparator()
         sigint_action = signal_menu.addAction("Strg+C (SIGINT)")
         sigint_action.triggered.connect(lambda: self.send_control_character(b"\x03"))
         sigtstp_action = signal_menu.addAction("Strg+Z (SIGTSTP/Pause)")
@@ -1283,6 +1502,333 @@ class TerminalTab(QWidget):
         self.input_line.setPlainText(text)
         self.input_line.moveCursor(QTextCursor.MoveOperation.End)
         self.execute_command()
+
+
+
+    def update_command_task_header_label(self):
+        header = getattr(self, "command_task_header", None)
+        if header is None:
+            return
+        expanded = bool(getattr(self, "command_task_panel_expanded", False))
+        count = 0
+        task_list = getattr(self, "command_task_list", None)
+        if task_list is not None:
+            count = task_list.count()
+        arrow = "▾" if expanded else "▸"
+        suffix = f" ({count})" if count else ""
+        header.setText(f"{arrow} Letzte Befehle{suffix}")
+
+    def set_command_task_panel_expanded(self, expanded):
+        self.command_task_panel_expanded = bool(expanded)
+        header = getattr(self, "command_task_header", None)
+        if header is not None and header.isChecked() != self.command_task_panel_expanded:
+            header.setChecked(self.command_task_panel_expanded)
+        task_list = getattr(self, "command_task_list", None)
+        if task_list is not None:
+            task_list.setVisible(self.command_task_panel_expanded)
+            task_list.setMaximumHeight(150 if self.command_task_panel_expanded else 0)
+        self.update_command_task_header_label()
+
+    def command_task_time_label(self, value=None):
+        timestamp = float(value if value is not None else time.time())
+        return time.strftime("%H:%M:%S", time.localtime(timestamp))
+
+    def command_task_duration_label(self, task):
+        started = float(task.get("started_at") or time.time())
+        ended = task.get("ended_at")
+        reference = float(ended if ended is not None else time.time())
+        duration = max(0.0, reference - started)
+        if duration < 10:
+            return f"{duration:.1f}s"
+        return f"{duration:.0f}s"
+
+    def trim_command_task_text(self, value, limit=4000):
+        text = self.window.clean_output_text(str(value or "")) if hasattr(self.window, "clean_output_text") else str(value or "")
+        text = text.strip()
+        if len(text) <= limit:
+            return text
+        return text[-limit:].lstrip()
+
+    def command_task_status_icon(self, status):
+        text = str(status or "").lower()
+        if text == "läuft":
+            return "▶"
+        if text == "erfolgreich":
+            return "✓"
+        if text == "fehler":
+            return "✗"
+        return "?"
+
+    def command_task_display_text(self, task):
+        icon = self.command_task_status_icon(task.get("status"))
+        command = str(task.get("original_command") or task.get("sent_command") or "").replace("\n", " ⏎ ")
+        if len(command) > 95:
+            command = command[:92].rstrip() + "…"
+        duration = self.command_task_duration_label(task)
+        cwd = self.compact_display_path(task.get("working_directory", ""))
+        details = []
+        if duration:
+            details.append(duration)
+        if cwd:
+            details.append(cwd)
+        if task.get("pre_commands"):
+            details.append("mit Vorbefehl")
+        suffix = " — " + " | ".join(details) if details else ""
+        return f"{icon} {command}{suffix}"
+
+    def update_command_task_item(self, task):
+        item = task.get("item")
+        if item is None:
+            return
+        item.setText(self.command_task_display_text(task))
+        tooltip = [
+            f"Status: {task.get('status', 'unbekannt')}",
+            f"Originalbefehl: {task.get('original_command', '')}",
+            f"Gesendet: {task.get('sent_command', '')}",
+            f"Start: {self.command_task_time_label(task.get('started_at'))}",
+            f"Arbeitsordner: {task.get('working_directory', '')}",
+            f"Shell: {task.get('shell_type', '')}",
+            f"Engine: {task.get('terminal_engine', '')}",
+        ]
+        if task.get("pre_commands"):
+            tooltip.append(f"Vorbefehl: {task.get('pre_commands')}")
+        if task.get("ended_at"):
+            tooltip.append(f"Ende: {self.command_task_time_label(task.get('ended_at'))}")
+        if task.get("exit_code") is not None:
+            tooltip.append(f"Exit-Code: {task.get('exit_code')}")
+        if task.get("stderr"):
+            tooltip.append("\nFehler-Ausschnitt:\n" + str(task.get("stderr")))
+        elif task.get("stdout"):
+            tooltip.append("\nAusgabe-Ausschnitt:\n" + str(task.get("stdout")))
+        item.setToolTip("\n".join(tooltip))
+
+    def start_command_task(self, original_command, sent_command, pre_commands=""):
+        # Falls ShellDeck ausnahmsweise schon einen laufenden Task hat, wird er
+        # bewusst als unbekannt abgeschlossen. So hängt die UI nie dauerhaft auf
+        # "läuft", wenn eine Prompt-Erkennung nicht möglich war.
+        if self.active_command_task is not None and self.active_command_task.get("status") == "läuft":
+            self.finish_active_command_task(status="unbekannt")
+
+        task = {
+            "original_command": str(original_command or "").strip(),
+            "sent_command": str(sent_command or "").strip(),
+            "pre_commands": str(pre_commands or "").strip(),
+            "started_at": time.time(),
+            "ended_at": None,
+            "duration": None,
+            "working_directory": str(getattr(self, "current_working_directory", "") or ""),
+            "shell_type": str(getattr(self, "shell_type", "") or ""),
+            "terminal_engine": str(self.actual_terminal_engine()),
+            "exit_code": None,
+            "status": "läuft",
+            "stdout": "",
+            "stderr": "",
+            "item": None,
+        }
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, task)
+        task["item"] = item
+        self.command_tasks.append(task)
+        self.command_task_list.insertItem(0, item)
+        self.command_task_list.setCurrentItem(item)
+        while self.command_task_list.count() > 80:
+            self.command_task_list.takeItem(self.command_task_list.count() - 1)
+        self.update_command_task_header_label()
+        self.active_command_task = task
+        self.update_command_task_item(task)
+        return task
+
+    def append_active_command_task_sent_command(self, sent_command):
+        task = self.active_command_task
+        if task is None or task.get("status") != "läuft":
+            return
+        text = str(sent_command or "").strip()
+        if not text:
+            return
+        current = str(task.get("sent_command") or "").strip()
+        if not current:
+            task["sent_command"] = text
+        elif text not in current.split("\n"):
+            task["sent_command"] = current + "\n" + text
+        self.update_command_task_item(task)
+
+    def append_command_task_output(self, stream_name, text):
+        task = self.active_command_task
+        if task is None or task.get("status") != "läuft":
+            return
+        key = "stderr" if stream_name == "stderr" else "stdout"
+        task[key] = self.trim_command_task_text(str(task.get(key) or "") + str(text or ""))
+        self.update_command_task_item(task)
+
+    def finish_active_command_task(self, status="", exit_code=None):
+        task = self.active_command_task
+        if task is None:
+            return
+        if task.get("status") != "läuft":
+            return
+        stderr = str(task.get("stderr") or "").strip()
+        if not status:
+            status = "Fehler" if stderr else "erfolgreich"
+        task["status"] = status
+        task["ended_at"] = time.time()
+        task["duration"] = max(0.0, float(task["ended_at"]) - float(task.get("started_at") or task["ended_at"]))
+        if exit_code is not None:
+            task["exit_code"] = int(exit_code)
+            if int(exit_code) != 0:
+                task["status"] = "Fehler"
+            elif status in {"", "unbekannt"}:
+                task["status"] = "erfolgreich"
+        self.update_command_task_item(task)
+        self.active_command_task = None
+
+    def finish_active_command_task_if_prompt_returned(self):
+        task = self.active_command_task
+        if task is None or task.get("status") != "läuft":
+            return
+        if self.output_ends_with_shell_prompt(self.terminal_output_text_for_state_checks()):
+            self.finish_active_command_task()
+
+    def command_task_from_item(self, item):
+        if item is None:
+            return None
+        task = item.data(Qt.ItemDataRole.UserRole)
+        return task if isinstance(task, dict) else None
+
+    def selected_command_task(self):
+        return self.command_task_from_item(self.command_task_list.currentItem())
+
+    def rerun_command_task(self, task=None):
+        task = task or self.selected_command_task()
+        if not task:
+            return
+        command = str(task.get("original_command") or task.get("sent_command") or "").strip()
+        if not command:
+            return
+        self.run_text_command(command)
+
+    def command_task_details_text(self, task):
+        if not task:
+            return ""
+        lines = [
+            f"Status: {task.get('status', 'unbekannt')}",
+            f"Originalbefehl: {task.get('original_command', '')}",
+            f"Gesendet: {task.get('sent_command', '')}",
+            f"Start: {self.command_task_time_label(task.get('started_at'))}",
+            f"Arbeitsordner: {task.get('working_directory', '')}",
+            f"Shell: {task.get('shell_type', '')}",
+            f"Engine: {task.get('terminal_engine', '')}",
+        ]
+        if task.get("pre_commands"):
+            lines.append(f"Vorbefehl: {task.get('pre_commands')}")
+        if task.get("ended_at"):
+            lines.append(f"Ende: {self.command_task_time_label(task.get('ended_at'))}")
+        if task.get("duration") is not None:
+            lines.append(f"Dauer: {self.command_task_duration_label(task)}")
+        if task.get("exit_code") is not None:
+            lines.append(f"Exit-Code: {task.get('exit_code')}")
+        stdout = str(task.get("stdout") or "").strip()
+        stderr = str(task.get("stderr") or "").strip()
+        if stdout:
+            lines.extend(["", "Ausgabe-Ausschnitt:", stdout])
+        if stderr:
+            lines.extend(["", "Fehler-Ausschnitt:", stderr])
+        return "\n".join(lines)
+
+    def all_command_tasks_text(self):
+        lines = []
+        for task in self.command_tasks:
+            lines.append(self.command_task_details_text(task))
+        return "\n\n---\n\n".join(line for line in lines if line.strip())
+
+    def delete_command_task(self, task=None):
+        task = task or self.selected_command_task()
+        if not task:
+            return
+        item = task.get("item")
+        if item is not None:
+            row = self.command_task_list.row(item)
+            if row >= 0:
+                self.command_task_list.takeItem(row)
+        if task in self.command_tasks:
+            self.command_tasks.remove(task)
+        if self.active_command_task is task:
+            self.active_command_task = None
+        self.update_command_task_header_label()
+
+    def clear_command_tasks(self):
+        self.command_tasks.clear()
+        self.active_command_task = None
+        self.command_task_list.clear()
+        self.update_command_task_header_label()
+
+    def show_command_task_context_menu(self, pos):
+        item = self.command_task_list.itemAt(pos)
+        if item is not None:
+            self.command_task_list.setCurrentItem(item)
+        task = self.command_task_from_item(item)
+
+        menu = QMenu(self)
+
+        rerun_action = QAction("Befehl erneut ausführen", self)
+        rerun_action.setEnabled(bool(task))
+        rerun_action.triggered.connect(lambda: self.rerun_command_task(task))
+        menu.addAction(rerun_action)
+
+        delete_action = QAction("Diesen Befehl löschen", self)
+        delete_action.setEnabled(bool(task))
+        delete_action.triggered.connect(lambda: self.delete_command_task(task))
+        menu.addAction(delete_action)
+
+        clear_action = QAction("Letzte Befehle leeren", self)
+        clear_action.setEnabled(bool(self.command_tasks))
+        clear_action.triggered.connect(self.clear_command_tasks)
+        menu.addAction(clear_action)
+
+        menu.addSeparator()
+
+        copy_original_action = QAction("Originalbefehl kopieren", self)
+        copy_original_action.setEnabled(bool(task))
+        copy_original_action.triggered.connect(lambda: QApplication.clipboard().setText(str(task.get("original_command") or "") if task else ""))
+        menu.addAction(copy_original_action)
+
+        copy_sent_action = QAction("Gesendeten Befehl kopieren", self)
+        copy_sent_action.setEnabled(bool(task))
+        copy_sent_action.triggered.connect(lambda: QApplication.clipboard().setText(str(task.get("sent_command") or "") if task else ""))
+        menu.addAction(copy_sent_action)
+
+        copy_details_action = QAction("Befehlsdetails kopieren", self)
+        copy_details_action.setEnabled(bool(task))
+        copy_details_action.triggered.connect(lambda: QApplication.clipboard().setText(self.command_task_details_text(task)))
+        menu.addAction(copy_details_action)
+
+        copy_all_action = QAction("Alle Befehlsdetails kopieren", self)
+        copy_all_action.setEnabled(bool(self.command_tasks))
+        copy_all_action.triggered.connect(lambda: QApplication.clipboard().setText(self.all_command_tasks_text()))
+        menu.addAction(copy_all_action)
+
+        copy_stdout_action = QAction("Ausgabe kopieren", self)
+        copy_stdout_action.setEnabled(bool(task and str(task.get("stdout") or "").strip()))
+        copy_stdout_action.triggered.connect(lambda: QApplication.clipboard().setText(str(task.get("stdout") or "") if task else ""))
+        menu.addAction(copy_stdout_action)
+
+        copy_stderr_action = QAction("Fehlerausgabe kopieren", self)
+        copy_stderr_action.setEnabled(bool(task and str(task.get("stderr") or "").strip()))
+        copy_stderr_action.triggered.connect(lambda: QApplication.clipboard().setText(str(task.get("stderr") or "") if task else ""))
+        menu.addAction(copy_stderr_action)
+
+        menu.addSeparator()
+
+        expand_action = QAction("Letzte Befehle ausklappen", self)
+        expand_action.setEnabled(not bool(getattr(self, "command_task_panel_expanded", False)))
+        expand_action.triggered.connect(lambda: self.set_command_task_panel_expanded(True))
+        menu.addAction(expand_action)
+
+        collapse_action = QAction("Letzte Befehle einklappen", self)
+        collapse_action.setEnabled(bool(getattr(self, "command_task_panel_expanded", False)))
+        collapse_action.triggered.connect(lambda: self.set_command_task_panel_expanded(False))
+        menu.addAction(collapse_action)
+
+        menu.exec(self.command_task_list.mapToGlobal(pos))
 
     def command_sequence_from_text(self, command_text, *, include_prefix=True):
         commands = []
@@ -1942,25 +2488,17 @@ class TerminalTab(QWidget):
         if self.client_process is None:
             return
         data = self._decode_process_output(self.client_process.readAllStandardOutput())
-        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.insertPlainText(data)
-        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.ensureCursorVisible()
+        self.queue_terminal_output(data)
 
     def handle_client_stderr(self):
         if self.client_process is None:
             return
         data = self._decode_process_output(self.client_process.readAllStandardError())
-        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.setTextColor(QColor(self.window.terminal_color("stderr", "#FCA5A5")))
-        self.output_area.insertPlainText(data)
-        self.output_area.setTextColor(QColor(self.window.terminal_color("stdout", "#FFFFFF")))
-        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.ensureCursorVisible()
+        self.queue_terminal_output(data, self.terminal_stderr_color())
 
     def handle_client_finished(self, exit_code, exit_status):
         label = self.client_mode_name or "Client"
-        self.output_area.append(f"\n[{label}-Client beendet, Exitcode {exit_code}]\n")
+        self.queue_terminal_output(f"\n[{label}-Client beendet, Exitcode {exit_code}]\n")
         if self.client_process is not None:
             self.client_process.deleteLater()
             self.client_process = None
@@ -2040,14 +2578,14 @@ class TerminalTab(QWidget):
         if text:
             self.last_ollama_code_blocks = extract_code_blocks(text)
             html = ollama_answer_to_html(text)
-            self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-            if html:
+            if html and len(html) <= OLLAMA_HTML_INLINE_RENDER_LIMIT and len(text) <= OLLAMA_HTML_INLINE_RENDER_LIMIT:
+                self.output_area.moveCursor(QTextCursor.MoveOperation.End)
                 self.output_area.insertHtml(html)
                 self.output_area.insertPlainText("\n")
+                self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+                self.output_area.ensureCursorVisible()
             else:
-                self.output_area.insertPlainText(f"\nOllama → {text}\n")
-            self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-            self.output_area.ensureCursorVisible()
+                self.queue_terminal_output(f"\nOllama → {text}\n")
         else:
             self.output_area.append("\n[Ollama hat keine sichtbare Antwort geliefert.]\n")
 
@@ -2172,8 +2710,7 @@ class TerminalTab(QWidget):
             if self.highlighter.document() is not None:
                 self.highlighter.setDocument(None)
         elif self.highlighter.document() is None:
-            self.highlighter.setDocument(self.output_area.document())
-            self.highlighter.set_terminal_colors(self.window.terminal_colors())
+            self.restore_terminal_highlighter_if_safe()
 
         if self.client_mode_active:
             label = self.client_mode_name or "interaktiver Client"
@@ -2408,22 +2945,44 @@ class TerminalTab(QWidget):
         last = lines[-1]
         return bool(re.search(r"^(?:>>|\.\.>|>>>|\.\.\.|dquote>|quote>|pipe>)\s*$", last, re.IGNORECASE))
 
+    def terminal_output_text_for_state_checks(self):
+        """Return visible output plus queued text that is not painted yet.
+
+        Terminal output is drained asynchronously for UI performance. The shell
+        prompt can already be in ``_output_queue`` while ``output_area`` still
+        does not contain it. State checks must include that queued text,
+        otherwise a finished command can be mistaken for an interactive/running
+        process and the next normal command bypasses history, Vorbefehl and
+        command translation.
+        """
+        try:
+            output = self.output_area.toPlainText()
+        except Exception:
+            output = ""
+        try:
+            queued = "".join(str(item[0] or "") for item in getattr(self, "_output_queue", []) if item)
+        except Exception:
+            queued = ""
+        return output + queued
+
     def command_appears_to_be_running(self):
         if not getattr(self, "_awaiting_command_completion", False):
             return False
         if getattr(self, "client_mode_active", False) or getattr(self, "password_prompt_active", False):
             return False
-        try:
-            output = self.output_area.toPlainText()
-        except Exception:
+        output = self.terminal_output_text_for_state_checks()
+        if self.output_ends_with_shell_prompt(output):
+            self._awaiting_command_completion = False
+            self.finish_active_command_task_if_prompt_returned()
             return False
-        return not self.output_ends_with_shell_prompt(output)
+        if self.output_ends_with_continuation_prompt(output):
+            return True
+        if self.output_contains_interactive_prompt(output):
+            return True
+        return True
 
     def update_command_completion_state_from_output(self):
-        try:
-            output = self.output_area.toPlainText()
-        except Exception:
-            output = ""
+        output = self.terminal_output_text_for_state_checks()
         if self.output_ends_with_shell_prompt(output):
             self._awaiting_command_completion = False
             if getattr(self, "interaction_prompt_active", False):
@@ -2489,7 +3048,7 @@ class TerminalTab(QWidget):
 
     def visible_output_waits_for_interaction(self):
         try:
-            return self.output_contains_interactive_prompt(self.output_area.toPlainText())
+            return self.output_contains_interactive_prompt(self.terminal_output_text_for_state_checks())
         except Exception:
             return False
 
@@ -2728,8 +3287,17 @@ class TerminalTab(QWidget):
             self.send_client_input(command_text)
             return
 
-        commands = self.command_sequence_from_text(command_text, include_prefix=True)
-        if not commands:
+        prefix_text = ""
+        prefix_commands = []
+        if not self.client_mode_active:
+            prefix_text = self.window.active_pre_command_text()
+            if prefix_text:
+                self.window.remember_pre_command_text(prefix_text)
+                prefix_commands = self.command_sequence_from_text(prefix_text, include_prefix=False)
+
+        user_commands = self.command_sequence_from_text(command_text, include_prefix=False)
+        commands_with_origin = [(command, False) for command in prefix_commands] + [(command, True) for command in user_commands]
+        if not commands_with_origin:
             return
 
         history_entry = command_text
@@ -2738,8 +3306,9 @@ class TerminalTab(QWidget):
         self.history_index = -1
         self.current_command = ""
 
-        for command in commands:
-            command = self.translate_cross_platform_command(command)
+        task_started = False
+        for raw_command, is_user_command in commands_with_origin:
+            command = self.translate_cross_platform_command(raw_command)
             ollama_model = self.parse_ollama_run_model(command)
             if ollama_model:
                 self.start_ollama_prompt_mode(ollama_model)
@@ -2749,14 +3318,31 @@ class TerminalTab(QWidget):
                 self.start_direct_client_process(direct_client)
                 continue
             if command.lower() in ("cls", "clear"):
+                if is_user_command and not task_started:
+                    self.start_command_task(command_text, command, prefix_text)
+                    task_started = True
+                elif is_user_command:
+                    self.append_active_command_task_sent_command(command)
                 self.output_area.clear()
+                self._awaiting_command_completion = False
+                if getattr(self, "interaction_prompt_active", False):
+                    self.reset_interaction_prompt_mode()
+                if is_user_command:
+                    self.finish_active_command_task(status="erfolgreich")
                 self.update_input_prompt_label()
             elif self.process.state() != QProcess.ProcessState.Running:
                 self.output_area.append(
                     f"Shell ist nicht aktiv: {self.process.errorString() or 'Prozess wurde beendet.'}"
                 )
+                if is_user_command and task_started:
+                    self.finish_active_command_task(status="Fehler")
                 break
             else:
+                if is_user_command and not task_started:
+                    self.start_command_task(command_text, command, prefix_text)
+                    task_started = True
+                elif is_user_command:
+                    self.append_active_command_task_sent_command(command)
                 self.write_shell_command(command)
                 prompt_text = self.extract_interactive_prompt_from_command(command)
                 if prompt_text:
@@ -2927,37 +3513,34 @@ class TerminalTab(QWidget):
 
     def handle_stdout(self):
         data = self.decoded_terminal_output(self.process.readAllStandardOutput())
-        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.insertPlainText(data)
-        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.ensureCursorVisible()
+        self.queue_terminal_output(data)
+        self.append_command_task_output("stdout", data)
         self.handle_possible_password_prompt(data)
         self.handle_possible_interactive_prompt(data)
         self.refresh_password_prompt_state_after_output()
         self.refresh_interaction_prompt_state_after_output()
+        self.finish_active_command_task_if_prompt_returned()
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_stderr(self):
         data = self.decoded_terminal_output(self.process.readAllStandardError())
-        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.setTextColor(QColor(self.window.terminal_color("stderr", "#FCA5A5")))
-        self.output_area.insertPlainText(data)
-        self.output_area.setTextColor(QColor(self.window.terminal_color("stdout", "#FFFFFF")))
-        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_area.ensureCursorVisible()
+        self.queue_terminal_output(data, self.terminal_stderr_color())
+        self.append_command_task_output("stderr", data)
         self.handle_possible_password_prompt(data)
         self.handle_possible_interactive_prompt(data)
         self.refresh_password_prompt_state_after_output()
         self.refresh_interaction_prompt_state_after_output()
+        self.finish_active_command_task_if_prompt_returned()
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_finished(self, exit_code, exit_status):
         self.set_client_mode(False)
-        self.output_area.append(f"\nProcess finished with exit code {exit_code}")
+        self.finish_active_command_task(status=("erfolgreich" if int(exit_code) == 0 else "Fehler"), exit_code=exit_code)
+        self.queue_terminal_output(f"\nProcess finished with exit code {exit_code}")
 
     def handle_process_error(self, error):
         self.set_client_mode(False)
-        self.output_area.append(f"\nShell konnte nicht gestartet werden: {self.process.errorString()}")
+        self.queue_terminal_output(f"\nShell konnte nicht gestartet werden: {self.process.errorString()}")
 
     def set_terminal_font(self, font):
         self.output_area.setFont(font)
@@ -3009,7 +3592,10 @@ class TerminalTab(QWidget):
             "}"
         )
         self.output_area.setTextColor(QColor(stdout_color))
-        self.highlighter.set_terminal_colors(terminal_colors)
+        if self.terminal_document_is_small_enough_for_highlighting():
+            self.highlighter.set_terminal_colors(terminal_colors)
+        else:
+            self.highlighter.set_terminal_colors(terminal_colors, rehighlight=False)
         self.input_line.setStyleSheet(
             "QPlainTextEdit {"
             f" background-color: {input_background_rgba};"
@@ -6612,6 +7198,9 @@ class TerminalWindow(QMainWindow):
         if not isinstance(tab, TerminalTab):
             return ""
         text = tab.output_area.toPlainText()
+        pending_queue = getattr(tab, "_output_queue", [])
+        if pending_queue:
+            text += "".join(str(item[0]) for item in pending_queue if item)
         return self.clean_output_text(text) if clean else text
 
     def save_current_output(self, forced_format=None):
