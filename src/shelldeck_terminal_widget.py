@@ -67,6 +67,46 @@ TERMINAL_HIGHLIGHT_MAX_LINE_CHARS = 3000
 OLLAMA_HTML_INLINE_RENDER_LIMIT = 180000
 
 
+def command_targets_shelldeck(command):
+    """Erkennt Befehle, die ShellDeck selbst (neu) starten würden.
+
+    Solche Befehle dürfen niemals automatisch ausgeführt werden — weder beim
+    App-Start noch beim Tab-/Workspace-Restore noch über Standard- oder
+    Profil-Startbefehle. Sonst entsteht eine Endlosschleife aus sich selbst
+    startenden Fenstern (z.B. wenn ShellDeck aus einem ShellDeck-Terminal mit
+    "python src/main.py" gestartet wurde). Manuelle Eingaben des Benutzers
+    bleiben davon unberührt.
+    """
+    text = str(command or "").strip()
+    if not text:
+        return False
+    if "shelldeck" in text.lower():
+        return True
+    try:
+        app_path = Path(sys.argv[0]).resolve()
+    except (OSError, RuntimeError):
+        app_path = None
+    normalized = text.replace("\\", "/")
+    try:
+        tokens = shlex.split(normalized, posix=(sys.platform != "win32"))
+    except ValueError:
+        tokens = normalized.split()
+    relative_self = {"main.py", "./main.py", "src/main.py", "./src/main.py"}
+    for token in tokens:
+        cleaned = str(token).strip("\"'")
+        if not cleaned.lower().endswith("main.py"):
+            continue
+        if cleaned.lower() in relative_self:
+            return True
+        if app_path is not None:
+            try:
+                if Path(cleaned).resolve() == app_path:
+                    return True
+            except (OSError, RuntimeError):
+                continue
+    return False
+
+
 
 class _NullStatusBar:
     """Platzhalter fuer QMainWindow.statusBar() im Standalone-Betrieb."""
@@ -1270,6 +1310,40 @@ class ShellDeckTerminalWidget(QWidget):
         end_cursor.movePosition(QTextCursor.MoveOperation.End)
         self.output_area.setTextCursor(end_cursor)
 
+    def paste_into_inline_input(self):
+        """Fügt die Zwischenablage in die Inline-Eingabe hinter dem Prompt ein."""
+        if not (self.inline_mode_active() and self.inline_markers_valid()):
+            return
+        self.move_inline_cursor_into_input_region()
+        clipboard_text = QApplication.clipboard().text()
+        if not clipboard_text:
+            return
+        paste_cursor = self.output_area.textCursor()
+        paste_cursor.insertText(clipboard_text, self.inline_input_char_format())
+        self.output_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.output_area.ensureCursorVisible()
+
+    def inline_selection_in_input_region(self):
+        """True, wenn die aktuelle Auswahl vollständig in der Eingabe liegt."""
+        if not (self.inline_mode_active() and self.inline_markers_valid()):
+            return False
+        cursor = self.output_area.textCursor()
+        if not cursor.hasSelection():
+            return False
+        return min(cursor.position(), cursor.anchor()) >= self._inline_input_cursor.position()
+
+    def cut_inline_selection(self):
+        """Schneidet markierten Text aus der Inline-Eingabe aus.
+
+        Nur Auswahlen innerhalb der Eingabezeile werden ausgeschnitten; die
+        Ausgabe-Historie oberhalb des Prompts bleibt schreibgeschützt.
+        """
+        if not self.inline_selection_in_input_region():
+            return
+        cursor = self.output_area.textCursor()
+        QApplication.clipboard().setText(cursor.selectedText().replace(chr(0x2029), "\n"))
+        cursor.removeSelectedText()
+
     def handle_inline_terminal_key(self, event):
         """Tastenbehandlung im Reines-Terminal-Modus.
 
@@ -1298,12 +1372,10 @@ class ShellDeckTerminalWidget(QWidget):
                 self.interrupt_current_command()
             return True
         if ctrl and key == Qt.Key.Key_V:
-            self.move_inline_cursor_into_input_region()
-            clipboard_text = QApplication.clipboard().text()
-            if clipboard_text:
-                paste_cursor = output_area.textCursor()
-                paste_cursor.insertText(clipboard_text, self.inline_input_char_format())
-                output_area.moveCursor(QTextCursor.MoveOperation.End)
+            self.paste_into_inline_input()
+            return True
+        if ctrl and key == Qt.Key.Key_X:
+            self.cut_inline_selection()
             return True
         if ctrl and key == Qt.Key.Key_L:
             self.clear_terminal_output()
@@ -1534,6 +1606,11 @@ class ShellDeckTerminalWidget(QWidget):
     def run_startup_command(self, command_text):
         for command in self.command_sequence_from_text(command_text, include_prefix=False):
             translated = self.translate_cross_platform_command(command)
+            if command_targets_shelldeck(translated):
+                self.output_area.append(
+                    f"\n[Automatischer Startbefehl übersprungen (zeigt auf ShellDeck selbst): {translated}]\n"
+                )
+                continue
             if translated.lower() in {"cls", "clear"}:
                 self.output_area.clear()
                 self._awaiting_command_completion = False
@@ -1880,6 +1957,19 @@ class ShellDeckTerminalWidget(QWidget):
             copy_action.setEnabled(bool(self.output_area.textCursor().hasSelection()))
             copy_action.triggered.connect(self.output_area.copy)
             menu.addAction(copy_action)
+
+            if self.inline_mode_active():
+                paste_action = QAction("Einfügen", self)
+                paste_action.setToolTip("Zwischenablage in die Eingabe hinter dem Prompt einfügen")
+                paste_action.setEnabled(bool(QApplication.clipboard().text()))
+                paste_action.triggered.connect(self.paste_into_inline_input)
+                menu.addAction(paste_action)
+
+                cut_action = QAction("Ausschneiden", self)
+                cut_action.setToolTip("Markierten Text aus der Eingabe ausschneiden (Ausgabe-Historie bleibt geschützt)")
+                cut_action.setEnabled(self.inline_selection_in_input_region())
+                cut_action.triggered.connect(self.cut_inline_selection)
+                menu.addAction(cut_action)
 
             copy_all_action = QAction("Alles kopieren", self)
             copy_all_action.setToolTip("Gesamte Ausgabe kopieren")
@@ -2886,6 +2976,21 @@ class ShellDeckTerminalWidget(QWidget):
         QTimer.singleShot(int(delay_ms), lambda t=text: self.run_restore_command(t))
         return True
 
+    def is_safe_restore_command(self, command):
+        """Beim Restore werden nur venv-Aktivierungen automatisch ausgeführt.
+
+        Gespeicherte letzte Befehle sind reine Historie/Anzeige. Alles, was
+        keine venv-Aktivierung ist — insbesondere Befehle, die auf ShellDeck
+        selbst zeigen (z.B. "python src/main.py") — wird beim Start, Tab- oder
+        Workspace-Restore niemals automatisch erneut ausgeführt.
+        """
+        text = str(command or "").strip()
+        if not text:
+            return False
+        if command_targets_shelldeck(text):
+            return False
+        return bool(self.command_looks_like_venv_activation(text))
+
     def run_restore_command(self, command=None):
         text = str(command or "").strip() or self.current_restore_command()
         if not text:
@@ -2893,6 +2998,11 @@ class ShellDeckTerminalWidget(QWidget):
         normalizer = getattr(self.window, "normalize_restore_command_for_shell", None)
         if callable(normalizer):
             text = normalizer(text, self.shell_type)
+        if not self.is_safe_restore_command(text):
+            self.output_area.append(
+                f"\n[Gespeicherter Befehl wird beim Start nicht automatisch ausgeführt: {text}]\n"
+            )
+            return False
         self.restore_command = text
         if self.client_mode_active:
             return False
@@ -4369,6 +4479,7 @@ __all__ = [
     "ShellDeckTerminalWidget",
     "TerminalTab",
     "DefaultTerminalHost",
+    "command_targets_shelldeck",
     "TerminalOutputArea",
     "TerminalHighlighter",
     "OllamaApiWorker",

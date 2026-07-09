@@ -36,6 +36,7 @@ from PySide6.QtGui import (
 from shelldeck_terminal_widget import (
     ShellDeckTerminalWidget, TerminalTab, DefaultTerminalHost,
     PtyTerminalProcess, TerminalOutputArea, TerminalHighlighter,
+    command_targets_shelldeck,
 )
 
 LOG_FILE = Path.home() / "TerminalApp.log"
@@ -1534,7 +1535,12 @@ class TerminalWindow(QMainWindow):
         elif ollama_model and not self.ai_features_enabled:
             tab.output_area.append("[KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.]\n")
         elif startup_command:
-            tab.run_text_command(startup_command)
+            if command_targets_shelldeck(startup_command):
+                tab.append_system_message(
+                    f"[Profil-Startbefehl übersprungen (zeigt auf ShellDeck selbst): {startup_command}]"
+                )
+            else:
+                tab.run_text_command(startup_command)
 
     def merge_workspaces_by_name(self, *workspace_lists):
         merged = []
