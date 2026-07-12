@@ -137,6 +137,10 @@ class TerminalWindow(QMainWindow):
         self.pre_command_enabled = False
         self.pre_command_text = ""
         self.pre_command_history = []
+        # Im Modus „Reines Terminal“ zeichnet ShellDeck einen eigenen, editierbaren
+        # Prompt. Der native Shell-Prompt wird dort ausgeblendet, damit nicht beide
+        # Prompt-Zeilen direkt hintereinander erscheinen.
+        self.hide_native_prompt_in_pure_terminal = True
         self.detached_windows = []
         self.history_file = Path.home() / ".visual_edit_terminal_history"
         self.settings_file = Path.home() / ".visual_edit_terminal_settings.json"
@@ -190,30 +194,55 @@ class TerminalWindow(QMainWindow):
         self.workspaces_menu = menubar.addMenu("&Workspaces")
 
         self.view_menu = menubar.addMenu("&Ansicht")
+        self.view_menu.setToolTipsVisible(True)
+        self.view_menu.aboutToShow.connect(self.update_view_menu_state)
 
         self.pre_command_bar_action = QAction("Vorbefehl-Leiste anzeigen", self)
+        self.pre_command_bar_action.setToolTip("Blendet die obere Vorbefehl-Leiste ein oder aus.")
         self.pre_command_bar_action.setCheckable(True)
         self.pre_command_bar_action.setChecked(True)
         self.pre_command_bar_action.triggered.connect(self.set_pre_command_bar_visible)
         self.view_menu.addAction(self.pre_command_bar_action)
+
+        self.command_task_panel_action = QAction("Letzte Befehle anzeigen", self)
+        self.command_task_panel_action.setToolTip("Blendet die komplette Tabelle der letzten Befehle im aktuellen Tab ein oder aus.")
+        self.command_task_panel_action.setCheckable(True)
+        self.command_task_panel_action.triggered.connect(self.set_current_command_task_panel_visible)
+        self.view_menu.addAction(self.command_task_panel_action)
+
+        self.command_task_expand_action = QAction("Letzte Befehle ausklappen", self)
+        self.command_task_expand_action.setToolTip("Klappt die Tabelle der letzten Befehle im aktuellen Tab auf oder zu.")
+        self.command_task_expand_action.setCheckable(True)
+        self.command_task_expand_action.triggered.connect(self.set_current_command_task_panel_expanded)
+        self.view_menu.addAction(self.command_task_expand_action)
+
+        self.pure_terminal_view_action = QAction("Reines Terminal", self)
+        self.pure_terminal_view_action.setToolTip("Schaltet den aktuellen Tab auf direkte Eingabe im Terminalbereich um. Tastenkürzel: Ctrl+Shift+E.")
+        self.pure_terminal_view_action.setCheckable(True)
+        self.pure_terminal_view_action.triggered.connect(self.set_current_pure_terminal_mode)
+        self.view_menu.addAction(self.pure_terminal_view_action)
         self.view_menu.addSeparator()
 
         self.view_single_action = QAction("Einzelansicht", self)
+        self.view_single_action.setToolTip("Zeigt nur eine Terminal-Tabfläche.")
         self.view_single_action.setCheckable(True)
         self.view_single_action.triggered.connect(lambda checked=False: self.set_view_layout_mode("single"))
         self.view_menu.addAction(self.view_single_action)
 
         self.split_view_action = QAction("2er horizontal: links | rechts", self)
+        self.split_view_action.setToolTip("Teilt die Oberfläche in zwei nebeneinanderliegende Terminalbereiche.")
         self.split_view_action.setCheckable(True)
         self.split_view_action.triggered.connect(lambda checked=False: self.set_view_layout_mode("horizontal"))
         self.view_menu.addAction(self.split_view_action)
 
         self.view_vertical_action = QAction("2er vertikal: oben / unten", self)
+        self.view_vertical_action.setToolTip("Teilt die Oberfläche in zwei übereinanderliegende Terminalbereiche.")
         self.view_vertical_action.setCheckable(True)
         self.view_vertical_action.triggered.connect(lambda checked=False: self.set_view_layout_mode("vertical"))
         self.view_menu.addAction(self.view_vertical_action)
 
         self.view_quad_action = QAction("4er Raster", self)
+        self.view_quad_action.setToolTip("Zeigt vier Terminalbereiche im Raster.")
         self.view_quad_action.setCheckable(True)
         self.view_quad_action.triggered.connect(lambda checked=False: self.set_view_layout_mode("quad"))
         self.view_menu.addAction(self.view_quad_action)
@@ -223,15 +252,18 @@ class TerminalWindow(QMainWindow):
         self.rebuild_move_view_menu()
 
         self.move_to_other_view_action = QAction("Aktuellen Tab in nächste Ansicht verschieben", self)
+        self.move_to_other_view_action.setToolTip("Verschiebt den aktiven Tab in den nächsten sichtbaren Layout-Bereich.")
         self.move_to_other_view_action.triggered.connect(self.move_current_tab_to_other_view)
         self.view_menu.addAction(self.move_to_other_view_action)
 
         self.view_menu.addSeparator()
         self.detach_current_tab_action = QAction("Aktuellen Tab entkoppeln", self)
+        self.detach_current_tab_action.setToolTip("Verschiebt den aktuellen Tab in ein separates Fenster.")
         self.detach_current_tab_action.triggered.connect(self.detach_current_tab)
         self.view_menu.addAction(self.detach_current_tab_action)
 
         self.reattach_current_tab_action = QAction("Aktuellen Tab wieder ins Hauptfenster koppeln", self)
+        self.reattach_current_tab_action.setToolTip("Holt einen entkoppelten Tab zurück ins Hauptfenster.")
         self.reattach_current_tab_action.triggered.connect(self.reattach_current_tab)
         self.view_menu.addAction(self.reattach_current_tab_action)
 
@@ -1768,6 +1800,10 @@ class TerminalWindow(QMainWindow):
                     )
                 else:
                     tab.schedule_restore_command(item.get("restore_command", ""))
+                if "command_task_panel_visible" in item:
+                    tab.set_command_task_panel_visible(bool(item.get("command_task_panel_visible", True)), save=False)
+                if "command_task_panel_expanded" in item:
+                    tab.set_command_task_panel_expanded(bool(item.get("command_task_panel_expanded", False)))
                 if item.get("pure_terminal_mode"):
                     tab.set_pure_terminal_mode(True, focus=False, save=False)
             restored = True
@@ -2021,6 +2057,46 @@ class TerminalWindow(QMainWindow):
             tab.clear_terminal_output()
             self.show_status("Ausgabe geleert")
 
+    def update_view_menu_state(self):
+        tab = self.current_terminal()
+        is_terminal = isinstance(tab, TerminalTab)
+        if hasattr(self, "command_task_panel_action"):
+            self.command_task_panel_action.setEnabled(is_terminal)
+            self.command_task_panel_action.setChecked(bool(is_terminal and getattr(tab, "command_task_panel_visible", True)))
+        if hasattr(self, "command_task_expand_action"):
+            self.command_task_expand_action.setEnabled(is_terminal and bool(getattr(tab, "command_task_panel_visible", True)))
+            self.command_task_expand_action.setChecked(bool(is_terminal and getattr(tab, "command_task_panel_expanded", False)))
+        if hasattr(self, "pure_terminal_view_action"):
+            self.pure_terminal_view_action.setEnabled(is_terminal)
+            self.pure_terminal_view_action.setChecked(bool(is_terminal and tab.inline_mode_active()))
+
+    def set_current_command_task_panel_visible(self, checked):
+        tab = self.current_terminal()
+        if isinstance(tab, TerminalTab):
+            tab.set_command_task_panel_visible(bool(checked))
+            self.show_status("Letzte Befehle eingeblendet" if checked else "Letzte Befehle ausgeblendet")
+            self.update_view_menu_state()
+
+    def set_current_command_task_panel_expanded(self, checked):
+        tab = self.current_terminal()
+        if isinstance(tab, TerminalTab):
+            if checked and not bool(getattr(tab, "command_task_panel_visible", True)):
+                tab.set_command_task_panel_visible(True)
+            tab.set_command_task_panel_expanded(bool(checked))
+            self.show_status("Letzte Befehle ausgeklappt" if checked else "Letzte Befehle eingeklappt")
+            self.update_view_menu_state()
+            self.save_settings()
+
+    def set_current_pure_terminal_mode(self, checked):
+        tab = self.current_terminal()
+        if isinstance(tab, TerminalTab):
+            tab.set_pure_terminal_mode(bool(checked))
+            if tab.inline_mode_active():
+                self.show_status("Reines Terminal aktiv – Eingabe direkt in der Ausgabe")
+            else:
+                self.show_status("Klassischer Modus aktiv – separates Eingabefeld")
+            self.update_view_menu_state()
+
     def toggle_current_pure_terminal_mode(self):
         tab = self.current_terminal()
         if isinstance(tab, TerminalTab):
@@ -2029,6 +2105,7 @@ class TerminalWindow(QMainWindow):
                 self.show_status("Reines Terminal aktiv – Eingabe direkt in der Ausgabe")
             else:
                 self.show_status("Klassischer Modus aktiv – separates Eingabefeld")
+            self.update_view_menu_state()
 
     def command_palette_entries(self):
         entries = [
@@ -2282,6 +2359,10 @@ class TerminalWindow(QMainWindow):
                     )
                 else:
                     tab.schedule_restore_command(item.get("restore_command", ""))
+                if "command_task_panel_visible" in item:
+                    tab.set_command_task_panel_visible(bool(item.get("command_task_panel_visible", True)), save=False)
+                if "command_task_panel_expanded" in item:
+                    tab.set_command_task_panel_expanded(bool(item.get("command_task_panel_expanded", False)))
                 if item.get("pure_terminal_mode"):
                     tab.set_pure_terminal_mode(True, focus=False, save=False)
             restored = True
@@ -2298,6 +2379,8 @@ class TerminalWindow(QMainWindow):
             "restore_command": tab.current_restore_command(),
             "venv_path": tab.current_venv_path(),
             "view_pane": self.logical_pane_for_widget(tab_widget),
+            "command_task_panel_visible": bool(getattr(tab, "command_task_panel_visible", True)),
+            "command_task_panel_expanded": bool(getattr(tab, "command_task_panel_expanded", False)),
             "pure_terminal_mode": bool(getattr(tab, "pure_terminal_mode", False)),
         }
         if detached_window is not None:
@@ -3718,6 +3801,8 @@ Vorbefehl-Leiste oben rechts
 - Im Client-Modus wird der Vorbefehl bewusst nicht angewendet, damit Python, SQL, Node oder Ollama keine unerwarteten Zusatzzeilen erhalten.
 - Sichtbarkeit, Aktiv-Haken, aktueller Vorbefehl und die letzten Vorbefehle werden gespeichert.
 - Ansicht → Vorbefehl-Leiste anzeigen blendet die Leiste ein oder aus.
+- Ansicht → Letzte Befehle anzeigen blendet die Befehlstabelle des aktuellen Tabs komplett ein oder aus.
+- Ansicht → Reines Terminal schaltet den aktuellen Tab ohne Kontextmenü zwischen klassischer Eingabe und direkter Terminaleingabe um.
 
 Datei-Menü
 - Neuer Tab: öffnet einen neuen Terminal-Tab mit dem aktuell gewählten Standard-Backend.
@@ -3752,6 +3837,9 @@ Workspaces-Menü
 
 Ansicht-Menü
 - Vorbefehl-Leiste anzeigen: blendet das obere Vorbefehl-Feld ein oder aus.
+- Letzte Befehle anzeigen: blendet die Befehlstabelle des aktuellen Tabs komplett ein oder aus.
+- Letzte Befehle ausklappen: klappt die Tabelle unter der Terminalausgabe auf oder zu.
+- Reines Terminal: schaltet den aktuellen Tab auf direkte Eingabe im Ausgabebereich um oder zurück.
 - Einzelansicht: zeigt eine normale Tab-Fläche.
 - 2er horizontal: zeigt zwei Bereiche links und rechts.
 - 2er vertikal: zeigt zwei Bereiche oben und unten.
@@ -3862,6 +3950,7 @@ Hinweise
 - Standard QProcess ist der stabile Kompatibilitätsmodus. Normale Shell-Befehle funktionieren gut; Programme mit Vollbild-Terminalsteuerung können eingeschränkt sein.
 - PTY/ConPTY experimentell ist zum Testen echterer Terminal-Interaktion gedacht und sollte erst nach einem gesicherten Git-Stand genutzt werden.
 - Welche Backends, Clients und Ollama-Modelle nutzbar sind, hängt davon ab, was auf dem System installiert ist.
+- Befehle werden nur dann zum Rückgängig-Machen angeboten, wenn ShellDeck einen einfachen sicheren Fall erkennt, z.B. mkdir für einen Ordner. Ist der Ordner nicht mehr leer, fragt ShellDeck vor dem Löschen ausdrücklich nach.
 - Unter Linux funktioniert die App grundsätzlich mit PySide6 und verfügbaren Shells wie bash, zsh, fish oder sh.
 """
 

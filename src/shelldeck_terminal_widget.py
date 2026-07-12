@@ -37,7 +37,8 @@ from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
 from PySide6.QtWidgets import (
     QApplication, QTextEdit, QPlainTextEdit, QVBoxLayout, QWidget,
     QPushButton, QDialog, QLabel, QInputDialog, QDialogButtonBox,
-    QMenu, QLineEdit, QListWidget, QListWidgetItem
+    QMenu, QLineEdit, QListWidget, QListWidgetItem, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox
 )
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer
 from PySide6.QtGui import (
@@ -954,19 +955,42 @@ class ShellDeckTerminalWidget(QWidget):
 
         self.command_tasks = []
         self.active_command_task = None
+        self.command_task_panel_visible = True
         self.command_task_panel_expanded = False
         self.command_task_header = QPushButton()
         self.command_task_header.setCheckable(True)
         self.command_task_header.setChecked(self.command_task_panel_expanded)
-        self.command_task_header.setToolTip("Letzte Befehle ein- oder ausklappen")
+        self.command_task_header.setToolTip(
+            "Blendet die Tabelle der zuletzt ausgeführten Befehle ein oder aus. "
+            "Die Tabelle kann auch über Ansicht → Letzte Befehle anzeigen komplett verborgen werden."
+        )
         self.command_task_header.clicked.connect(self.set_command_task_panel_expanded)
         layout.addWidget(self.command_task_header)
 
-        self.command_task_list = QListWidget()
+        self.command_task_list = QTableWidget(0, 5)
+        self.command_task_list.setToolTip(
+            "Letzte Befehle als Tabelle. Doppelklick auf eine Zeile führt den Befehl erneut aus. "
+            "Rechtsklick öffnet Kopieren-, Löschen-, Eingabe- und sichere Rückgängig-Aktionen."
+        )
+        self.command_task_list.setHorizontalHeaderLabels(["Status", "Befehl", "Zeit", "Dauer", "Ordner"])
         self.command_task_list.setMaximumHeight(150)
+        self.command_task_list.setAlternatingRowColors(True)
+        self.command_task_list.setShowGrid(False)
+        self.command_task_list.setSortingEnabled(False)
+        self.command_task_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.command_task_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.command_task_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.command_task_list.verticalHeader().setVisible(False)
+        header = self.command_task_list.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.command_task_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.command_task_list.customContextMenuRequested.connect(self.show_command_task_context_menu)
-        self.command_task_list.itemDoubleClicked.connect(lambda item: self.rerun_command_task(self.command_task_from_item(item)))
+        self.command_task_list.cellDoubleClicked.connect(self.rerun_command_task_from_table_cell)
         layout.addWidget(self.command_task_list)
         self.set_command_task_panel_expanded(self.command_task_panel_expanded)
 
@@ -985,6 +1009,7 @@ class ShellDeckTerminalWidget(QWidget):
         self._inline_input_cursor = None
 
         self.input_prompt_label = QLineEdit()
+        self.input_prompt_label.setToolTip("Aktueller Eingabe-Prompt mit Shell, Benutzer, Rechner und erkanntem Arbeitsordner.")
         self.input_prompt_label.setReadOnly(True)
         self.input_prompt_label.setFont(self.window.terminal_font)
         self.input_prompt_label.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
@@ -992,6 +1017,10 @@ class ShellDeckTerminalWidget(QWidget):
         layout.addWidget(self.input_prompt_label)
 
         self.input_line = QPlainTextEdit()
+        self.input_line.setToolTip(
+            "Befehl eingeben und mit Enter oder dem Button ausführen. "
+            "Ctrl+Enter fügt eine neue Zeile ein."
+        )
         self.input_line.setMaximumHeight(110)
         self.input_line.setFont(self.window.terminal_font)
         self.input_line.installEventFilter(self)
@@ -1001,6 +1030,7 @@ class ShellDeckTerminalWidget(QWidget):
         self.update_input_prompt_label()
 
         self.execute_button = QPushButton("Befehl ausführen")
+        self.execute_button.setToolTip("Führt die aktuelle Eingabe im aktiven Terminal-Tab aus.")
         self.execute_button.clicked.connect(self.execute_command)
         layout.addWidget(self.execute_button)
 
@@ -1161,6 +1191,10 @@ class ShellDeckTerminalWidget(QWidget):
             self.output_area.ensureCursorVisible()
             self._output_drain_timer.stop()
             self._highlighter_restore_timer.start(750)
+            if self.inline_mode_active():
+                # Nach neuer Ausgabe entscheiden, ob der eigene Prompt nötig
+                # ist oder der native Shell-Prompt sichtbar geworden ist.
+                self.refresh_inline_prompt()
 
     # ---- Reines-Terminal-Modus: Eingabe direkt im Ausgabebereich ----
 
@@ -1189,6 +1223,53 @@ class ShellDeckTerminalWidget(QWidget):
             return "Passwort erwartet: "
         return f"{self.input_prompt_text()} "
 
+    def inline_prompt_context_text(self):
+        """Sichtbarer Text vor dem Inline-Prompt inkl. noch nicht gezeichneter Queue."""
+        if self.inline_markers_valid():
+            cursor = QTextCursor(self.output_area.document())
+            cursor.setPosition(0)
+            cursor.setPosition(self._inline_prompt_cursor.position(), QTextCursor.MoveMode.KeepAnchor)
+            text = cursor.selectedText().replace(chr(0x2029), "\n")
+        else:
+            try:
+                text = self.output_area.toPlainText()
+            except Exception:
+                text = ""
+        try:
+            queued = "".join(str(item[0] or "") for item in getattr(self, "_output_queue", []) if item)
+        except Exception:
+            queued = ""
+        return text + queued
+
+    def inline_prompt_should_be_visible(self):
+        """Eigenen Prompt nur zeigen, wenn kein echter Shell-Prompt sichtbar ist.
+
+        Im QProcess-Pipe-Modus (und unter PTY/ConPTY) schreiben PowerShell,
+        CMD & Co. ihren eigenen Prompt als normale Ausgabe. Endet die Ausgabe
+        bereits mit so einem Prompt, würde der zusätzliche ShellDeck-Prompt
+        doppelt erscheinen — dann dient der native Prompt als Eingabemarke.
+        Die Erkennung ist dieselbe, mit der ShellDeck auch das Befehlsende
+        erkennt (output_ends_with_shell_prompt); es wird keine Ausgabe
+        entfernt oder verändert.
+        """
+        if getattr(self, "password_prompt_active", False):
+            return True
+        return not self.output_ends_with_shell_prompt(self.inline_prompt_context_text())
+
+    def inline_prompt_effective_text(self):
+        if self.inline_prompt_should_be_visible():
+            return self.inline_prompt_display_text()
+        # Unsichtbarer Anker (Zero-Width-Space): Er hält Prompt- und
+        # Eingabe-Marker auseinander, während der native Shell-Prompt als
+        # sichtbare Eingabemarke dient. Ohne Anker fielen beide Marker auf
+        # dieselbe Position und Einfügungen würden sie überholen.
+        return chr(0x200B)
+
+    def inline_document_ends_mid_line(self, document, position):
+        if position <= 0:
+            return False
+        return document.characterAt(position - 1) != chr(0x2029)
+
     def inline_prompt_char_format(self):
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(self.window.terminal_color("command", "#7DD3FC")))
@@ -1206,12 +1287,14 @@ class ShellDeckTerminalWidget(QWidget):
         document = self.output_area.document()
         cursor = QTextCursor(document)
         cursor.movePosition(QTextCursor.MoveOperation.End)
+        visible_prompt = self.inline_prompt_should_be_visible()
+        prompt_text = self.inline_prompt_effective_text()
         cursor.beginEditBlock()
         try:
-            if cursor.position() > 0 and document.characterAt(cursor.position() - 1) != "\u2029":
+            if visible_prompt and self.inline_document_ends_mid_line(document, cursor.position()):
                 cursor.insertText("\n")
             prompt_start = cursor.position()
-            cursor.insertText(self.inline_prompt_display_text(), self.inline_prompt_char_format())
+            cursor.insertText(prompt_text, self.inline_prompt_char_format())
         finally:
             cursor.endEditBlock()
         self._inline_prompt_cursor = QTextCursor(document)
@@ -1271,8 +1354,8 @@ class ShellDeckTerminalWidget(QWidget):
         cursor = QTextCursor(document)
         cursor.setPosition(start)
         cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-        current = cursor.selectedText().replace("\u2029", "\n")
-        new_prompt = self.inline_prompt_display_text()
+        current = cursor.selectedText().replace(chr(0x2029), "\n")
+        new_prompt = self.inline_prompt_effective_text()
         if current == new_prompt:
             return
         cursor.insertText(new_prompt, self.inline_prompt_char_format())
@@ -2219,28 +2302,58 @@ class ShellDeckTerminalWidget(QWidget):
         if header is None:
             return
         expanded = bool(getattr(self, "command_task_panel_expanded", False))
+        visible = bool(getattr(self, "command_task_panel_visible", True))
         count = 0
-        task_list = getattr(self, "command_task_list", None)
-        if task_list is not None:
-            count = task_list.count()
+        task_table = getattr(self, "command_task_list", None)
+        if task_table is not None:
+            count = task_table.rowCount()
         arrow = "▾" if expanded else "▸"
         suffix = f" ({count})" if count else ""
-        header.setText(f"{arrow} Letzte Befehle{suffix}")
+        hidden_suffix = " — ausgeblendet" if not visible else ""
+        header.setText(f"{arrow} Letzte Befehle{suffix}{hidden_suffix}")
+
+    def set_command_task_panel_visible(self, visible, *, save=True):
+        """Show or hide the complete last-command area for this tab."""
+        self.command_task_panel_visible = bool(visible)
+        header = getattr(self, "command_task_header", None)
+        if header is not None:
+            header.setVisible(self.command_task_panel_visible)
+        task_table = getattr(self, "command_task_list", None)
+        if task_table is not None:
+            task_table.setVisible(self.command_task_panel_visible and self.command_task_panel_expanded)
+            task_table.setMaximumHeight(150 if (self.command_task_panel_visible and self.command_task_panel_expanded) else 0)
+        self.update_command_task_header_label()
+        if save:
+            try:
+                self.window.save_settings()
+            except Exception:
+                pass
+
+    def toggle_command_task_panel_visible(self):
+        self.set_command_task_panel_visible(not bool(getattr(self, "command_task_panel_visible", True)))
 
     def set_command_task_panel_expanded(self, expanded):
         self.command_task_panel_expanded = bool(expanded)
+        if self.command_task_panel_expanded and not bool(getattr(self, "command_task_panel_visible", True)):
+            self.command_task_panel_visible = True
         header = getattr(self, "command_task_header", None)
-        if header is not None and header.isChecked() != self.command_task_panel_expanded:
-            header.setChecked(self.command_task_panel_expanded)
-        task_list = getattr(self, "command_task_list", None)
-        if task_list is not None:
-            task_list.setVisible(self.command_task_panel_expanded)
-            task_list.setMaximumHeight(150 if self.command_task_panel_expanded else 0)
+        if header is not None:
+            header.setVisible(bool(getattr(self, "command_task_panel_visible", True)))
+            if header.isChecked() != self.command_task_panel_expanded:
+                header.setChecked(self.command_task_panel_expanded)
+        task_table = getattr(self, "command_task_list", None)
+        if task_table is not None:
+            task_table.setVisible(bool(getattr(self, "command_task_panel_visible", True)) and self.command_task_panel_expanded)
+            task_table.setMaximumHeight(150 if (bool(getattr(self, "command_task_panel_visible", True)) and self.command_task_panel_expanded) else 0)
         self.update_command_task_header_label()
 
     def command_task_time_label(self, value=None):
         timestamp = float(value if value is not None else time.time())
         return time.strftime("%H:%M:%S", time.localtime(timestamp))
+
+    def command_task_datetime_label(self, value=None):
+        timestamp = float(value if value is not None else time.time())
+        return time.strftime("%d.%m. %H:%M", time.localtime(timestamp))
 
     def command_task_duration_label(self, task):
         started = float(task.get("started_at") or time.time())
@@ -2268,28 +2381,46 @@ class ShellDeckTerminalWidget(QWidget):
             return "✗"
         return "?"
 
-    def command_task_display_text(self, task):
-        icon = self.command_task_status_icon(task.get("status"))
+    def command_task_command_label(self, task, limit=140):
         command = str(task.get("original_command") or task.get("sent_command") or "").replace("\n", " ⏎ ")
-        if len(command) > 95:
-            command = command[:92].rstrip() + "…"
-        duration = self.command_task_duration_label(task)
-        cwd = self.compact_display_path(task.get("working_directory", ""))
-        details = []
-        if duration:
-            details.append(duration)
-        if cwd:
-            details.append(cwd)
-        if task.get("pre_commands"):
-            details.append("mit Vorbefehl")
-        suffix = " — " + " | ".join(details) if details else ""
-        return f"{icon} {command}{suffix}"
+        if len(command) > int(limit):
+            command = command[: int(limit) - 1].rstrip() + "…"
+        return command
 
-    def update_command_task_item(self, task):
+    def command_task_table_values(self, task):
+        cwd = self.compact_display_path(task.get("working_directory", ""))
+        if task.get("pre_commands"):
+            cwd = f"{cwd} | mit Vorbefehl" if cwd else "mit Vorbefehl"
+        return [
+            self.command_task_status_icon(task.get("status")),
+            self.command_task_command_label(task),
+            self.command_task_datetime_label(task.get("started_at")),
+            self.command_task_duration_label(task),
+            cwd,
+        ]
+
+    def command_task_row(self, task):
+        if not task:
+            return -1
+        task_table = getattr(self, "command_task_list", None)
+        if task_table is None:
+            return -1
         item = task.get("item")
-        if item is None:
-            return
-        item.setText(self.command_task_display_text(task))
+        if item is not None:
+            try:
+                row = item.row()
+                if row >= 0 and row < task_table.rowCount():
+                    return row
+            except RuntimeError:
+                pass
+        for row in range(task_table.rowCount()):
+            for column in range(task_table.columnCount()):
+                cell = task_table.item(row, column)
+                if cell is not None and cell.data(Qt.ItemDataRole.UserRole) is task:
+                    return row
+        return -1
+
+    def command_task_tooltip_text(self, task):
         tooltip = [
             f"Status: {task.get('status', 'unbekannt')}",
             f"Originalbefehl: {task.get('original_command', '')}",
@@ -2309,7 +2440,26 @@ class ShellDeckTerminalWidget(QWidget):
             tooltip.append("\nFehler-Ausschnitt:\n" + str(task.get("stderr")))
         elif task.get("stdout"):
             tooltip.append("\nAusgabe-Ausschnitt:\n" + str(task.get("stdout")))
-        item.setToolTip("\n".join(tooltip))
+        return "\n".join(tooltip)
+
+    def update_command_task_item(self, task):
+        task_table = getattr(self, "command_task_list", None)
+        if task_table is None:
+            return
+        row = self.command_task_row(task)
+        if row < 0:
+            return
+        values = self.command_task_table_values(task)
+        tooltip = self.command_task_tooltip_text(task)
+        for column, value in enumerate(values):
+            item = task_table.item(row, column)
+            if item is None:
+                item = QTableWidgetItem()
+                task_table.setItem(row, column, item)
+            item.setText(str(value))
+            item.setToolTip(tooltip)
+            item.setData(Qt.ItemDataRole.UserRole, task)
+        task["item"] = task_table.item(row, 0)
 
     def start_command_task(self, original_command, sent_command, pre_commands=""):
         # Falls ShellDeck ausnahmsweise schon einen laufenden Task hat, wird er
@@ -2334,14 +2484,21 @@ class ShellDeckTerminalWidget(QWidget):
             "stderr": "",
             "item": None,
         }
-        item = QListWidgetItem()
-        item.setData(Qt.ItemDataRole.UserRole, task)
-        task["item"] = item
+        task_table = self.command_task_list
+        task_table.insertRow(0)
+        for column in range(task_table.columnCount()):
+            item = QTableWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, task)
+            task_table.setItem(0, column, item)
+        task["item"] = task_table.item(0, 0)
         self.command_tasks.append(task)
-        self.command_task_list.insertItem(0, item)
-        self.command_task_list.setCurrentItem(item)
-        while self.command_task_list.count() > 80:
-            self.command_task_list.takeItem(self.command_task_list.count() - 1)
+        task_table.setCurrentCell(0, 1)
+        while task_table.rowCount() > 80:
+            old_row = task_table.rowCount() - 1
+            old_task = self.command_task_from_table_row(old_row)
+            task_table.removeRow(old_row)
+            if old_task in self.command_tasks and old_task is not self.active_command_task:
+                self.command_tasks.remove(old_task)
         self.update_command_task_header_label()
         self.active_command_task = task
         self.update_command_task_item(task)
@@ -2403,8 +2560,27 @@ class ShellDeckTerminalWidget(QWidget):
         task = item.data(Qt.ItemDataRole.UserRole)
         return task if isinstance(task, dict) else None
 
+    def command_task_from_table_row(self, row):
+        task_table = getattr(self, "command_task_list", None)
+        if task_table is None or row < 0 or row >= task_table.rowCount():
+            return None
+        for column in range(task_table.columnCount()):
+            task = self.command_task_from_item(task_table.item(row, column))
+            if task:
+                return task
+        return None
+
     def selected_command_task(self):
-        return self.command_task_from_item(self.command_task_list.currentItem())
+        task_table = getattr(self, "command_task_list", None)
+        if task_table is None:
+            return None
+        task = self.command_task_from_item(task_table.currentItem())
+        if task:
+            return task
+        return self.command_task_from_table_row(task_table.currentRow())
+
+    def rerun_command_task_from_table_cell(self, row, column):
+        self.rerun_command_task(self.command_task_from_table_row(row))
 
     def rerun_command_task(self, task=None):
         task = task or self.selected_command_task()
@@ -2414,6 +2590,17 @@ class ShellDeckTerminalWidget(QWidget):
         if not command:
             return
         self.run_text_command(command)
+
+    def load_command_task_into_input(self, task=None):
+        task = task or self.selected_command_task()
+        if not task:
+            return
+        command = str(task.get("original_command") or task.get("sent_command") or "").strip()
+        if not command:
+            return
+        self.input_line.setPlainText(command)
+        self.input_line.moveCursor(QTextCursor.MoveOperation.End)
+        self.input_line.setFocus()
 
     def command_task_details_text(self, task):
         if not task:
@@ -2453,11 +2640,9 @@ class ShellDeckTerminalWidget(QWidget):
         task = task or self.selected_command_task()
         if not task:
             return
-        item = task.get("item")
-        if item is not None:
-            row = self.command_task_list.row(item)
-            if row >= 0:
-                self.command_task_list.takeItem(row)
+        row = self.command_task_row(task)
+        if row >= 0:
+            self.command_task_list.removeRow(row)
         if task in self.command_tasks:
             self.command_tasks.remove(task)
         if self.active_command_task is task:
@@ -2467,28 +2652,174 @@ class ShellDeckTerminalWidget(QWidget):
     def clear_command_tasks(self):
         self.command_tasks.clear()
         self.active_command_task = None
-        self.command_task_list.clear()
+        self.command_task_list.setRowCount(0)
         self.update_command_task_header_label()
 
+
+    def shell_split_command_for_undo(self, command):
+        text = str(command or "").strip()
+        if not text:
+            return []
+        try:
+            return shlex.split(text, posix=(sys.platform != "win32"))
+        except ValueError:
+            return text.split()
+
+    def mkdir_undo_target_for_task(self, task):
+        """Return a Path for simple mkdir/md commands that can be safely offered as undo."""
+        if not task:
+            return None
+        command = str(task.get("original_command") or task.get("sent_command") or "").strip()
+        if "\n" in command or "\r" in command or not command:
+            return None
+        parts = self.shell_split_command_for_undo(command)
+        if len(parts) < 2:
+            return None
+        verb = str(parts[0] or "").lower().strip()
+        if verb not in {"mkdir", "md"}:
+            return None
+        shell_type = str(task.get("shell_type") or getattr(self, "shell_type", "") or "").lower()
+        if shell_type == "wsl" and sys.platform == "win32":
+            return None
+        targets = []
+        skip_next = False
+        for token in parts[1:]:
+            token = str(token or "").strip()
+            if not token:
+                continue
+            if skip_next:
+                skip_next = False
+                continue
+            if token in {"--mode", "-m"}:
+                skip_next = True
+                continue
+            if token.startswith("-"):
+                continue
+            targets.append(token)
+        if len(targets) != 1:
+            return None
+        target_text = targets[0].strip().strip('"')
+        if not target_text:
+            return None
+        target = Path(os.path.expanduser(target_text))
+        if not target.is_absolute():
+            cwd = str(task.get("working_directory") or getattr(self, "current_working_directory", "") or "").strip()
+            if not cwd:
+                return None
+            target = Path(cwd) / target
+        try:
+            return target.resolve()
+        except OSError:
+            return target
+
+    def can_undo_command_task(self, task):
+        target = self.mkdir_undo_target_for_task(task)
+        return bool(target and target.exists() and target.is_dir())
+
+    def undo_command_task(self, task=None):
+        task = task or self.selected_command_task()
+        target = self.mkdir_undo_target_for_task(task)
+        if target is None:
+            QMessageBox.information(
+                self,
+                "Kein sicheres Rückgängig möglich",
+                "Für diesen Befehl kann ShellDeck keinen sicheren Rückgängig-Schritt ermitteln.",
+            )
+            return
+        if not target.exists() or not target.is_dir():
+            QMessageBox.information(
+                self,
+                "Ordner nicht gefunden",
+                f"Der Ordner existiert nicht mehr oder ist kein Ordner:\n{target}",
+            )
+            return
+
+        try:
+            is_empty = not any(target.iterdir())
+        except OSError as exc:
+            QMessageBox.warning(self, "Ordner kann nicht geprüft werden", f"{target}\n\n{exc}")
+            return
+
+        if is_empty:
+            question = (
+                "Dieser mkdir-Befehl kann rückgängig gemacht werden, indem der leere Ordner gelöscht wird.\n\n"
+                f"Ordner:\n{target}\n\nLeeren Ordner löschen?"
+            )
+            answer = QMessageBox.question(
+                self,
+                "mkdir rückgängig machen",
+                question,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                target.rmdir()
+                self.window.show_status(f"Ordner gelöscht: {target}")
+            except OSError as exc:
+                QMessageBox.warning(self, "Ordner konnte nicht gelöscht werden", f"{target}\n\n{exc}")
+            return
+
+        question = (
+            "Der Ordner ist nicht mehr leer. Beim Rückgängig-Machen würden auch alle enthaltenen Dateien "
+            "und Unterordner gelöscht.\n\n"
+            f"Ordner:\n{target}\n\nWirklich vollständig löschen?"
+        )
+        answer = QMessageBox.question(
+            self,
+            "Nicht leeren Ordner löschen?",
+            question,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            shutil.rmtree(target)
+            self.window.show_status(f"Ordner mit Inhalt gelöscht: {target}")
+        except OSError as exc:
+            QMessageBox.warning(self, "Ordner konnte nicht gelöscht werden", f"{target}\n\n{exc}")
+
     def show_command_task_context_menu(self, pos):
-        item = self.command_task_list.itemAt(pos)
+        task_table = self.command_task_list
+        item = task_table.itemAt(pos)
         if item is not None:
-            self.command_task_list.setCurrentItem(item)
-        task = self.command_task_from_item(item)
+            task_table.setCurrentCell(item.row(), item.column())
+        task = self.command_task_from_item(item) or self.command_task_from_table_row(task_table.currentRow())
 
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
 
         rerun_action = QAction("Befehl erneut ausführen", self)
+        rerun_action.setToolTip("Führt den ausgewählten Befehl erneut im aktiven Terminal aus.")
         rerun_action.setEnabled(bool(task))
         rerun_action.triggered.connect(lambda: self.rerun_command_task(task))
         menu.addAction(rerun_action)
 
+        load_input_action = QAction("Befehl in Eingabe übernehmen", self)
+        load_input_action.setToolTip("Übernimmt den Befehl in das Eingabefeld, ohne ihn sofort auszuführen.")
+        load_input_action.setEnabled(bool(task))
+        load_input_action.triggered.connect(lambda: self.load_command_task_into_input(task))
+        menu.addAction(load_input_action)
+
+        undo_action = QAction("Befehl rückgängig machen…", self)
+        undo_action.setToolTip(
+            "Nur für sicher erkannte einfache Befehle aktiv, z.B. mkdir. "
+            "Bei nicht leerem Ordner fragt ShellDeck vor dem Löschen ausdrücklich nach."
+        )
+        undo_action.setEnabled(bool(task and self.can_undo_command_task(task)))
+        undo_action.triggered.connect(lambda: self.undo_command_task(task))
+        menu.addAction(undo_action)
+
         delete_action = QAction("Diesen Befehl löschen", self)
+        delete_action.setToolTip("Entfernt nur diesen Eintrag aus der Liste. Der Befehl selbst wird nicht rückgängig gemacht.")
         delete_action.setEnabled(bool(task))
         delete_action.triggered.connect(lambda: self.delete_command_task(task))
         menu.addAction(delete_action)
 
         clear_action = QAction("Letzte Befehle leeren", self)
+        clear_action.setToolTip("Leert die sichtbare Befehlsliste dieses Tabs.")
         clear_action.setEnabled(bool(self.command_tasks))
         clear_action.triggered.connect(self.clear_command_tasks)
         menu.addAction(clear_action)
@@ -2496,31 +2827,37 @@ class ShellDeckTerminalWidget(QWidget):
         menu.addSeparator()
 
         copy_original_action = QAction("Originalbefehl kopieren", self)
+        copy_original_action.setToolTip("Kopiert den ursprünglich eingegebenen Befehl in die Zwischenablage.")
         copy_original_action.setEnabled(bool(task))
         copy_original_action.triggered.connect(lambda: QApplication.clipboard().setText(str(task.get("original_command") or "") if task else ""))
         menu.addAction(copy_original_action)
 
         copy_sent_action = QAction("Gesendeten Befehl kopieren", self)
+        copy_sent_action.setToolTip("Kopiert den tatsächlich an die Shell gesendeten Befehl in die Zwischenablage.")
         copy_sent_action.setEnabled(bool(task))
         copy_sent_action.triggered.connect(lambda: QApplication.clipboard().setText(str(task.get("sent_command") or "") if task else ""))
         menu.addAction(copy_sent_action)
 
         copy_details_action = QAction("Befehlsdetails kopieren", self)
+        copy_details_action.setToolTip("Kopiert Status, Zeiten, Ordner, Shell, Engine und Ausgabeausschnitte dieses Eintrags.")
         copy_details_action.setEnabled(bool(task))
         copy_details_action.triggered.connect(lambda: QApplication.clipboard().setText(self.command_task_details_text(task)))
         menu.addAction(copy_details_action)
 
         copy_all_action = QAction("Alle Befehlsdetails kopieren", self)
+        copy_all_action.setToolTip("Kopiert die Details aller sichtbaren Befehle in die Zwischenablage.")
         copy_all_action.setEnabled(bool(self.command_tasks))
         copy_all_action.triggered.connect(lambda: QApplication.clipboard().setText(self.all_command_tasks_text()))
         menu.addAction(copy_all_action)
 
         copy_stdout_action = QAction("Ausgabe kopieren", self)
+        copy_stdout_action.setToolTip("Kopiert den gespeicherten Ausgabe-Ausschnitt dieses Befehls.")
         copy_stdout_action.setEnabled(bool(task and str(task.get("stdout") or "").strip()))
         copy_stdout_action.triggered.connect(lambda: QApplication.clipboard().setText(str(task.get("stdout") or "") if task else ""))
         menu.addAction(copy_stdout_action)
 
         copy_stderr_action = QAction("Fehlerausgabe kopieren", self)
+        copy_stderr_action.setToolTip("Kopiert den gespeicherten Fehlerausgabe-Ausschnitt dieses Befehls.")
         copy_stderr_action.setEnabled(bool(task and str(task.get("stderr") or "").strip()))
         copy_stderr_action.triggered.connect(lambda: QApplication.clipboard().setText(str(task.get("stderr") or "") if task else ""))
         menu.addAction(copy_stderr_action)
@@ -2528,16 +2865,18 @@ class ShellDeckTerminalWidget(QWidget):
         menu.addSeparator()
 
         expand_action = QAction("Letzte Befehle ausklappen", self)
+        expand_action.setToolTip("Zeigt die Tabelle der letzten Befehle unter der Terminalausgabe an.")
         expand_action.setEnabled(not bool(getattr(self, "command_task_panel_expanded", False)))
         expand_action.triggered.connect(lambda: self.set_command_task_panel_expanded(True))
         menu.addAction(expand_action)
 
         collapse_action = QAction("Letzte Befehle einklappen", self)
+        collapse_action.setToolTip("Klappt die Tabelle ein, lässt die schmale Überschrift aber sichtbar.")
         collapse_action.setEnabled(bool(getattr(self, "command_task_panel_expanded", False)))
         collapse_action.triggered.connect(lambda: self.set_command_task_panel_expanded(False))
         menu.addAction(collapse_action)
 
-        menu.exec(self.command_task_list.mapToGlobal(pos))
+        menu.exec(task_table.viewport().mapToGlobal(pos))
 
     def command_sequence_from_text(self, command_text, *, include_prefix=True):
         commands = []
