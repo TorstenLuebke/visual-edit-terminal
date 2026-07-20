@@ -3125,7 +3125,7 @@ class ShellDeckTerminalWidget(QWidget):
             exit_command = "exit"
 
         if self.process and self.process.state() == QProcess.ProcessState.Running:
-            self.process.write(exit_command.encode() + b"\n")
+            self.process.write(self.encode_process_input(exit_command) + b"\n")
             self.process.waitForBytesWritten(1000)
 
         self.set_client_mode(False)
@@ -3352,7 +3352,7 @@ class ShellDeckTerminalWidget(QWidget):
             return False
         self.update_working_context_from_shell_command(text)
         self.output_area.append(f"\n[Restore] Führe aus: {text}\n")
-        self.process.write(text.encode() + b"\n")
+        self.process.write(self.encode_process_input(text) + b"\n")
         self.process.waitForBytesWritten(1000)
         QTimer.singleShot(250, self.update_input_prompt_label)
         return True
@@ -3994,7 +3994,7 @@ class ShellDeckTerminalWidget(QWidget):
             self.reset_password_prompt_mode("Veraltete Passworteingabe ignoriert")
             return
         payload = str(password or "") + "\n"
-        self.process.write(payload.encode("utf-8", errors="replace"))
+        self.process.write(self.encode_process_input(payload))
         self.process.waitForBytesWritten(1000)
         self.reset_password_prompt_mode("Passwort wurde an den laufenden Prozess gesendet")
 
@@ -4255,7 +4255,7 @@ class ShellDeckTerminalWidget(QWidget):
         # (>>) ab oder bestätigen "Press Enter"-Prompts.
         payload = payload.rstrip("\n") + "\n"
         self.remember_pending_interactive_response_echo(answer)
-        self.process.write(payload.encode("utf-8", errors="replace"))
+        self.process.write(self.encode_process_input(payload))
         self.process.waitForBytesWritten(1000)
         self.input_line.clear()
         self._awaiting_command_completion = True
@@ -4281,7 +4281,7 @@ class ShellDeckTerminalWidget(QWidget):
             return
 
         if self.is_client_exit_command(payload):
-            self.process.write(payload.encode() + b"\n")
+            self.process.write(self.encode_process_input(payload) + b"\n")
             self.input_line.clear()
             self.set_client_mode(False)
             return
@@ -4290,7 +4290,7 @@ class ShellDeckTerminalWidget(QWidget):
 
         self.history_index = -1
         self.current_command = ""
-        self.process.write(payload.encode() + b"\n")
+        self.process.write(self.encode_process_input(payload) + b"\n")
         self.input_line.clear()
 
     def write_shell_command(self, command):
@@ -4308,8 +4308,11 @@ class ShellDeckTerminalWidget(QWidget):
         # In PTY/ConPTY PowerShell the shell is started without PSReadLine.
         # That avoids the redraw storm that produced duplicated command
         # fragments. Send the command normally; the pending-echo filter remains
-        # as a safety net for already emitted redraw fragments.
-        if self.process_uses_pty_engine() and str(self.shell_type or "").lower() in {"powershell", "pwsh"}:
+        # as a safety net for already emitted redraw fragments. ConPTY malt die
+        # Eingabezeile aber bei JEDER Shell pro Zeichen neu (auch cmd/bash),
+        # deshalb wird das Echo hier für alle PTY-Shells vorgemerkt — sonst
+        # erscheinen Fragmente wie "ppython youtube_downlpython …" im Output.
+        if self.process_uses_pty_engine():
             self.remember_pending_pty_command_echo(text)
 
         self.update_working_context_from_shell_command(text)
@@ -4325,13 +4328,28 @@ class ShellDeckTerminalWidget(QWidget):
             text += "\n"
         self._last_sent_shell_command = str(command or "")
         self._awaiting_command_completion = True
-        self.process.write(text.encode())
+        self.process.write(self.encode_process_input(text))
         self.process.waitForBytesWritten(1000)
         QTimer.singleShot(300, self.refresh_process_input_mode_hint)
 
     def execute_command(self):
         command_text = self.input_line.toPlainText().strip()
         if not command_text:
+            # Leere Eingaben sind im Antwort-Modus gültig: Sie schließen z.B.
+            # eine PowerShell-Continuation (">>") ab oder bestätigen
+            # "Press Enter"-Prompts. Ohne diesen Zweig konnte die im
+            # Statushinweis geforderte "leere Zeile zum Abschließen" nie
+            # gesendet werden, weil der Button bei leerem Feld nichts tat.
+            if self.password_prompt_active or self.visible_output_waits_for_password():
+                return
+            if getattr(self, "client_mode_active", False):
+                return
+            if (
+                self.interaction_prompt_active
+                or self.visible_output_waits_for_interaction()
+                or self.command_appears_to_be_running()
+            ):
+                self.send_interactive_input("")
             return
 
         if self.password_prompt_active or self.visible_output_waits_for_password():
@@ -4451,6 +4469,25 @@ class ShellDeckTerminalWidget(QWidget):
     def process_uses_pty_engine(self):
         return str(getattr(getattr(self, "process", None), "_shelldeck_engine", "") or "").lower() == "pty"
 
+    def encode_process_input(self, text):
+        """Eingaben mit derselben Codepage kodieren, mit der Ausgaben dekodiert
+        werden.
+
+        QProcess-PowerShell/cmd liest stdin unter Windows in der OEM-Codepage
+        (cp850), ``str.encode()`` liefert aber UTF-8. Ein "ß" kommt dann als
+        zwei cp850-Zeichen "├ƒ" an — sichtbar im Echo und, schlimmer, im
+        tatsächlich ausgeführten Befehl. Der PTY-Adapter dekodiert Bytes selbst
+        wieder zu Text (UTF-8 zuerst), dort bleibt UTF-8 korrekt.
+        """
+        value = str(text or "")
+        if sys.platform == "win32" and not self.process_uses_pty_engine():
+            for encoding in ("cp850", "mbcs", "cp1252"):
+                try:
+                    return value.encode(encoding)
+                except (UnicodeEncodeError, LookupError):
+                    continue
+        return value.encode("utf-8", errors="replace")
+
     def decoded_terminal_output(self, raw):
         text = self._decode_process_output(raw)
         if self.process_uses_pty_engine():
@@ -4520,7 +4557,17 @@ class ShellDeckTerminalWidget(QWidget):
         if not text:
             return
         pending = getattr(self, "_pending_pty_command_echoes", [])
-        pending.append({"command": text, "ttl": 8})
+        # Beim Profil-Autostart wird der Befehl geschrieben, während die Shell
+        # noch bootet (Banner, venv-activate, Prompt = viele Chunks). Ein rein
+        # chunk-basiertes TTL verfällt dann, bevor das Echo überhaupt ankommt.
+        # Deshalb: Zeitfenster als harte Grenze, Chunk-TTL zählt erst herunter,
+        # nachdem das erste Echo-Fragment gesehen wurde ("seen").
+        pending.append({
+            "command": text,
+            "ttl": 8,
+            "deadline": time.monotonic() + 15.0,
+            "seen": False,
+        })
         self._pending_pty_command_echoes = pending[-8:]
 
     def compact_echo_text(self, value):
@@ -4548,8 +4595,12 @@ class ShellDeckTerminalWidget(QWidget):
 
         line_key = self.compact_echo_text(raw_line)
         command_key = self.compact_echo_text(raw_command)
-        if len(command_key) < 3 or len(line_key) < 3:
+        if len(command_key) < 3 or not line_key:
             return False
+        if len(line_key) < 3:
+            # Sehr kurze Fragmente (z.B. ein einzelnes "p") sind nur dann Echo,
+            # wenn sie ein Präfix des erwarteten Befehls sind.
+            return command_key.startswith(line_key)
 
         if command_key.startswith(line_key) or line_key.startswith(command_key):
             return True
@@ -4567,27 +4618,144 @@ class ShellDeckTerminalWidget(QWidget):
 
         return False
 
+    _PTY_PROMPT_PREFIX_RE = re.compile(
+        r"^\s*(?:\([^()\r\n]{1,40}\)\s*)?(?:PS\s+[^>\r\n]+>|[A-Za-z]:[^>\r\n]*>)\s*"
+    )
+
+    def _split_pty_prompt_prefix(self, line):
+        """Trennt einen führenden Shell-Prompt von der restlichen Zeile."""
+        value = str(line or "")
+        match = self._PTY_PROMPT_PREFIX_RE.match(value)
+        if not match:
+            return "", value
+        return value[: match.end()], value[match.end():]
+
+    def _pty_echo_storm_spans(self, value, command):
+        """True, wenn ``value`` nur aus aneinandergereihten Präfixen des
+        Befehls besteht (ConPTY-Redraw-Schnappschüsse), optional mit einem
+        unvollständigen Präfix am Ende. Beispiel für
+        "python youtube_downloader.py":
+        "ppython youtube_downlpython youtube_downloader.py".
+        """
+        command_text = str(command or "").strip()
+        s = str(value or "")
+        if not command_text or not s:
+            return False
+        i = 0
+        n = len(s)
+        while i < n:
+            if s[i] in " \t":
+                # ConPTY füllt gelöschte Bereiche gelegentlich mit Leerraum auf.
+                i += 1
+                continue
+            max_len = min(len(command_text), n - i)
+            matched = 0
+            for length in range(max_len, 0, -1):
+                if s.startswith(command_text[:length], i):
+                    matched = length
+                    break
+            if matched == 0:
+                return False
+            i += matched
+        return True
+
+    def _line_matches_pty_echo(self, body, command):
+        candidate = str(body or "").strip()
+        if not candidate:
+            return False
+        return self.line_looks_like_pending_pty_echo(candidate, command) or self._pty_echo_storm_spans(candidate, command)
+
+    def _schedule_pty_echo_carry_flush(self):
+        self._pty_echo_carry_generation = int(getattr(self, "_pty_echo_carry_generation", 0)) + 1
+        generation = self._pty_echo_carry_generation
+        try:
+            QTimer.singleShot(800, lambda: self._flush_pty_echo_carry(generation))
+        except Exception:
+            pass
+
+    def _flush_pty_echo_carry(self, generation=None):
+        if generation is not None and generation != int(getattr(self, "_pty_echo_carry_generation", 0)):
+            return
+        carry = str(getattr(self, "_pty_echo_carry", "") or "")
+        if not carry:
+            return
+        self._pty_echo_carry = ""
+        pending = getattr(self, "_pending_pty_command_echoes", []) or []
+        prompt_part, rest = self._split_pty_prompt_prefix(carry)
+        if any(self._line_matches_pty_echo(rest, item.get("command", "")) for item in pending):
+            remainder = prompt_part if prompt_part.strip() else ""
+        else:
+            remainder = carry
+        if remainder:
+            try:
+                self.queue_terminal_output(remainder)
+            except Exception:
+                pass
+
     def suppress_pending_pty_command_echo(self, text):
+        # Der Redraw-Sturm ist EINE lange Zeile ohne Zeilenumbrüche, die in
+        # beliebig zerschnittenen Chunks ankommt. Ein Chunk, der mitten im
+        # Fragment beginnt ("utube_downlopython …"), sieht allein nicht mehr
+        # wie ein Echo aus. Deshalb wird die unfertige letzte Zeile als
+        # "Carry" zurückgehalten und mit dem nächsten Chunk zusammengesetzt,
+        # solange sie wie ein Echo-Sturm aussieht.
+        carry = str(getattr(self, "_pty_echo_carry", "") or "")
+        self._pty_echo_carry = ""
+        value = carry + str(text or "")
         pending = list(getattr(self, "_pending_pty_command_echoes", []) or [])
         if not pending:
-            return text
+            return value
 
         kept_lines = []
-        removed_any = False
-        for line in str(text or "").splitlines(True):
-            line_body = line.rstrip("\n")
-            if any(self.line_looks_like_pending_pty_echo(line_body, item.get("command", "")) for item in pending):
-                removed_any = True
+        hit_items = set()
+        new_carry = ""
+        lines = value.splitlines(True)
+        for pos, line in enumerate(lines):
+            line_body = line.rstrip("\r\n")
+            newline = line[len(line_body):]
+            is_open_tail = pos == len(lines) - 1 and not newline
+            prompt_part, rest = self._split_pty_prompt_prefix(line_body)
+            matched_index = None
+            for index, item in enumerate(pending):
+                command = item.get("command", "")
+                if self._line_matches_pty_echo(rest, command) or self.line_looks_like_pending_pty_echo(line_body, command):
+                    matched_index = index
+                    break
+            if matched_index is None:
+                kept_lines.append(line)
                 continue
-            kept_lines.append(line)
+            pending[matched_index]["seen"] = True
+            hit_items.add(matched_index)
+            if is_open_tail:
+                # Sturm läuft möglicherweise noch: Zeile roh zurückhalten und
+                # mit dem nächsten Chunk erneut bewerten. Ein Timer flusht den
+                # Rest, falls keine weiteren Chunks mehr kommen.
+                new_carry = line
+            elif prompt_part.strip():
+                # Prompt bleibt sichtbar, nur die Echo-Fragmente verschwinden.
+                kept_lines.append(prompt_part + newline)
 
+        # Redraw-Stürme verteilen sich über mehrere Output-Chunks. Der Eintrag
+        # darf daher nach dem ersten Treffer nicht verworfen werden. Vor dem
+        # ersten Echo-Fragment ("seen") zählt die TTL nicht herunter — sonst
+        # fressen Boot-Chunks der Shell (Banner, venv-activate) das TTL auf,
+        # bevor das Echo ankommt. Die Deadline begrenzt alles zeitlich, damit
+        # spätere echte Programmausgaben nicht dauerhaft gefiltert werden.
+        now = time.monotonic()
         next_pending = []
-        for item in pending:
-            ttl = int(item.get("ttl", 0)) - 1
-            if ttl > 0 and not removed_any:
+        for index, item in enumerate(pending):
+            if now >= float(item.get("deadline", now + 15.0)):
+                continue
+            ttl = int(item.get("ttl", 0))
+            if item.get("seen") and index not in hit_items:
+                ttl -= 1
+            if ttl > 0:
                 item["ttl"] = ttl
                 next_pending.append(item)
         self._pending_pty_command_echoes = next_pending
+        self._pty_echo_carry = new_carry
+        if new_carry:
+            self._schedule_pty_echo_carry_flush()
         return "".join(kept_lines)
 
     def handle_stdout(self):
@@ -4802,7 +4970,7 @@ class ShellDeckTerminalWidget(QWidget):
         if process is None or process.state() != QProcess.ProcessState.Running:
             self.append_system_message("[Shell ist nicht aktiv; Text wurde nicht gesendet.]")
             return
-        process.write(payload.encode("utf-8", errors="replace"))
+        process.write(self.encode_process_input(payload))
         process.waitForBytesWritten(1000)
 
     def send_return(self):
