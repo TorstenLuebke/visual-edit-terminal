@@ -3207,6 +3207,11 @@ class ShellDeckTerminalWidget(QWidget):
             environment = QProcessEnvironment.systemEnvironment()
             if not environment.contains("TERM") or not environment.value("TERM").strip():
                 environment.insert("TERM", "xterm-256color")
+            # Feste Prompt-Vorgabe fuer sudo. Ueber die Umgebung statt ueber "-p",
+            # damit die Befehlszeile lesbar bleibt ("sudo -S apt remove x" statt
+            # "sudo -S -p '...' apt remove x") und die Erkennung trotzdem
+            # unabhaengig von der Systemsprache greift.
+            environment.insert("SUDO_PROMPT", self.SUDO_PIPE_PROMPT)
             process.setProcessEnvironment(environment)
         except Exception:
             pass
@@ -4101,9 +4106,18 @@ class ShellDeckTerminalWidget(QWidget):
         return any(pattern.search(tail) for pattern in self.password_prompt_patterns())
 
     def visible_output_waits_for_password(self):
-        """Return True if the visible terminal tail currently ends in a password prompt."""
+        """Return True if the terminal tail currently ends in a password prompt.
+
+        Wichtig ist terminal_output_text_for_state_checks(): Ausgabe wird ueber
+        _output_queue verzoegert gezeichnet. Wurde nur output_area geprueft,
+        stand der gerade eingetroffene sudo-Prompt dort noch nicht — dann setzte
+        refresh_password_prompt_state_after_output() den Passwortmodus sofort
+        wieder zurueck und show_password_prompt_dialog() brach nach seinen
+        180 ms ab. Der maskierte Dialog erschien nie und das Passwort musste ins
+        normale, unmaskierte Eingabefeld getippt werden.
+        """
         try:
-            return self.output_contains_password_prompt(self.output_area.toPlainText())
+            return self.output_contains_password_prompt(self.terminal_output_text_for_state_checks())
         except Exception:
             return False
 
@@ -4116,7 +4130,7 @@ class ShellDeckTerminalWidget(QWidget):
         # ausgibt und Qt/PTY ihn in mehrere readyRead-Ereignisse aufteilen kann.
         combined = str(getattr(self, "_password_prompt_tail", "") or "") + str(text or "")
         try:
-            current_tail = self.output_area.toPlainText()[-2000:]
+            current_tail = self.terminal_output_text_for_state_checks()[-2000:]
             combined = current_tail + combined
         except Exception:
             pass
@@ -4696,7 +4710,7 @@ class ShellDeckTerminalWidget(QWidget):
         prefix_length = len(stripped) - len(stripped.lstrip())
         prefix = stripped[:prefix_length] if prefix_length else ""
         remainder = stripped.strip()[len(words[0]):].lstrip()
-        injected = f"{words[0]} -S -p {shlex.quote(self.SUDO_PIPE_PROMPT)} {remainder}".rstrip()
+        injected = f"{words[0]} -S {remainder}".rstrip()
         return part.replace(stripped, prefix + injected, 1)
 
     def write_shell_command(self, command):
