@@ -1001,6 +1001,11 @@ class ShellDeckTerminalWidget(QWidget):
         self.command_history = self.normalize_command_history(command_history)
         self.restore_command = str(restore_command or "").strip()
         self.venv_path = self.normalize_venv_path(venv_path)
+        # True, sobald die Shell keine aktive venv mehr meldet oder der Benutzer
+        # "deactivate" ausgefuehrt hat. Sperrt die Ersatz-Erkennung in
+        # active_venv_label(), damit das Praefix nicht aus dem Restore-Befehl
+        # oder alten Ausgabezeilen zurueckkehrt.
+        self._venv_deactivated = False
         self.client_mode_active = False
         self.client_mode_name = ""
         self.client_mode_kind = ""
@@ -1686,6 +1691,12 @@ class ShellDeckTerminalWidget(QWidget):
                 return Path(venv_text).name or "venv"
             except OSError:
                 return "venv"
+        # Nach einem bewussten "deactivate" (oder wenn die Shell VIRTUAL_ENV
+        # leer meldet) darf keine der Ersatzquellen unten das Praefix wieder
+        # herbeizaubern: der Restore-Befehl und alte Ausgabezeilen enthalten
+        # das ".venv" naemlich weiterhin.
+        if getattr(self, "_venv_deactivated", False):
+            return ""
         restore = str(getattr(self, "restore_command", "") or "")
         if re.search(r"(?:^|[\\/\s])\.venv(?:[\\/\s]|$)", restore):
             return ".venv"
@@ -1828,8 +1839,31 @@ class ShellDeckTerminalWidget(QWidget):
             return False
         return False
 
+    def command_deactivates_venv(self, command):
+        """True für Befehle, die eine aktive venv verlassen."""
+        text = str(command or "").strip()
+        if not text:
+            return False
+        try:
+            parts = shlex.split(text, posix=(sys.platform != "win32"))
+        except ValueError:
+            parts = text.split()
+        if not parts:
+            return False
+        first = Path(str(parts[0]).strip("\"'")).name.lower()
+        return first in {"deactivate", "deactivate.bat", "deactivate.ps1"}
+
     def update_venv_path_from_activation_command(self, command):
         text = str(command or "").strip()
+        if self.command_deactivates_venv(text):
+            # "deactivate" ist keine Aktivierung, muss die Anzeige aber
+            # zuruecksetzen. Ohne das Merkmal _venv_deactivated holte
+            # active_venv_label() das "(.venv)" gleich wieder aus dem
+            # gespeicherten Restore-Befehl oder aus alten Ausgabezeilen.
+            self.venv_path = ""
+            self._venv_deactivated = True
+            self.update_input_prompt_label()
+            return True
         if not self.command_looks_like_venv_activation(text):
             return False
         try:
@@ -1856,6 +1890,7 @@ class ShellDeckTerminalWidget(QWidget):
                 venv_dir = script_path.parent.parent
                 if venv_dir.exists() and venv_dir.is_dir():
                     self.venv_path = str(venv_dir)
+                    self._venv_deactivated = False
                     project_dir = venv_dir.parent
                     if project_dir.exists() and project_dir.is_dir():
                         self.current_working_directory = str(project_dir)
@@ -1955,6 +1990,15 @@ class ShellDeckTerminalWidget(QWidget):
                 kept.append(line)
                 continue
             payload = body.split(marker, 1)[1]
+            # Die Marker-Zeile kann zwischen zwei Lesevorgaengen zerrissen
+            # ankommen. Nur eine abgeschlossene Zeile mit Tabulator enthaelt
+            # wirklich beide Werte; alles andere wird nur ausgeblendet, darf
+            # aber den Zustand nicht veraendern — sonst gilt eine aktive venv
+            # faelschlich als deaktiviert.
+            marker_line_complete = line != body and "\t" in payload
+            if not marker_line_complete:
+                changed = True
+                continue
             parts = payload.split("\t", 1)
             pwd = parts[0].strip() if parts else ""
             venv = parts[1].strip() if len(parts) > 1 else ""
@@ -1968,14 +2012,18 @@ class ShellDeckTerminalWidget(QWidget):
                     venv_path = Path(venv).expanduser().resolve()
                     if venv_path.exists() and venv_path.is_dir():
                         self.venv_path = str(venv_path)
+                        self._venv_deactivated = False
                         changed = True
                 else:
                     # Eine leere VIRTUAL_ENV-Marke bedeutet: Die Shell hat keine
                     # aktive venv mehr. Der Restore-Befehl bleibt erhalten, aber
                     # die Statusanzeige soll dann kein (.venv) vortäuschen.
-                    if str(getattr(self, "venv_path", "") or ""):
-                        self.venv_path = ""
+                    # Die Shell ist hier die verbindliche Quelle, deshalb wird
+                    # auch die Ersatz-Erkennung in active_venv_label() gesperrt.
+                    if not getattr(self, "_venv_deactivated", False) or str(getattr(self, "venv_path", "") or ""):
                         changed = True
+                    self.venv_path = ""
+                    self._venv_deactivated = True
             except OSError:
                 pass
         if changed:
