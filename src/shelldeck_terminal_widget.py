@@ -993,6 +993,7 @@ class ShellDeckTerminalWidget(QWidget):
         self.shell_type = normalize_shell(requested_shell) if callable(normalize_shell) else requested_shell
         self.terminal_engine = self.window.normalize_terminal_engine(terminal_engine or getattr(window, "terminal_engine", "qprocess"))
         self.custom_title = custom_title or ""
+        self.source_profile_name = ""
         self.start_directory = self.normalize_start_directory(start_directory)
         self.current_working_directory = self.start_directory or str(Path.cwd())
         self.title = title
@@ -1070,7 +1071,7 @@ class ShellDeckTerminalWidget(QWidget):
             "Rechtsklick öffnet Kopieren-, Löschen-, Eingabe- und sichere Rückgängig-Aktionen."
         )
         self.command_task_list.setHorizontalHeaderLabels(["Status", "Befehl", "Zeit", "Dauer", "Ordner"])
-        self.command_task_list.setMaximumHeight(150)
+        self.update_command_task_table_height()
         self.command_task_list.setAlternatingRowColors(True)
         self.command_task_list.setShowGrid(False)
         self.command_task_list.setSortingEnabled(False)
@@ -1090,6 +1091,7 @@ class ShellDeckTerminalWidget(QWidget):
         self.command_task_list.cellDoubleClicked.connect(self.rerun_command_task_from_table_cell)
         layout.addWidget(self.command_task_list)
         self.set_command_task_panel_expanded(self.command_task_panel_expanded)
+        self.load_persistent_command_tasks(getattr(self.window, "command_history_entries", []))
 
         self.highlighter = TerminalHighlighter(self.output_area.document(), self.window.terminal_colors())
         self._output_queue = []
@@ -2463,7 +2465,10 @@ class ShellDeckTerminalWidget(QWidget):
         task_table = getattr(self, "command_task_list", None)
         if task_table is not None:
             task_table.setVisible(self.command_task_panel_visible and self.command_task_panel_expanded)
-            task_table.setMaximumHeight(150 if (self.command_task_panel_visible and self.command_task_panel_expanded) else 0)
+            if self.command_task_panel_visible and self.command_task_panel_expanded:
+                self.update_command_task_table_height()
+            else:
+                task_table.setMaximumHeight(0)
         self.update_command_task_header_label()
         if save:
             try:
@@ -2486,7 +2491,10 @@ class ShellDeckTerminalWidget(QWidget):
         task_table = getattr(self, "command_task_list", None)
         if task_table is not None:
             task_table.setVisible(bool(getattr(self, "command_task_panel_visible", True)) and self.command_task_panel_expanded)
-            task_table.setMaximumHeight(150 if (bool(getattr(self, "command_task_panel_visible", True)) and self.command_task_panel_expanded) else 0)
+            if bool(getattr(self, "command_task_panel_visible", True)) and self.command_task_panel_expanded:
+                self.update_command_task_table_height()
+            else:
+                task_table.setMaximumHeight(0)
         self.update_command_task_header_label()
 
     def command_task_time_label(self, value=None):
@@ -2603,6 +2611,72 @@ class ShellDeckTerminalWidget(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, task)
         task["item"] = task_table.item(row, 0)
 
+
+    def update_command_task_table_height(self):
+        """Begrenzt die Leiste "Letzte Befehle" auf 10 sichtbare Zeilen.
+
+        Wird die Leiste ein- und wieder ausgeklappt, setzten
+        set_command_task_panel_visible() und set_command_task_panel_expanded()
+        die Hoehe zuvor fest auf 150 Pixel zurueck — das reichte nur fuer rund
+        vier Zeilen. Beide Wege rufen jetzt diese Funktion auf.
+
+        Die Kopfzeile meldet ihre Hoehe erst nach dem ersten Layout-Durchlauf
+        sinnvoll; deshalb dient sizeHint() als Rueckfallwert.
+        """
+        table = getattr(self, "command_task_list", None)
+        if table is None:
+            return
+        header = table.horizontalHeader()
+        row_height = table.verticalHeader().defaultSectionSize()
+        header_height = max(header.height(), header.sizeHint().height())
+        table.setMaximumHeight(header_height + row_height * 10 + 2)
+
+    def persistent_task_to_live_task(self, entry):
+        started = entry.get("started_at")
+        try:
+            from datetime import datetime
+            started_value = datetime.fromisoformat(str(started or "")).timestamp()
+        except (TypeError, ValueError):
+            started_value = float(started or 0) if isinstance(started, (int, float)) else 0.0
+        return {
+            "original_command": str(entry.get("command") or entry.get("sent_command") or ""),
+            "sent_command": str(entry.get("sent_command") or ""),
+            "pre_commands": str(entry.get("pre_commands") or ""),
+            "started_at": started_value,
+            "ended_at": started_value + (float(entry.get("duration_ms") or 0) / 1000.0),
+            "duration": float(entry.get("duration_ms") or 0) / 1000.0,
+            "working_directory": str(entry.get("working_directory") or ""),
+            "shell_type": str(entry.get("shell_type") or ""),
+            "terminal_engine": "",
+            "exit_code": entry.get("exit_code"),
+            "status": str(entry.get("status") or ""),
+            "stdout": "",
+            "stderr": "",
+            "item": None,
+            "persistent_entry": entry,
+        }
+
+    def load_persistent_command_tasks(self, entries):
+        if getattr(self, "active_command_task", None) is not None:
+            return
+        table = getattr(self, "command_task_list", None)
+        if table is None:
+            return
+        self.command_tasks = []
+        table.setRowCount(0)
+        for entry in list(entries or [])[-80:][::-1]:
+            task = self.persistent_task_to_live_task(entry)
+            row = table.rowCount()
+            table.insertRow(row)
+            for column in range(table.columnCount()):
+                item = QTableWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, task)
+                table.setItem(row, column, item)
+            task["item"] = table.item(row, 0)
+            self.command_tasks.append(task)
+            self.update_command_task_item(task)
+        self.update_command_task_header_label()
+
     def start_command_task(self, original_command, sent_command, pre_commands=""):
         # Falls ShellDeck ausnahmsweise schon einen laufenden Task hat, wird er
         # bewusst als unbekannt abgeschlossen. So hängt die UI nie dauerhaft auf
@@ -2688,6 +2762,9 @@ class ShellDeckTerminalWidget(QWidget):
                 task["status"] = "erfolgreich"
         self.update_command_task_item(task)
         self.active_command_task = None
+        callback = getattr(self.window, "register_completed_command_task", None)
+        if callable(callback):
+            callback(self, task)
 
     def finish_active_command_task_if_prompt_returned(self):
         task = self.active_command_task
@@ -2789,9 +2866,17 @@ class ShellDeckTerminalWidget(QWidget):
             self.command_tasks.remove(task)
         if self.active_command_task is task:
             self.active_command_task = None
+        persistent_entry = task.get("persistent_entry")
+        remover = getattr(self.window, "remove_command_history_entries", None)
+        if persistent_entry is not None and callable(remover):
+            remover([persistent_entry])
         self.update_command_task_header_label()
 
     def clear_command_tasks(self):
+        persistent_entries = [task.get("persistent_entry") for task in self.command_tasks if task.get("persistent_entry") is not None]
+        remover = getattr(self.window, "remove_command_history_entries", None)
+        if persistent_entries and callable(remover):
+            remover(persistent_entries)
         self.command_tasks.clear()
         self.active_command_task = None
         self.command_task_list.setRowCount(0)
@@ -5054,6 +5139,7 @@ class ShellDeckTerminalWidget(QWidget):
         self.input_line.setFont(font)
         if hasattr(self, "input_prompt_label"):
             self.input_prompt_label.setFont(font)
+        self.update_command_task_table_height()
 
     def apply_theme(self):
         theme = self.window.active_theme()

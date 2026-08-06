@@ -35,6 +35,7 @@ def normalize_workspace(value: Any) -> Dict[str, Any]:
                 "client_mode_kind": _clean_text(item.get("client_mode_kind") or item.get("client_mode")),
                 "ollama_model": _clean_text(item.get("ollama_model")),
                 "ollama_system_prompt": _clean_text(item.get("ollama_system_prompt")),
+                "source_profile_name": _clean_text(item.get("source_profile_name")),
             })
     return {
         "name": name,

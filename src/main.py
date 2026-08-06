@@ -3,6 +3,7 @@ import sys
 import re
 import json
 import time
+from datetime import datetime
 import os
 import traceback
 import faulthandler
@@ -20,12 +21,13 @@ from shelldeck_workspaces import normalize_workspace, normalize_workspaces, work
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
 from shelldeck_file_context import append_file_context_to_prompt, build_file_context_block, read_text_file_context
 from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
+from shelldeck_command_history import CommandHistoryDialog
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
     QDialog, QFormLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QSlider,
     QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog,
-    QLineEdit, QListWidget, QListWidgetItem, QSplitter
+    QLineEdit, QListWidget, QListWidgetItem, QSplitter, QMessageBox
 )
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer, QByteArray
 from PySide6.QtGui import (
@@ -150,6 +152,12 @@ class TerminalWindow(QMainWindow):
         self.default_start_directory = ""
         self.selected_ollama_model = ""
         self.ai_features_enabled = False
+        self.carry_over_profiles_on_exit = False
+        self.carry_over_workspaces_on_exit = False
+        self.active_workspace_name = ""
+        self.command_history_entries = []
+        self._command_history_save_pending = False
+        self.command_history_dialog = None
         self.pre_command_visible = True
         self.pre_command_enabled = False
         self.pre_command_text = ""
@@ -166,7 +174,9 @@ class TerminalWindow(QMainWindow):
         self.pre_command_store_file = workspace_config_base / "pre_command.json"
         self.terminal_engine_store_file = workspace_config_base / "terminal_engine.json"
         self.theme_store_file = workspace_config_base / "theme.json"
+        self.command_history_store_file = workspace_config_base / "command_history.json"
         self.load_history()
+        self.load_command_history()
 
         menubar = self.menuBar()
         self.file_menu = menubar.addMenu("&Datei")
@@ -226,6 +236,11 @@ class TerminalWindow(QMainWindow):
         self.command_task_panel_action.setCheckable(True)
         self.command_task_panel_action.triggered.connect(self.set_current_command_task_panel_visible)
         self.view_menu.addAction(self.command_task_panel_action)
+
+        history_search_action = QAction("Befehlsverlauf durchsuchen…", self)
+        history_search_action.setShortcut("Ctrl+Shift+H")
+        history_search_action.triggered.connect(self.show_command_history_dialog)
+        self.view_menu.addAction(history_search_action)
 
         self.command_task_expand_action = QAction("Letzte Befehle ausklappen", self)
         self.command_task_expand_action.setToolTip("Klappt die Tabelle der letzten Befehle im aktuellen Tab auf oder zu.")
@@ -309,6 +324,16 @@ class TerminalWindow(QMainWindow):
         history_action = QAction("History-Größe", self)
         history_action.triggered.connect(self.show_history_dialog)
         settings_menu.addAction(history_action)
+
+        self.carry_profiles_action = QAction("Profiländerungen beim Beenden übernehmen", self)
+        self.carry_profiles_action.setCheckable(True)
+        self.carry_profiles_action.triggered.connect(self.set_carry_over_profiles_on_exit)
+        settings_menu.addAction(self.carry_profiles_action)
+
+        self.carry_workspaces_action = QAction("Workspace-Änderungen beim Beenden übernehmen", self)
+        self.carry_workspaces_action.setCheckable(True)
+        self.carry_workspaces_action.triggered.connect(self.set_carry_over_workspaces_on_exit)
+        settings_menu.addAction(self.carry_workspaces_action)
 
         shell_action = QAction("Shell-Backend", self)
         shell_action.triggered.connect(self.select_shell)
@@ -1586,6 +1611,7 @@ class TerminalWindow(QMainWindow):
         )
         if not isinstance(tab, TerminalTab):
             return
+        tab.source_profile_name = str(profile.get("name", "") or "").strip()
 
         ollama_model = str(profile.get("ollama_model", "") or "").strip()
         startup_command = str(profile.get("startup_command", "") or "").strip()
@@ -1726,6 +1752,7 @@ class TerminalWindow(QMainWindow):
             if str(item.get("name", "") or "").strip().lower() != workspace["name"].strip().lower()
         ]
         self.workspaces.append(workspace)
+        self.active_workspace_name = workspace["name"]
         self.rebuild_workspaces_menu()
         settings_ok = self.save_settings()
         store_ok = self.save_persistent_workspaces()
@@ -1789,6 +1816,7 @@ class TerminalWindow(QMainWindow):
 
     def load_workspace(self, workspace):
         workspace = normalize_workspace(workspace)
+        self.active_workspace_name = str(workspace.get("name", "") or "").strip()
         self.default_start_directory = workspace.get("default_start_directory", "")
         self.selected_ollama_model = workspace.get("selected_ollama_model", "")
         shell_type = self.normalize_shell_type(workspace.get("shell_type", ""))
@@ -1828,6 +1856,7 @@ class TerminalWindow(QMainWindow):
                     )
                 else:
                     tab.schedule_restore_command(item.get("restore_command", ""))
+                tab.source_profile_name = str(item.get("source_profile_name", "") or "").strip()
                 if "command_task_panel_visible" in item:
                     tab.set_command_task_panel_visible(bool(item.get("command_task_panel_visible", True)), save=False)
                 if "command_task_panel_expanded" in item:
@@ -2387,6 +2416,7 @@ class TerminalWindow(QMainWindow):
                     )
                 else:
                     tab.schedule_restore_command(item.get("restore_command", ""))
+                tab.source_profile_name = str(item.get("source_profile_name", "") or "").strip()
                 if "command_task_panel_visible" in item:
                     tab.set_command_task_panel_visible(bool(item.get("command_task_panel_visible", True)), save=False)
                 if "command_task_panel_expanded" in item:
@@ -2410,6 +2440,7 @@ class TerminalWindow(QMainWindow):
             "command_task_panel_visible": bool(getattr(tab, "command_task_panel_visible", True)),
             "command_task_panel_expanded": bool(getattr(tab, "command_task_panel_expanded", False)),
             "pure_terminal_mode": bool(getattr(tab, "pure_terminal_mode", False)),
+            "source_profile_name": str(getattr(tab, "source_profile_name", "") or "").strip(),
         }
         if detached_window is not None:
             item["view_pane"] = "detached"
@@ -2963,6 +2994,12 @@ class TerminalWindow(QMainWindow):
         self.default_start_directory = str(settings.get("default_start_directory", self.default_start_directory or "") or "")
         self.selected_ollama_model = str(settings.get("selected_ollama_model", self.selected_ollama_model or "") or "")
         self.ai_features_enabled = bool(settings.get("ai_features_enabled", False))
+        self.carry_over_profiles_on_exit = bool(settings.get("carry_over_profiles_on_exit", False))
+        self.carry_over_workspaces_on_exit = bool(settings.get("carry_over_workspaces_on_exit", False))
+        if hasattr(self, "carry_profiles_action"):
+            self.carry_profiles_action.setChecked(self.carry_over_profiles_on_exit)
+        if hasattr(self, "carry_workspaces_action"):
+            self.carry_workspaces_action.setChecked(self.carry_over_workspaces_on_exit)
         self.apply_pre_command_settings_mapping(settings)
         self.apply_pre_command_settings_mapping(self.load_pre_command_persistent_settings())
         self.tab_profiles = normalize_profiles(settings.get("tab_profiles", self.tab_profiles))
@@ -2994,6 +3031,8 @@ class TerminalWindow(QMainWindow):
             "default_start_directory": self.default_start_directory,
             "selected_ollama_model": self.selected_ollama_model,
             "ai_features_enabled": self.ai_features_enabled,
+            "carry_over_profiles_on_exit": self.carry_over_profiles_on_exit,
+            "carry_over_workspaces_on_exit": self.carry_over_workspaces_on_exit,
             **pre_command_settings,
             "tab_profiles": normalize_profiles(self.tab_profiles),
             "workspaces": normalize_workspaces(self.workspaces),
@@ -4027,8 +4066,126 @@ Hinweise
         layout.addWidget(buttons)
         dialog.exec()
 
+
+    def set_carry_over_profiles_on_exit(self, enabled):
+        self.carry_over_profiles_on_exit = bool(enabled)
+        self.save_settings()
+
+    def set_carry_over_workspaces_on_exit(self, enabled):
+        self.carry_over_workspaces_on_exit = bool(enabled)
+        self.save_settings()
+
+    def load_command_history(self):
+        self.command_history_entries = []
+        try:
+            data = json.loads(self.command_history_store_file.read_text(encoding="utf-8"))
+            entries = data.get("entries", []) if isinstance(data, dict) else []
+            if isinstance(entries, list):
+                self.command_history_entries = [item for item in entries if isinstance(item, dict)][-2000:]
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def save_command_history(self):
+        try:
+            self.command_history_store_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = self.command_history_store_file.with_suffix(self.command_history_store_file.suffix + ".tmp")
+            tmp_file.write_text(json.dumps({"version": 1, "entries": self.command_history_entries[-2000:]}, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_file.replace(self.command_history_store_file)
+            self._command_history_save_pending = False
+            return True
+        except OSError as exc:
+            self._command_history_save_pending = False
+            self.show_status(f"Befehlsverlauf konnte nicht gespeichert werden: {exc}")
+            return False
+
+    def schedule_command_history_save(self):
+        if self._command_history_save_pending:
+            return
+        self._command_history_save_pending = True
+        QTimer.singleShot(2000, self.save_command_history)
+
+    def register_completed_command_task(self, tab, task):
+        entry = {
+            "command": str(task.get("original_command") or task.get("sent_command") or "").strip(),
+            "sent_command": str(task.get("sent_command") or "").strip(),
+            "pre_commands": str(task.get("pre_commands") or "").strip(),
+            "status": str(task.get("status") or ""),
+            "exit_code": task.get("exit_code"),
+            "started_at": datetime.fromtimestamp(float(task.get("started_at") or time.time())).isoformat(timespec="seconds"),
+            "duration_ms": int(round(float(task.get("duration") or 0) * 1000)),
+            "working_directory": str(task.get("working_directory") or ""),
+            "shell_type": str(task.get("shell_type") or ""),
+            "tab_title": str(getattr(tab, "custom_title", "") or getattr(tab, "title", "") or ""),
+        }
+        self.command_history_entries.append(entry)
+        self.command_history_entries = self.command_history_entries[-2000:]
+        self.schedule_command_history_save()
+        self.refresh_command_history_views()
+
+    def remove_command_history_entries(self, entries):
+        identities = {id(item) for item in entries if isinstance(item, dict)}
+        self.command_history_entries = [item for item in self.command_history_entries if id(item) not in identities]
+        self.save_command_history()
+        self.refresh_command_history_views()
+
+    def refresh_command_history_views(self):
+        for _, _, tab in self.all_terminal_tabs():
+            refresh = getattr(tab, "load_persistent_command_tasks", None)
+            if callable(refresh):
+                refresh(self.command_history_entries)
+        dialog = getattr(self, "command_history_dialog", None)
+        if dialog is not None and dialog.isVisible():
+            dialog.refresh()
+
+    def show_command_history_dialog(self):
+        if self.command_history_dialog is None:
+            self.command_history_dialog = CommandHistoryDialog(self)
+        self.command_history_dialog.refresh()
+        self.command_history_dialog.show()
+        self.command_history_dialog.raise_()
+        self.command_history_dialog.activateWindow()
+
+    def carry_over_workspace_on_exit(self):
+        name = str(self.active_workspace_name or "").strip()
+        if not self.carry_over_workspaces_on_exit or not name:
+            return
+        answer = QMessageBox.question(self, "Workspace übernehmen", f"Workspace »{name}« mit dem aktuellen Zustand überschreiben?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        workspace = workspace_from_tabs(self.collect_tab_settings(), name=name, default_start_directory=self.default_start_directory, selected_ollama_model=self.selected_ollama_model, shell_type=self.shell_type, terminal_engine=self.current_terminal_engine(), layout_mode=getattr(self, "view_layout_mode", "single"))
+        self.workspaces = [item for item in normalize_workspaces(self.workspaces) if str(item.get("name", "")).strip().casefold() != name.casefold()]
+        self.workspaces.append(workspace)
+        self.save_persistent_workspaces()
+
+    def carry_over_profiles_on_exit_confirmed(self):
+        if not self.carry_over_profiles_on_exit:
+            return
+        chosen = {}
+        current = self.current_terminal()
+        for _, _, tab in self.all_terminal_tabs():
+            name = str(getattr(tab, "source_profile_name", "") or "").strip()
+            if name:
+                chosen[name.casefold()] = (name, tab)
+        if isinstance(current, TerminalTab):
+            name = str(getattr(current, "source_profile_name", "") or "").strip()
+            if name:
+                chosen[name.casefold()] = (name, current)
+        if not chosen:
+            return
+        names = [value[0] for value in chosen.values()]
+        answer = QMessageBox.question(self, "Profile übernehmen", "Folgende Profile mit dem aktuellen Zustand überschreiben? — " + ", ".join(names))
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        replacements = {key: profile_from_tab(tab, name=name, startup_command=("" if getattr(tab, "_venv_deactivated", False) else tab.current_restore_command())) for key, (name, tab) in chosen.items()}
+        profiles = [item for item in normalize_profiles(self.tab_profiles) if str(item.get("name", "")).strip().casefold() not in replacements]
+        profiles.extend(replacements.values())
+        self.tab_profiles = normalize_profiles(profiles)
+
     def closeEvent(self, event):
         self._closing_app = True
+        self.carry_over_workspace_on_exit()
+        self.carry_over_profiles_on_exit_confirmed()
+        self.save_command_history()
         self.save_settings()
         for _, _, tab in self.all_terminal_tabs():
             tab.stop_process(fast=True)
