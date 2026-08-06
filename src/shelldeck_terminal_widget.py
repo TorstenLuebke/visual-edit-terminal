@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QMenu, QLineEdit, QListWidget, QListWidgetItem, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox
 )
-from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QEvent, QThread, Signal, QTimer
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor,
     QSyntaxHighlighter, QAction, QTextOption
@@ -135,15 +135,20 @@ def command_targets_shelldeck(command):
     return False
 
 
-def split_on_unquoted_semicolons(text):
-    """Zerlegt eine Befehlszeile an Semikolons ausserhalb von Anführungszeichen.
+def split_shell_command_parts(text, extra_separators=()):
+    """Zerlegt eine Befehlszeile an Trennern ausserhalb von Anführungszeichen.
 
     ``str.split(";")`` zerschneidet sonst Pfade und Argumente, in denen ein
     Semikolon in Quotes steht (unter Windows z.B.
     ``7z a out.7z "C:/Daten/Alt; Neu"`` oder ``-mmt=on;x=9``-artige Angaben in
     Anführungszeichen). Die Teilbefehle laufen dann als zwei kaputte Zeilen.
+
+    ``extra_separators`` erlaubt zusaetzliche mehrzeichige Trenner wie ``&&``
+    und ``||``. Die werden nur fuer die Kontextauswertung (Arbeitsordner, venv)
+    benutzt, nicht fuer das Absenden an die Shell.
     """
     value = str(text or "")
+    separators = tuple(sorted({str(item) for item in extra_separators if item}, key=len, reverse=True))
     parts = []
     current = []
     quote = ""
@@ -158,17 +163,37 @@ def split_on_unquoted_semicolons(text):
             elif char == "\\" and quote == '"' and index + 1 < length:
                 current.append(value[index + 1])
                 index += 1
-        elif char in "\"'":
+            index += 1
+            continue
+        if char in "\"'":
             quote = char
             current.append(char)
-        elif char == ";":
+            index += 1
+            continue
+        matched = ""
+        for separator in separators:
+            if value.startswith(separator, index):
+                matched = separator
+                break
+        if matched:
             parts.append("".join(current))
             current = []
-        else:
-            current.append(char)
+            index += len(matched)
+            continue
+        if char == ";":
+            parts.append("".join(current))
+            current = []
+            index += 1
+            continue
+        current.append(char)
         index += 1
     parts.append("".join(current))
     return parts
+
+
+def split_on_unquoted_semicolons(text):
+    """Zerlegt nur an Semikolons ausserhalb von Anführungszeichen."""
+    return split_shell_command_parts(text)
 
 
 
@@ -1844,7 +1869,9 @@ class ShellDeckTerminalWidget(QWidget):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
         result = []
         for line in text.split("\n"):
-            for part in split_on_unquoted_semicolons(line):
+            # Fuer den Kontext (Arbeitsordner, venv) zaehlen auch Verkettungen
+            # mit && und ||: "mkdir -p x && cd x" wechselt den Ordner genauso.
+            for part in split_shell_command_parts(line, extra_separators=("&&", "||")):
                 clean = part.strip()
                 if clean:
                     result.append(clean)
@@ -3039,6 +3066,17 @@ class ShellDeckTerminalWidget(QWidget):
             return process
         process = QProcess(self)
         process._shelldeck_engine = "qprocess"
+        # Ohne TERM scheitern curses-artige Werkzeuge: "clear" meldet
+        # "TERM environment variable not set.", ebenso less, top, nano.
+        # Der PTY-Adapter setzt TERM bereits selbst; die QProcess-Engine hatte
+        # es bisher nicht, weil sie unter Linux faktisch nie lief.
+        try:
+            environment = QProcessEnvironment.systemEnvironment()
+            if not environment.contains("TERM") or not environment.value("TERM").strip():
+                environment.insert("TERM", "xterm-256color")
+            process.setProcessEnvironment(environment)
+        except Exception:
+            pass
         if requested_engine == "pty" and not user_choice:
             # Nur die automatische Vorgabe darf zurückfallen. Eine bewusste
             # Auswahl bleibt gespeichert, damit sie nach einem vorübergehend
@@ -3272,6 +3310,13 @@ class ShellDeckTerminalWidget(QWidget):
                 return True
             if event.key() == Qt.Key.Key_Down:
                 self.show_next_command()
+                return True
+            if event.key() == Qt.Key.Key_Escape and getattr(self, "interaction_prompt_active", False):
+                # Notausstieg aus dem Antwortmodus. Wenn ShellDeck den Prompt
+                # einer Shell einmal nicht erkennt, kommt man sonst nicht mehr
+                # in den normalen Befehlsmodus zurueck.
+                self._awaiting_command_completion = False
+                self.reset_interaction_prompt_mode("Antwortmodus verlassen; Eingaben laufen wieder als Befehl")
                 return True
         return super().eventFilter(source, event)
 
@@ -4087,6 +4132,21 @@ class ShellDeckTerminalWidget(QWidget):
             re.compile(r"(?:^|\n)\s*\([^\r\n()]+\)\s*PS\s+[^\r\n>]+>\s*$"),
             re.compile(r"(?:^|\n)\s*[A-Za-z]:[\\/][^\r\n>]*>\s*$"),
             re.compile(r"(?:^|\n)\s*(?:\([^\r\n()]+\)\s*)?[^@\s:\r\n]+@[^:\r\n]+:[^\r\n#$]*[#$]\s*$"),
+            # Bash/sh ohne eigenes PS1 — genau das liefert
+            # shell_start_args() mit "--noprofile --norc":
+            #   "bash-5.2$", "sh-5.2#", "(.venv) bash-5.2$"
+            # Ohne dieses Muster galt der zurueckgekehrte Prompt nie als
+            # erkannt. _awaiting_command_completion blieb dann dauerhaft True,
+            # das Terminal hing im Antwortmodus fest, und jede weitere Eingabe
+            # ging roh an die Shell — ohne cls/clear-Uebersetzung, ohne
+            # Historie und ohne Ordneranzeige.
+            re.compile(
+                r"(?:^|\n)\s*(?:\([^\r\n()]*\)\s*)?"
+                r"(?:bash|sh|dash|ksh|zsh|fish)-[0-9][0-9.a-zA-Z]*\s*[#$%]\s*$",
+                re.IGNORECASE,
+            ),
+            # Minimalprompt, z.B. "$ ", "# ", "% " oder "(.venv) $ ".
+            re.compile(r"(?:^|\n)\s*(?:\([^\r\n()]*\)\s*)?[#$%]\s*$"),
         ]
 
     def output_ends_with_shell_prompt(self, text):
@@ -4131,6 +4191,13 @@ class ShellDeckTerminalWidget(QWidget):
         if not getattr(self, "_awaiting_command_completion", False):
             return False
         if getattr(self, "client_mode_active", False) or getattr(self, "password_prompt_active", False):
+            return False
+        # Sicherheitsventil: Ohne laufende Shell kann nichts auf eine Antwort
+        # warten. Sonst konnte ein einmal nicht erkannter Prompt das Terminal
+        # dauerhaft im Antwortmodus einsperren.
+        process = getattr(self, "process", None)
+        if process is None or process.state() != QProcess.ProcessState.Running:
+            self._awaiting_command_completion = False
             return False
         output = self.terminal_output_text_for_state_checks()
         if self.output_ends_with_shell_prompt(output):
