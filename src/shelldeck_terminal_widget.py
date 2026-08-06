@@ -4631,11 +4631,80 @@ class ShellDeckTerminalWidget(QWidget):
         self.process.write(self.encode_process_input(payload) + b"\n")
         self.input_line.clear()
 
+    SUDO_PIPE_PROMPT = "[sudo] Passwort für %p:"
+
+    def prepare_sudo_command_for_pipe(self, command_text):
+        """Macht sudo auch ohne TTY benutzbar (QProcess-Engine).
+
+        Ohne steuerndes Terminal weigert sich sudo, ein Passwort zu lesen:
+        "sudo: ein Terminal ist erforderlich, um das Passwort zu lesen".
+        Unter der PTY-Engine gibt es ein TTY, deshalb fiel das dort nie auf.
+
+        Mit "-S" liest sudo das Passwort von der Standardeingabe — genau dem
+        Kanal, über den ShellDeck ohnehin schreibt. "-p" setzt einen Prompt, den
+        output_contains_password_prompt() sicher erkennt, sodass der vorhandene
+        Passwortdialog aufgeht. Das Passwort geht als Zeile in die Standard-
+        eingabe und taucht damit nicht in der Prozessliste auf.
+
+        Unangetastet bleiben Aufrufe, die schon selbst festlegen, woher das
+        Passwort kommt (-S, -A/--askpass), die gar keines wollen (-n) oder die
+        eine Shell oeffnen (sudo -i / -s) — dort wuerde die Umschreibung stoeren.
+        """
+        text = str(command_text or "")
+        if self.process_uses_pty_engine() or sys.platform == "win32":
+            return text
+        rewritten = []
+        for line in text.split("\n"):
+            parts = split_shell_command_parts(line, extra_separators=("&&", "||"))
+            new_parts = []
+            for part in parts:
+                new_parts.append(self.rewrite_single_sudo_call(part))
+            # Die Trenner sind bei dieser Zerlegung verloren, deshalb nur
+            # ersetzen, wenn sich tatsaechlich etwas geaendert hat.
+            if new_parts == parts:
+                rewritten.append(line)
+                continue
+            rebuilt = line
+            for old, new in zip(parts, new_parts):
+                if old != new:
+                    rebuilt = rebuilt.replace(old, new, 1)
+            rewritten.append(rebuilt)
+        return "\n".join(rewritten)
+
+    def rewrite_single_sudo_call(self, part):
+        stripped = str(part or "").strip()
+        if not stripped:
+            return part
+        try:
+            words = shlex.split(stripped)
+        except ValueError:
+            return part
+        if not words or Path(words[0]).name.lower() != "sudo":
+            return part
+        options = []
+        for word in words[1:]:
+            if not word.startswith("-"):
+                break
+            options.append(word)
+        blocking = {"-S", "--stdin", "-A", "--askpass", "-n", "--non-interactive", "-i", "--login", "-s", "--shell"}
+        for option in options:
+            if option in blocking or option.split("=", 1)[0] in blocking:
+                return part
+            # Zusammengefasste Kurzoptionen wie "-nS" beruecksichtigen.
+            if len(option) > 1 and not option.startswith("--") and set(option[1:]) & set("SAnis"):
+                return part
+        prefix_length = len(stripped) - len(stripped.lstrip())
+        prefix = stripped[:prefix_length] if prefix_length else ""
+        remainder = stripped.strip()[len(words[0]):].lstrip()
+        injected = f"{words[0]} -S -p {shlex.quote(self.SUDO_PIPE_PROMPT)} {remainder}".rstrip()
+        return part.replace(stripped, prefix + injected, 1)
+
     def write_shell_command(self, command):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
         if not text:
             return
         self.update_working_context_from_shell_command(text)
+        text = self.prepare_sudo_command_for_pipe(text)
 
         # Nach jedem normalen POSIX-Shell-Befehl fragt ShellDeck den echten
         # Arbeitsordner nur bei Shell-State-Befehlen direkt ab. Ein pauschaler
