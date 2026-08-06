@@ -124,6 +124,10 @@ class TerminalWindow(QMainWindow):
         self.theme_config = self.default_theme_config()
         self.shell_type = self.default_shell_type()
         self.terminal_engine = "qprocess"
+        # True, sobald der Benutzer die Engine bewusst ausgewaehlt hat (Liste,
+        # Menue oder gespeicherte Einstellung). Nur solange das False ist, darf
+        # create_shell_process() unter Linux/macOS automatisch auf PTY anheben.
+        self.terminal_engine_is_user_choice = False
         self.max_history_size = 1000
         self.terminal_font = QFont("Courier New", 10)
         self.saved_tabs = []
@@ -597,6 +601,10 @@ class TerminalWindow(QMainWindow):
         self.terminal_engine = self.normalize_terminal_engine(
             mapping.get("terminal_engine", getattr(self, "terminal_engine", "qprocess"))
         )
+        if "terminal_engine" in mapping:
+            # Eine gespeicherte Engine stammt immer aus einer frueheren
+            # bewussten Auswahl und darf nicht wieder ueberschrieben werden.
+            self.terminal_engine_is_user_choice = True
 
     def terminal_engine_combo_value(self):
         combo = getattr(self, "terminal_engine_combo", None)
@@ -610,8 +618,13 @@ class TerminalWindow(QMainWindow):
         except RuntimeError:
             return self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
 
-    def set_terminal_engine(self, engine, *, show_message=True, save=True, apply_to_current_tab=True):
+    def set_terminal_engine(self, engine, *, show_message=True, save=True, apply_to_current_tab=True, user_choice=False):
         new_engine = self.normalize_terminal_engine(engine)
+        if user_choice:
+            # Ab jetzt ist die Engine verbindlich. Ohne diese Markierung setzte
+            # create_shell_process() die Auswahl unter Linux sofort auf PTY
+            # zurueck, und die Auswahlliste sprang wieder um.
+            self.terminal_engine_is_user_choice = True
         if new_engine == "pty":
             message = PtyTerminalProcess.availability_message()
             if message and show_message:
@@ -632,7 +645,9 @@ class TerminalWindow(QMainWindow):
                 self.show_status(f"Terminal-Engine: {self.terminal_engine_label(new_engine)}. {suffix}")
 
     def set_terminal_engine_from_combo(self, index=0):
-        self.set_terminal_engine(self.terminal_engine_combo_value(), show_message=True, save=True)
+        self.set_terminal_engine(
+            self.terminal_engine_combo_value(), show_message=True, save=True, user_choice=True
+        )
 
     def update_terminal_engine_ui(self):
         combo = getattr(self, "terminal_engine_combo", None)
@@ -2657,7 +2672,7 @@ class TerminalWindow(QMainWindow):
         if not ok:
             return
         new_engine = "pty" if choice.startswith("PTY/") else "qprocess"
-        self.set_terminal_engine(new_engine, show_message=True, save=True)
+        self.set_terminal_engine(new_engine, show_message=True, save=True, user_choice=True)
 
     def system_shell(self, shell_type=None) -> str:
         shell_type = self.normalize_shell_type(shell_type or self.shell_type)

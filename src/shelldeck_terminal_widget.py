@@ -77,12 +77,18 @@ def command_targets_shelldeck(command):
     startenden Fenstern (z.B. wenn ShellDeck aus einem ShellDeck-Terminal mit
     "python src/main.py" gestartet wurde). Manuelle Eingaben des Benutzers
     bleiben davon unberührt.
+
+    Wichtig: Geprüft wird, ob ein Token wirklich ein *Startziel* ist. Früher
+    genügte das blosse Vorkommen der Zeichenkette "shelldeck" irgendwo im
+    Befehl. Dadurch galten harmlose Befehle wie
+    ``tar -czf ShellDeck_backup.tar.gz src`` oder
+    ``Compress-Archive -Path C:\\Projekte\\ShellDeck -DestinationPath x.zip``
+    als Selbststart und wurden beim Restore/Startbefehl kommentarlos
+    übersprungen.
     """
     text = str(command or "").strip()
     if not text:
         return False
-    if "shelldeck" in text.lower():
-        return True
     try:
         app_path = Path(sys.argv[0]).resolve()
     except (OSError, RuntimeError):
@@ -92,12 +98,33 @@ def command_targets_shelldeck(command):
         tokens = shlex.split(normalized, posix=(sys.platform != "win32"))
     except ValueError:
         tokens = normalized.split()
+    cleaned_tokens = [str(token).strip("\"'") for token in tokens]
     relative_self = {"main.py", "./main.py", "src/main.py", "./src/main.py"}
-    for token in tokens:
-        cleaned = str(token).strip("\"'")
-        if not cleaned.lower().endswith("main.py"):
+
+    def token_is_shelldeck_launcher(value, position):
+        name = Path(value).name.lower()
+        stem = name.rsplit(".", 1)[0]
+        if stem != "shelldeck":
+            return False
+        if name.endswith((".py", ".pyw", ".exe", ".bat", ".cmd", ".sh")):
+            return True
+        # Ein endungsloses "shelldeck" zaehlt nur in Programmposition. Sonst
+        # waeren Ordner- und Archivnamen wie "C:/Projekte/ShellDeck" oder
+        # "ShellDeck.zip" faelschlich ein Selbststart.
+        return position == 0
+
+    for index, cleaned in enumerate(cleaned_tokens):
+        if not cleaned:
             continue
-        if cleaned.lower() in relative_self:
+        lowered = cleaned.lower()
+        # "python -m shelldeck" / "python -m shelldeck.main"
+        if lowered.split(".", 1)[0] == "shelldeck" and index > 0 and cleaned_tokens[index - 1].lower() == "-m":
+            return True
+        if token_is_shelldeck_launcher(cleaned, index):
+            return True
+        if not lowered.endswith("main.py"):
+            continue
+        if lowered in relative_self:
             return True
         if app_path is not None:
             try:
@@ -106,6 +133,42 @@ def command_targets_shelldeck(command):
             except (OSError, RuntimeError):
                 continue
     return False
+
+
+def split_on_unquoted_semicolons(text):
+    """Zerlegt eine Befehlszeile an Semikolons ausserhalb von Anführungszeichen.
+
+    ``str.split(";")`` zerschneidet sonst Pfade und Argumente, in denen ein
+    Semikolon in Quotes steht (unter Windows z.B.
+    ``7z a out.7z "C:/Daten/Alt; Neu"`` oder ``-mmt=on;x=9``-artige Angaben in
+    Anführungszeichen). Die Teilbefehle laufen dann als zwei kaputte Zeilen.
+    """
+    value = str(text or "")
+    parts = []
+    current = []
+    quote = ""
+    index = 0
+    length = len(value)
+    while index < length:
+        char = value[index]
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            elif char == "\\" and quote == '"' and index + 1 < length:
+                current.append(value[index + 1])
+                index += 1
+        elif char in "\"'":
+            quote = char
+            current.append(char)
+        elif char == ";":
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    parts.append("".join(current))
+    return parts
 
 
 
@@ -133,6 +196,10 @@ class DefaultTerminalHost:
         self.max_history_size = 1000
         self.default_command = ""
         self.terminal_engine = "qprocess"
+        # False = die Engine ist nur eine Vorgabe und darf plattformabhaengig
+        # automatisch auf PTY angehoben werden. Einbettende Anwendungen (z.B.
+        # Visual Edit) koennen True setzen, um ihre Wahl verbindlich zu machen.
+        self.terminal_engine_is_user_choice = False
         self.theme_key = "dark"
         self.shell_type = self.default_shell_type()
         self._status_bar = _NullStatusBar()
@@ -1777,7 +1844,7 @@ class ShellDeckTerminalWidget(QWidget):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
         result = []
         for line in text.split("\n"):
-            for part in line.split(";"):
+            for part in split_on_unquoted_semicolons(line):
                 clean = part.strip()
                 if clean:
                     result.append(clean)
@@ -2883,7 +2950,7 @@ class ShellDeckTerminalWidget(QWidget):
 
         def append_split_commands(text_block):
             for line in str(text_block or "").splitlines():
-                for cmd in line.split(";"):
+                for cmd in split_on_unquoted_semicolons(line):
                     text = cmd.strip()
                     if text:
                         commands.append(text)
@@ -2947,10 +3014,22 @@ class ShellDeckTerminalWidget(QWidget):
 
     def create_shell_process(self):
         requested_engine = self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
-        if sys.platform != "win32" and str(self.shell_type or "").lower() in {"bash", "zsh", "fish", "sh"}:
+        user_choice = bool(getattr(self.window, "terminal_engine_is_user_choice", False))
+        if (
+            not user_choice
+            and sys.platform != "win32"
+            and str(self.shell_type or "").lower() in {"bash", "zsh", "fish", "sh"}
+        ):
             # Auf Linux/macOS sollen interaktive Shells standardmäßig über ein
             # echtes PTY laufen. QProcess-Pipes erzeugen bei Bash sonst Meldungen
             # wie "Keine Jobsteuerung in dieser Shell".
+            #
+            # Das gilt aber nur als Vorgabe. Früher wurde hier bedingungslos auf
+            # "pty" umgeschaltet UND self.terminal_engine überschrieben. Wer in
+            # der Auswahlliste "Standard QProcess" wählte, bekam dadurch sofort
+            # wieder PTY: set_terminal_engine() startete den Tab neu,
+            # create_shell_process() setzte "pty" zurück, und
+            # update_terminal_engine_ui() stellte die Liste entsprechend um.
             if PtyTerminalProcess.is_available():
                 requested_engine = "pty"
                 self.terminal_engine = "pty"
@@ -2960,7 +3039,11 @@ class ShellDeckTerminalWidget(QWidget):
             return process
         process = QProcess(self)
         process._shelldeck_engine = "qprocess"
-        if requested_engine == "pty":
+        if requested_engine == "pty" and not user_choice:
+            # Nur die automatische Vorgabe darf zurückfallen. Eine bewusste
+            # Auswahl bleibt gespeichert, damit sie nach einem vorübergehend
+            # nicht verfügbaren PTY nicht dauerhaft verloren geht;
+            # actual_terminal_engine() meldet ohnehin die echte Engine.
             self.terminal_engine = "qprocess"
         return process
 
@@ -4096,12 +4179,55 @@ class ShellDeckTerminalWidget(QWidget):
         kein normaler Shell-Prompt zurück ist.
         """
         return [
-            re.compile(r"(?:^|\n).{0,260}(?:\[[^\]\r\n]{1,80}\]|\([^()\r\n]{1,80}\))\s*[:?]?\s*$", re.IGNORECASE),
+            # Auswahl in Klammern mit echtem Trennzeichen: "(y/n)", "[J/N]",
+            # "[a/w/n]", "(ja/nein)".
+            re.compile(
+                r"(?:^|\n).{0,260}[\[(]\s*[A-Za-z0-9ÄÖÜäöüß?]{1,14}"
+                r"(?:\s*[/|,]\s*[A-Za-z0-9ÄÖÜäöüß?]{1,14})+\s*[\])].{0,40}$",
+                re.IGNORECASE,
+            ),
+            # Beliebiger Klammerausdruck am Zeilenende — aber nur mit
+            # abschliessendem ":" oder "?". Ohne diese Pflicht galt praktisch
+            # jede Werkzeugausgabe als Rückfrage, weil Packer ihre Zeilen fast
+            # immer mit einer Klammer beenden:
+            #   "  adding: src/main.py (deflated 72%)"
+            #   "Archive size: 45678 bytes (45 KiB)"
+            #   "Total bytes written: 10240 (10KiB, 5.0MiB/s)"
+            #   "Updating ZIP archive out.zip (1 von 3)"
+            re.compile(r"(?:^|\n).{0,260}(?:\[[^\]\r\n]{1,80}\]|\([^()\r\n]{1,80}\))\s*[:?]\s*$", re.IGNORECASE),
             re.compile(r"(?:^|\n).{0,260}(?:yes/no|y/n|j/n|ja/nein|yes to all|no to all|all/none|a/w/n|abort|retry|ignore|abbrechen|wiederholen|weiter|neu versuchen).{0,160}[:?]\s*$", re.IGNORECASE),
             re.compile(r"(?:^|\n).{0,260}(?:fortfahren|weiter|löschen|loeschen|überschreiben|ueberschreiben|overwrite|delete|remove|continue|proceed|confirm|bestätigen|bestaetigen|abbrechen|retry|ignore|wiederholen|neu versuchen).{0,180}\?\s*$", re.IGNORECASE),
-            re.compile(r"(?:^|\n).{0,260}\[[A-Za-zÄÖÜäöü?]\].{0,260}(?:\[[A-Za-zÄÖÜäöü?]\].{0,260}){1,}:\s*$", re.IGNORECASE | re.DOTALL),
+            # Mehrere Einzelbuchstaben in Klammern, z.B. PowerShell-Confirm
+            # "[Y] Ja  [A] Ja, alle  [N] Nein  [?] Hilfe (Standard ist "Y"):"
+            # oder 7-Zip "(Y)es / (N)o / (A)lways / (Q)uit?".
+            re.compile(
+                r"(?:^|\n).{0,260}[\[(][A-Za-zÄÖÜäöü?][\])].{0,260}"
+                r"(?:[\[(][A-Za-zÄÖÜäöü?][\])].{0,260}){1,}[:?]\s*$",
+                re.IGNORECASE | re.DOTALL,
+            ),
             re.compile(r"(?:^|\n).{0,260}(?:press any key|drücken sie eine beliebige taste|beliebige taste|enter drücken|press enter|hit enter).{0,120}$", re.IGNORECASE),
         ]
+
+    def output_line_looks_like_progress(self, line):
+        """True für Fortschritts-/Statistikzeilen von Packern und Kopierern.
+
+        Solche Zeilen dürfen nie als Rückfrage gelten, auch wenn sie zufällig
+        auf eine Klammer oder einen Doppelpunkt enden.
+        """
+        text = str(line or "").strip()
+        if not text:
+            return False
+        if re.search(r"\(\s*(?:de|in)?flated\s+\d{1,3}\s*%\s*\)\s*$", text, re.IGNORECASE):
+            return True
+        if re.search(r"\(\s*(?:gespeichert|stored|shrunk)\b[^()]*\)\s*$", text, re.IGNORECASE):
+            return True
+        if re.search(r"\(\s*[\d.,]+\s*(?:%|[KMGT]?i?B(?:/s)?|byte|bytes)\b[^()]*\)\s*$", text, re.IGNORECASE):
+            return True
+        if re.search(r"\(\s*\d+\s+(?:von|of)\s+\d+\s*\)\s*$", text, re.IGNORECASE):
+            return True
+        if re.match(r"^\s*\d{1,3}\s*%", text):
+            return True
+        return False
 
     def extract_interactive_prompt_from_output(self, text):
         value = str(text or "")
@@ -4116,6 +4242,8 @@ class ShellDeckTerminalWidget(QWidget):
         if self.output_ends_with_continuation_prompt(tail):
             return "mehrzeilige Eingabe fortsetzen oder leere Zeile zum Abschließen senden"
         last_line = lines[-1]
+        if self.output_line_looks_like_progress(last_line):
+            return ""
         check_text = tail if re.search(r"\[[A-Za-zÄÖÜäöü?]\].*\[[A-Za-zÄÖÜäöü?]\]", tail, re.DOTALL) else last_line
         for pattern in self.interactive_prompt_patterns():
             if pattern.search(check_text):
@@ -4165,6 +4293,12 @@ class ShellDeckTerminalWidget(QWidget):
 
     def handle_possible_interactive_prompt(self, text):
         if getattr(self, "password_prompt_active", False):
+            return
+        # Ohne laufenden Befehl gibt es nichts zu beantworten. Sonst konnte
+        # nachlaufende Ausgabe eines bereits beendeten Befehls den Antwortmodus
+        # aktivieren und die naechste normale Eingabe roh an die Shell schicken
+        # (ohne Historie, Vorbefehl, Semikolon-Zerlegung und cd-Nachfuehrung).
+        if not getattr(self, "_awaiting_command_completion", False):
             return
         combined = str(getattr(self, "_interaction_prompt_tail", "") or "") + str(text or "")
         try:
@@ -4222,8 +4356,12 @@ class ShellDeckTerminalWidget(QWidget):
             return
         self.update_command_completion_state_from_output()
         if getattr(self, "interaction_prompt_active", False):
+            # Wie in terminal_output_text_for_state_checks() beschrieben, kann
+            # der zurueckgekehrte Shell-Prompt noch in der Zeichen-Warteschlange
+            # stehen. Wird nur output_area geprueft, bleibt der Antwortmodus
+            # nach einem langen Befehl (z.B. Packen) faelschlich aktiv.
             try:
-                output = self.output_area.toPlainText()
+                output = self.terminal_output_text_for_state_checks()
             except Exception:
                 output = ""
             prompt_text = self.extract_interactive_prompt_from_output(output)
