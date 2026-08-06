@@ -22,6 +22,8 @@ from shelldeck_ollama import build_generate_payload, extract_generate_response, 
 from shelldeck_file_context import append_file_context_to_prompt, build_file_context_block, read_text_file_context
 from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
 from shelldeck_command_history import CommandHistoryDialog
+from shelldeck_cli import parse_launch_arguments, resolve_directory
+import shelldeck_system_integration as system_integration
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
@@ -342,6 +344,12 @@ class TerminalWindow(QMainWindow):
         terminal_engine_action = QAction("Terminal-Engine", self)
         terminal_engine_action.triggered.connect(self.select_terminal_engine)
         settings_menu.addAction(terminal_engine_action)
+
+        system_integration_action = QAction("Systemintegration…", self)
+        system_integration_action.setToolTip("ShellDeck als Terminal (Linux) bzw. im Explorer-Kontextmenü (Windows) registrieren.")
+        system_integration_action.triggered.connect(self.show_system_integration_dialog)
+        settings_menu.addAction(system_integration_action)
+
 
         settings_menu.addSeparator()
 
@@ -4012,6 +4020,24 @@ Modulare Dateien
 - src/shelldeck_ollama.py enthält Hilfsfunktionen für Ollama.
 - src/shelldeck_markdown.py rendert sichere Markdown-/Codeblock-Ausgabe für Ollama-Antworten.
 - src/shelldeck_file_context.py liest Textdateien als Prompt-Kontext.
+- src/shelldeck_cli.py wertet Kommandozeilenargumente aus (--working-directory, --new-tab, -e/--execute).
+- src/shelldeck_system_integration.py kapselt die Linux-/Windows-Systemintegration (update-alternatives bzw. Explorer-Kontextmenue).
+
+Kommandozeile
+- shelldeck --working-directory PFAD startet ShellDeck mit einem Tab im angegebenen Ordner (~, Umgebungsvariablen und relative Pfade werden aufgeloest).
+- Existiert der Ordner nicht, startet ShellDeck trotzdem, meldet dies und faellt auf das Standardverzeichnis zurueck.
+- shelldeck --new-tab PFAD oeffnet einen Tab im angegebenen Ordner. Ohne vorhandene Single-Instance-Loesung wird dafuer eine neue ShellDeck-Instanz gestartet.
+- shelldeck -e BEFEHL bzw. shelldeck --execute BEFEHL fuehrt den nachfolgenden Befehl im Terminal aus; alle Folgeargumente gehoeren zum Befehl.
+- --working-directory und -e lassen sich kombinieren: zuerst wird der Ordner gesetzt, dann der Befehl ausgefuehrt.
+- Beispiele: shelldeck --working-directory "/home/torsten/Meine Projekte" | shelldeck -e git status | shelldeck --working-directory /tmp -e pwd
+
+Systemintegration (Einstellungen -> Systemintegration...)
+- Linux: ShellDeck kann als auswaehlbare x-terminal-emulator-Alternative registriert werden. ShellDeck wird dadurch NICHT automatisch zum Standard.
+- Das Standardterminal waehlt man selbst mit: sudo update-alternatives --config x-terminal-emulator (jederzeit umkehrbar).
+- Dateimanager verhalten sich unterschiedlich: nur wer das Terminal ueber x-terminal-emulator startet (z.B. Caja/MATE), uebernimmt die Auswahl automatisch.
+- Windows: Der Explorer-Eintrag "In ShellDeck oeffnen" (Ordner, Ordnerhintergrund, optional Laufwerke) kann installiert und entfernt werden; unter Windows 11 ggf. unter "Weitere Optionen anzeigen".
+- Die Windows-Integration macht ShellDeck NICHT zum nativen Standard-Terminalhost (Konsolendelegierung ist ein separates Projekt).
+- Systemaenderungen erfolgen nie automatisch beim Start, sondern nur auf ausdrueckliche Aktion.
 
 Hinweise
 - Standard QProcess ist der stabile Kompatibilitätsmodus. Normale Shell-Befehle funktionieren gut; Programme mit Vollbild-Terminalsteuerung können eingeschränkt sein.
@@ -4181,6 +4207,159 @@ Hinweise
         profiles.extend(replacements.values())
         self.tab_profiles = normalize_profiles(profiles)
 
+    # --- Kommandozeilen-Startoptionen und Systemintegration --------------
+    def apply_launch_options(self, options):
+        """Wendet die beim Start übergebenen Kommandozeilenoptionen an.
+
+        Fehler dürfen ShellDeck nicht am Starten hindern: ungültige Pfade
+        und unbekannte Argumente führen nur zu einer verständlichen
+        Statusmeldung und einem Rückfall auf das normale Startverhalten.
+        """
+        if options is None:
+            return
+        for message in getattr(options, "errors", []):
+            self.show_status(message)
+        unknown = getattr(options, "unknown", [])
+        if unknown:
+            self.show_status("Unbekannte Argumente ignoriert: " + " ".join(unknown))
+
+        target_directory = ""
+        raw_directory = options.requested_directory
+        if raw_directory:
+            resolved, exists = resolve_directory(raw_directory)
+            if exists:
+                target_directory = resolved
+            else:
+                self.show_status(
+                    "Verzeichnis nicht gefunden: {p} — es wird das Standardverzeichnis verwendet.".format(p=raw_directory)
+                )
+
+        want_new_tab = bool(options.new_tab) or bool(target_directory) or bool(options.execute_requested)
+        tab = self.current_terminal()
+        if want_new_tab or not isinstance(tab, TerminalTab):
+            tab = self.new_tab(start_directory=(target_directory or None))
+        if not isinstance(tab, TerminalTab):
+            return
+
+        if options.execute_requested and options.execute_command:
+            self._schedule_launch_command(tab, options.execute_command)
+
+    def _schedule_launch_command(self, tab, command_tokens):
+        """Führt einen per -e/--execute übergebenen Befehl im Tab aus.
+
+        Der Befehl wird erst nach dem Start der Shell ausgeführt. Argument-
+        grenzen bleiben erhalten, weil aus der Token-Liste plattformgerecht
+        neu gequotet wird (kein erneutes naives String-Splitting).
+        """
+        tokens = [str(t) for t in command_tokens if str(t) != ""]
+        if not tokens:
+            return
+        if sys.platform == "win32":
+            command_string = subprocess.list2cmdline(tokens)
+        else:
+            command_string = " ".join(shlex.quote(t) for t in tokens)
+        # Selbststart-Schleifen verhindern (siehe command_targets_shelldeck).
+        if command_targets_shelldeck(command_string):
+            self.show_status("Befehl wird nicht ausgeführt (würde ShellDeck erneut starten): " + command_string)
+            return
+
+        def run_when_ready(attempt=0):
+            process = getattr(tab, "process", None)
+            try:
+                running = process is not None and process.state() == QProcess.ProcessState.Running
+            except Exception:
+                running = False
+            if not running and attempt < 20:
+                QTimer.singleShot(150, lambda: run_when_ready(attempt + 1))
+                return
+            tab.run_text_command(command_string)
+
+        QTimer.singleShot(300, run_when_ready)
+
+    def show_system_integration_dialog(self):
+        """Zeigt plattformabhängig nur die sinnvollen Integrationsaktionen."""
+        info = system_integration.detect_platform_integration()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Systemintegration")
+        layout = QVBoxLayout(dialog)
+
+        os_name = "Windows" if info.get("is_windows") else ("Linux" if info.get("is_linux") else str(info.get("platform", "")))
+        os_label = QLabel("Betriebssystem: " + os_name)
+        exe_label = QLabel("Programmdatei: " + str(info.get("executable_path", "")))
+        exe_label.setWordWrap(True)
+        status_label = QLabel()
+        status_label.setWordWrap(True)
+        layout.addWidget(os_label)
+        layout.addWidget(exe_label)
+        layout.addWidget(status_label)
+
+        def refresh_status():
+            if info.get("is_linux"):
+                res = system_integration.get_linux_terminal_alternative_status()
+                status_label.setText("x-terminal-emulator: " + res.message)
+            elif info.get("is_windows"):
+                res = system_integration.get_windows_explorer_integration_status()
+                status_label.setText("Explorer-Eintrag: " + res.message)
+            else:
+                status_label.setText("Für dieses Betriebssystem ist keine Integration verfügbar.")
+
+        def report(result):
+            refresh_status()
+            box = QMessageBox(dialog)
+            box.setIcon(QMessageBox.Icon.Information if result.success else QMessageBox.Icon.Warning)
+            box.setWindowTitle("Systemintegration")
+            box.setText(result.message)
+            if result.details:
+                box.setDetailedText(result.details)
+            box.exec()
+
+        if info.get("is_linux"):
+            available = bool(info.get("linux_alternatives_available"))
+            has_pkexec = bool(shutil.which("pkexec"))
+            install_btn = QPushButton("Als Terminal-Emulator registrieren")
+            remove_btn = QPushButton("Registrierung entfernen")
+            choose_btn = QPushButton("Standardterminal auswählen…")
+            install_btn.setToolTip("Registriert ShellDeck als auswählbare Alternative. Ändert das Standardterminal nicht.")
+            choose_btn.setToolTip("Zeigt den Befehl zum Auswählen des Standardterminals an.")
+            install_btn.clicked.connect(lambda: report(system_integration.install_linux_terminal_alternative(use_pkexec=has_pkexec)))
+            remove_btn.clicked.connect(lambda: report(system_integration.remove_linux_terminal_alternative(use_pkexec=has_pkexec)))
+
+            def choose_default_terminal():
+                cmd = " ".join(system_integration.build_config_alternative_command())
+                box = QMessageBox(dialog)
+                box.setIcon(QMessageBox.Icon.Information)
+                box.setWindowTitle("Standardterminal auswählen")
+                box.setText("Zum Auswählen des Standardterminals in einem Terminal ausführen:\n\n" + cmd + "\n\nDie Auswahl ist jederzeit umkehrbar.")
+                box.exec()
+
+            choose_btn.clicked.connect(choose_default_terminal)
+            for widget in (install_btn, remove_btn, choose_btn):
+                widget.setEnabled(available)
+                layout.addWidget(widget)
+            if not available:
+                hint = QLabel("»update-alternatives« ist nicht verfügbar. Die Terminal-Registrierung wird auf diesem System nicht unterstützt.")
+                hint.setWordWrap(True)
+                layout.addWidget(hint)
+        elif info.get("is_windows"):
+            drives_check = QCheckBox("Auch für Laufwerke anzeigen")
+            install_btn = QPushButton("Explorer-Eintrag installieren")
+            remove_btn = QPushButton("Explorer-Eintrag entfernen")
+            install_btn.clicked.connect(lambda: report(system_integration.install_windows_explorer_integration(include_drives=drives_check.isChecked())))
+            remove_btn.clicked.connect(lambda: report(system_integration.remove_windows_explorer_integration()))
+            layout.addWidget(drives_check)
+            layout.addWidget(install_btn)
+            layout.addWidget(remove_btn)
+        else:
+            layout.addWidget(QLabel("Für dieses Betriebssystem ist keine Systemintegration verfügbar."))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        refresh_status()
+        dialog.exec()
+
+
     def closeEvent(self, event):
         self._closing_app = True
         self.carry_over_workspace_on_exit()
@@ -4195,8 +4374,11 @@ Hinweise
         event.accept()
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    if argv is None:
+        argv = sys.argv
     install_crash_logging()
+    launch_options = parse_launch_arguments(list(argv[1:]))
     app = QApplication(sys.argv)
     try:
         app.setStyle("Fusion")
@@ -4211,6 +4393,7 @@ def main() -> int:
             frame.moveCenter(screen.availableGeometry().center())
             w.move(frame.topLeft())
     w.show()
+    w.apply_launch_options(launch_options)
     return app.exec()
 
 

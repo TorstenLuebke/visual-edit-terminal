@@ -1,0 +1,19 @@
+#!/bin/sh
+# ShellDeck – Debian/Ubuntu postrm
+#
+# Sicherheitsnetz: entfernt die ShellDeck-Alternative auch bei purge erneut,
+# falls sie noch vorhanden ist. Doppeltes Entfernen ist unschaedlich.
+set -e
+
+LAUNCHER=/usr/bin/shelldeck
+
+case "$1" in
+    remove|purge)
+        if command -v update-alternatives >/dev/null 2>&1; then
+            update-alternatives --remove x-terminal-emulator "$LAUNCHER" || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ShellDeck Terminal
+GenericName=Terminal
+Comment=ShellDeck Terminal-Emulator
+Exec=shelldeck
+Icon=shelldeck
+# Terminal=false: ShellDeck ist selbst der Terminal-Emulator und wird nicht in
+# einem anderen Terminal gestartet.
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;konsole;kommandozeile;
+# Hinweis: StartupWMClass wurde bewusst nicht gesetzt, da der tatsaechliche
+# WM-Klassenname des ShellDeck-Fensters hier nicht verlaesslich geprueft werden
+# kann. Ein falscher Wert wuerde die Fensterzuordnung stoeren.
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=Neues ShellDeck-Fenster
+Exec=shelldeck

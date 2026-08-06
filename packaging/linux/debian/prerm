@@ -1,0 +1,20 @@
+#!/bin/sh
+# ShellDeck – Debian/Ubuntu prerm
+#
+# Entfernt beim Deinstallieren ausschliesslich die ShellDeck-eigene
+# x-terminal-emulator-Alternative. Kein anderes Terminal wird veraendert.
+# Funktioniert auch, wenn ShellDeck nicht laeuft. Idempotent.
+set -e
+
+LAUNCHER=/usr/bin/shelldeck
+
+case "$1" in
+    remove|deconfigure)
+        if command -v update-alternatives >/dev/null 2>&1; then
+            update-alternatives --remove x-terminal-emulator "$LAUNCHER" || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

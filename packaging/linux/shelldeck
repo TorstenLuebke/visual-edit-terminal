@@ -1,0 +1,39 @@
+#!/bin/sh
+# ShellDeck-Starter fuer /usr/bin/shelldeck.
+#
+# Dieser Wrapper wird als x-terminal-emulator-Alternative registriert und muss
+# alle Argumente unveraendert an ShellDeck weiterreichen (u.a.
+# --working-directory, --new-tab, -e/--execute).
+#
+# Reihenfolge:
+#   1. Ein vom Kompiler erzeugtes Binaerprogramm (falls vorhanden) bevorzugen.
+#   2. Andernfalls den Quelllauf ueber Python starten.
+#
+# Keine hart codierten Benutzerpfade; "$@" bewahrt die Quotierung der
+# einzelnen Argumente.
+
+# 1) Kompiliertes Binaerprogramm (Beispielpfade – vom Kompiler anpassbar):
+for candidate in \
+    /usr/lib/shelldeck/ShellDeck \
+    /usr/lib/shelldeck/shelldeck \
+    /opt/shelldeck/ShellDeck \
+    /opt/shelldeck/shelldeck
+do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+# 2) Quelllauf ueber Python (Fallback):
+for srcdir in \
+    /usr/lib/shelldeck/src \
+    /usr/share/shelldeck/src \
+    /opt/shelldeck/src
+do
+    if [ -f "$srcdir/main.py" ]; then
+        exec python3 "$srcdir/main.py" "$@"
+    fi
+done
+
+echo "ShellDeck wurde nicht gefunden. Bitte Installationspfad im Wrapper anpassen." >&2
+exit 1
