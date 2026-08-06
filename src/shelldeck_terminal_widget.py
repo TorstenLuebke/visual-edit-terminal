@@ -4628,12 +4628,19 @@ class ShellDeckTerminalWidget(QWidget):
 
     def decoded_terminal_output(self, raw):
         text = self._decode_process_output(raw)
-        if self.process_uses_pty_engine():
+        uses_pty = self.process_uses_pty_engine()
+        # Auch die QProcess-Engine bekommt unter Linux/macOS ANSI-Sequenzen
+        # geliefert: Bash uebernimmt ein gefaerbtes PS1 aus der Umgebung und
+        # sendet zusaetzlich die OSC-Titelsequenz. Ohne Bereinigung landen
+        # Rohfolgen wie "\x1b]0;user@host\x07\x1b[01;32m" sichtbar im
+        # Ausgabefenster und stoeren ausserdem die Prompt-Erkennung.
+        if uses_pty or sys.platform != "win32":
             cleaner = getattr(self.window, "clean_terminal_control_sequences", None)
             if callable(cleaner):
                 text = cleaner(text)
             else:
                 text = self.window.clean_output_text(text)
+        if uses_pty:
             text = self.suppress_pending_pty_command_echo(text)
         text = self.suppress_pending_interactive_response_echo(text)
         return self.consume_shell_context_markers(text)

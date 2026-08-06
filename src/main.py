@@ -6,6 +6,7 @@ import time
 import os
 import traceback
 import faulthandler
+import signal
 import shutil
 import subprocess
 import shlex
@@ -51,6 +52,18 @@ def install_crash_logging():
         faulthandler.enable(file=_LOG_HANDLE, all_threads=True)
     except OSError:
         _LOG_HANDLE = None
+
+    # Haenger-Diagnose: Bei einem eingefrorenen Fenster liefert
+    #     kill -USR1 $(pgrep -f "python.*src/main.py")
+    # den kompletten Stack aller Threads in ~/TerminalApp.log, ohne die
+    # Anwendung zu beenden. Nur dort verfuegbar, wo SIGUSR1 existiert.
+    if _LOG_HANDLE is not None and hasattr(signal, "SIGUSR1"):
+        try:
+            faulthandler.register(
+                signal.SIGUSR1, file=_LOG_HANDLE, all_threads=True, chain=False
+            )
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            pass
 
     def handle_exception(exc_type, exc_value, exc_tb):
         try:
