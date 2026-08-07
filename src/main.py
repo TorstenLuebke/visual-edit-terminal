@@ -21,6 +21,7 @@ from shelldeck_workspaces import normalize_workspace, normalize_workspaces, work
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
 from shelldeck_file_context import append_file_context_to_prompt, build_file_context_block, read_text_file_context
 from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
+from shelldeck_backend_manager import missing_backend_packages, start_backend_package_install
 from shelldeck_command_history import CommandHistoryDialog
 from shelldeck_cli import parse_launch_arguments, resolve_directory
 import shelldeck_system_integration as system_integration
@@ -140,7 +141,7 @@ class TerminalWindow(QMainWindow):
         self.window_opacity = 100
         self.theme_config = self.default_theme_config()
         self.shell_type = self.default_shell_type()
-        self.terminal_engine = "qprocess"
+        self.terminal_engine = "auto"
         # True, sobald der Benutzer die Engine bewusst ausgewaehlt hat (Liste,
         # Menue oder gespeicherte Einstellung). Nur solange das False ist, darf
         # create_shell_process() unter Linux/macOS automatisch auf PTY anheben.
@@ -351,6 +352,10 @@ class TerminalWindow(QMainWindow):
         settings_menu.addAction(system_integration_action)
 
 
+        backend_packages_action = QAction("Fehlende Backend-Pakete installieren…", self)
+        backend_packages_action.triggered.connect(self.install_missing_backend_package)
+        settings_menu.addAction(backend_packages_action)
+
         settings_menu.addSeparator()
 
         self.ai_features_action = QAction("KI-Menü / Ollama aktivieren", self)
@@ -418,12 +423,13 @@ class TerminalWindow(QMainWindow):
 
         self.terminal_engine_combo = QComboBox(self.pre_command_bar)
         self.terminal_engine_combo.setToolTip(
-            "Terminal-Engine für neu gestartete Tabs. "
-            "QProcess bleibt Standard; PTY/ConPTY ist experimentell."
+            "Automatisch wählt unter Windows ConPTY und unter Linux/macOS POSIX-PTY. "
+            "QProcess bleibt als kompatibler Rückfall verfügbar."
         )
-        self.terminal_engine_combo.addItem("Standard QProcess", "qprocess")
-        self.terminal_engine_combo.addItem("PTY/ConPTY experimentell", "pty")
-        self.terminal_engine_combo.setFixedWidth(210)
+        self.terminal_engine_combo.addItem("Automatisch – empfohlen", "auto")
+        self.terminal_engine_combo.addItem("QProcess – kompatibel", "qprocess")
+        self.terminal_engine_combo.addItem("PTY/ConPTY – interaktiv", "pty")
+        self.terminal_engine_combo.setFixedWidth(230)
         self.terminal_engine_combo.currentIndexChanged.connect(self.set_terminal_engine_from_combo)
         pre_command_layout.addWidget(self.terminal_engine_combo)
 
@@ -611,11 +617,11 @@ class TerminalWindow(QMainWindow):
             return "dark"
 
     def normalize_terminal_engine(self, engine):
-        value = str(engine or "qprocess").lower().strip()
-        return value if value in {"qprocess", "pty"} else "qprocess"
+        value = str(engine or "auto").lower().strip()
+        return value if value in {"auto", "qprocess", "pty"} else "auto"
 
     def terminal_engine_settings_snapshot(self):
-        return {"terminal_engine": self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))}
+        return {"terminal_engine": self.normalize_terminal_engine(getattr(self, "terminal_engine", "auto"))}
 
     def load_terminal_engine_persistent_settings(self):
         store_file = getattr(self, "terminal_engine_store_file", None)
@@ -645,7 +651,7 @@ class TerminalWindow(QMainWindow):
         if not isinstance(mapping, dict):
             return
         self.terminal_engine = self.normalize_terminal_engine(
-            mapping.get("terminal_engine", getattr(self, "terminal_engine", "qprocess"))
+            mapping.get("terminal_engine", getattr(self, "terminal_engine", "auto"))
         )
         if "terminal_engine" in mapping:
             # Eine gespeicherte Engine stammt immer aus einer frueheren
@@ -655,22 +661,18 @@ class TerminalWindow(QMainWindow):
     def terminal_engine_combo_value(self):
         combo = getattr(self, "terminal_engine_combo", None)
         if combo is None:
-            return self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+            return self.normalize_terminal_engine(getattr(self, "terminal_engine", "auto"))
         try:
             data = combo.currentData()
             if data:
                 return self.normalize_terminal_engine(data)
             return self.normalize_terminal_engine(combo.currentText())
         except RuntimeError:
-            return self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+            return self.normalize_terminal_engine(getattr(self, "terminal_engine", "auto"))
 
     def set_terminal_engine(self, engine, *, show_message=True, save=True, apply_to_current_tab=True, user_choice=False):
         new_engine = self.normalize_terminal_engine(engine)
-        if user_choice:
-            # Ab jetzt ist die Engine verbindlich. Ohne diese Markierung setzte
-            # create_shell_process() die Auswahl unter Linux sofort auf PTY
-            # zurueck, und die Auswahlliste sprang wieder um.
-            self.terminal_engine_is_user_choice = True
+        self.terminal_engine_is_user_choice = bool(user_choice and new_engine != "auto")
         if new_engine == "pty":
             message = PtyTerminalProcess.availability_message()
             if message and show_message:
@@ -691,15 +693,19 @@ class TerminalWindow(QMainWindow):
                 self.show_status(f"Terminal-Engine: {self.terminal_engine_label(new_engine)}. {suffix}")
 
     def set_terminal_engine_from_combo(self, index=0):
+        selected = self.terminal_engine_combo_value()
         self.set_terminal_engine(
-            self.terminal_engine_combo_value(), show_message=True, save=True, user_choice=True
+            selected, show_message=True, save=True, user_choice=(selected != "auto")
         )
 
     def update_terminal_engine_ui(self):
         combo = getattr(self, "terminal_engine_combo", None)
         if combo is None:
             return
-        engine = self.current_terminal_engine()
+        current_tab = self.current_terminal()
+        engine = self.normalize_terminal_engine(
+            getattr(current_tab, "terminal_engine", self.terminal_engine)
+        )
         combo.blockSignals(True)
         for index in range(combo.count()):
             if self.normalize_terminal_engine(combo.itemData(index)) == engine:
@@ -2677,10 +2683,12 @@ class TerminalWindow(QMainWindow):
         }.get(lower, "#FFFFFF")
 
     def terminal_engine_label(self, engine=None):
-        value = str(engine or getattr(self, "terminal_engine", "qprocess") or "qprocess").lower().strip()
+        value = str(engine or getattr(self, "terminal_engine", "auto") or "auto").lower().strip()
+        if value == "auto":
+            return "Automatisch – empfohlen"
         if value == "pty":
-            return "PTY/ConPTY experimentell"
-        return "Standard QProcess"
+            return "ConPTY" if sys.platform == "win32" else "POSIX-PTY"
+        return "QProcess – kompatibel"
 
     def terminal_engine_label_for_process(self, process=None):
         engine = str(getattr(process, "_shelldeck_engine", "") or "").lower().strip()
@@ -2690,7 +2698,7 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal() if hasattr(self, "tab_widget") else None
         if isinstance(tab, TerminalTab):
             return tab.actual_terminal_engine()
-        return self.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+        return self.normalize_terminal_engine(getattr(self, "terminal_engine", "auto"))
 
     def terminal_engine_label_for_tab(self, tab=None):
         if isinstance(tab, TerminalTab):
@@ -2698,21 +2706,27 @@ class TerminalWindow(QMainWindow):
         return self.terminal_engine_label(self.current_terminal_engine())
 
     def should_use_pty_backend(self, shell_type=None, engine=None):
-        if self.normalize_terminal_engine(engine or getattr(self, "terminal_engine", "qprocess")) != "pty":
+        selected = self.normalize_terminal_engine(engine or getattr(self, "terminal_engine", "auto"))
+        if selected == "qprocess":
             return False
         message = PtyTerminalProcess.availability_message()
         if message:
-            QTimer.singleShot(0, lambda m=message: self.show_status(f"PTY/ConPTY nicht aktiv: {m}"))
+            if selected == "pty":
+                QTimer.singleShot(0, lambda m=message: self.show_status(f"PTY/ConPTY nicht aktiv: {m}"))
             return False
         return True
 
     def select_terminal_engine(self):
         options = [
-            "Standard QProcess",
-            "PTY/ConPTY/Linux-PTY experimentell",
+            "Automatisch – empfohlen",
+            "QProcess – kompatibel",
+            "PTY/ConPTY – interaktiv",
         ]
-        current_engine = self.current_terminal_engine()
-        current_index = 1 if current_engine == "pty" else 0
+        current_tab = self.current_terminal()
+        current_engine = self.normalize_terminal_engine(
+            getattr(current_tab, "terminal_engine", self.terminal_engine)
+        )
+        current_index = {"auto": 0, "qprocess": 1, "pty": 2}.get(current_engine, 0)
         choice, ok = QInputDialog.getItem(
             self,
             "Terminal-Engine",
@@ -2723,8 +2737,39 @@ class TerminalWindow(QMainWindow):
         )
         if not ok:
             return
-        new_engine = "pty" if choice.startswith("PTY/") else "qprocess"
-        self.set_terminal_engine(new_engine, show_message=True, save=True, user_choice=True)
+        new_engine = {
+            "Automatisch – empfohlen": "auto",
+            "QProcess – kompatibel": "qprocess",
+            "PTY/ConPTY – interaktiv": "pty",
+        }.get(choice, "auto")
+        self.set_terminal_engine(
+            new_engine, show_message=True, save=True,
+            user_choice=(new_engine != "auto"),
+        )
+
+    def install_missing_backend_package(self):
+        packages = missing_backend_packages()
+        if not packages:
+            self.show_status("Alle unterstützten Backend-Pakete sind bereits verfügbar.")
+            return
+        labels = [f"{item.label} – {item.reason}" for item in packages]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Backend-Paket installieren",
+            "Fehlendes Paket auswählen. Unter Windows werden EXE-Pakete bevorzugt über winget installiert:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return
+        package = packages[labels.index(choice)]
+        success, message = start_backend_package_install(package)
+        self.show_status(message)
+        if success:
+            QTimer.singleShot(2500, lambda: self.show_status(
+                "Installation wurde gestartet. Nach Abschluss den betroffenen Tab oder ShellDeck neu starten."
+            ))
 
     def system_shell(self, shell_type=None) -> str:
         shell_type = self.normalize_shell_type(shell_type or self.shell_type)
@@ -2979,8 +3024,8 @@ class TerminalWindow(QMainWindow):
 
         self.history = self.history[-self.max_history_size:]
 
-        engine_value = str(settings.get("terminal_engine", self.terminal_engine or "qprocess") or "qprocess").lower().strip()
-        self.terminal_engine = engine_value if engine_value in {"qprocess", "pty"} else "qprocess"
+        engine_value = str(settings.get("terminal_engine", self.terminal_engine or "auto") or "auto").lower().strip()
+        self.terminal_engine = engine_value if engine_value in {"auto", "qprocess", "pty"} else "auto"
         self.apply_terminal_engine_settings_mapping(self.load_terminal_engine_persistent_settings())
 
         shell_type_val = self.normalize_shell_type(settings.get("shell_type", self.shell_type))

@@ -220,7 +220,7 @@ class DefaultTerminalHost:
         self.history = []
         self.max_history_size = 1000
         self.default_command = ""
-        self.terminal_engine = "qprocess"
+        self.terminal_engine = "auto"
         # False = die Engine ist nur eine Vorgabe und darf plattformabhaengig
         # automatisch auf PTY angehoben werden. Einbettende Anwendungen (z.B.
         # Visual Edit) koennen True setzen, um ihre Wahl verbindlich zu machen.
@@ -378,21 +378,24 @@ class DefaultTerminalHost:
     # ---- Terminal-Engine ----
 
     def normalize_terminal_engine(self, engine):
-        value = str(engine or "qprocess").lower().strip()
-        return value if value in {"qprocess", "pty"} else "qprocess"
+        value = str(engine or "auto").lower().strip()
+        return value if value in {"auto", "qprocess", "pty"} else "auto"
 
     def terminal_engine_label(self, engine=None):
-        value = str(engine or getattr(self, "terminal_engine", "qprocess") or "qprocess").lower().strip()
+        value = str(engine or getattr(self, "terminal_engine", "auto") or "auto").lower().strip()
+        if value == "auto":
+            return "Automatisch – empfohlen"
         if value == "pty":
-            return "PTY/ConPTY experimentell"
-        return "Standard QProcess"
+            return "ConPTY" if sys.platform == "win32" else "POSIX-PTY"
+        return "QProcess – kompatibel"
 
     def terminal_engine_label_for_process(self, process=None):
         engine = str(getattr(process, "_shelldeck_engine", "") or "").lower().strip()
         return self.terminal_engine_label(engine or "qprocess")
 
     def should_use_pty_backend(self, shell_type=None, engine=None):
-        if self.normalize_terminal_engine(engine or getattr(self, "terminal_engine", "qprocess")) != "pty":
+        selected = self.normalize_terminal_engine(engine or getattr(self, "terminal_engine", "auto"))
+        if selected == "qprocess":
             return False
         return not PtyTerminalProcess.availability_message()
 
@@ -991,7 +994,7 @@ class ShellDeckTerminalWidget(QWidget):
         normalize_shell = getattr(window, "normalize_shell_type", None)
         requested_shell = shell_type or window.shell_type
         self.shell_type = normalize_shell(requested_shell) if callable(normalize_shell) else requested_shell
-        self.terminal_engine = self.window.normalize_terminal_engine(terminal_engine or getattr(window, "terminal_engine", "qprocess"))
+        self.terminal_engine = self.window.normalize_terminal_engine(terminal_engine or getattr(window, "terminal_engine", "auto"))
         self.custom_title = custom_title or ""
         self.source_profile_name = ""
         self.start_directory = self.normalize_start_directory(start_directory)
@@ -3173,29 +3176,14 @@ class ShellDeckTerminalWidget(QWidget):
         return str(Path.cwd())
 
     def create_shell_process(self):
-        requested_engine = self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
-        user_choice = bool(getattr(self.window, "terminal_engine_is_user_choice", False))
-        if (
-            not user_choice
-            and sys.platform != "win32"
-            and str(self.shell_type or "").lower() in {"bash", "zsh", "fish", "sh"}
-        ):
-            # Auf Linux/macOS sollen interaktive Shells standardmäßig über ein
-            # echtes PTY laufen. QProcess-Pipes erzeugen bei Bash sonst Meldungen
-            # wie "Keine Jobsteuerung in dieser Shell".
-            #
-            # Das gilt aber nur als Vorgabe. Früher wurde hier bedingungslos auf
-            # "pty" umgeschaltet UND self.terminal_engine überschrieben. Wer in
-            # der Auswahlliste "Standard QProcess" wählte, bekam dadurch sofort
-            # wieder PTY: set_terminal_engine() startete den Tab neu,
-            # create_shell_process() setzte "pty" zurück, und
-            # update_terminal_engine_ui() stellte die Liste entsprechend um.
-            if PtyTerminalProcess.is_available():
-                requested_engine = "pty"
-                self.terminal_engine = "pty"
+        requested_engine = self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "auto"))
+        # Automatisch bevorzugt auf allen unterstützten Systemen das echte
+        # Terminal-Backend. Dadurch erhalten PowerShell/CMD unter Windows
+        # ConPTY und interaktive POSIX-Shells ein PTY. QProcess bleibt der
+        # robuste Rückfall, falls das Backend fehlt oder nicht startet.
         if self.window.should_use_pty_backend(self.shell_type, engine=requested_engine):
             process = PtyTerminalProcess(self)
-            self.output_area.append("[PTY/ConPTY/Linux-PTY experimentell aktiv]\n")
+            self.output_area.append("[ConPTY aktiv]\n" if sys.platform == "win32" else "[POSIX-PTY aktiv]\n")
             return process
         process = QProcess(self)
         process._shelldeck_engine = "qprocess"
@@ -3215,12 +3203,6 @@ class ShellDeckTerminalWidget(QWidget):
             process.setProcessEnvironment(environment)
         except Exception:
             pass
-        if requested_engine == "pty" and not user_choice:
-            # Nur die automatische Vorgabe darf zurückfallen. Eine bewusste
-            # Auswahl bleibt gespeichert, damit sie nach einem vorübergehend
-            # nicht verfügbaren PTY nicht dauerhaft verloren geht;
-            # actual_terminal_engine() meldet ohnehin die echte Engine.
-            self.terminal_engine = "qprocess"
         return process
 
     def connect_shell_process(self, process):
@@ -3235,7 +3217,7 @@ class ShellDeckTerminalWidget(QWidget):
         process_engine = str(getattr(getattr(self, "process", None), "_shelldeck_engine", "") or "").lower().strip()
         if process_engine in {"qprocess", "pty"}:
             return process_engine
-        return self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "qprocess"))
+        return self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "auto"))
 
     def set_terminal_engine(self, engine, *, restart=True):
         new_engine = self.window.normalize_terminal_engine(engine)

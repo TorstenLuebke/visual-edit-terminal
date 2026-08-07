@@ -1,35 +1,91 @@
-import sys, os
-sys.path.insert(0, '.')
+import os
+import sys
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-import shelldeck_terminal_widget as W
+sys.path.insert(0, os.path.dirname(__file__))
+
 from PySide6.QtWidgets import QApplication
+import shelldeck_terminal_widget as widget
+
 
 app = QApplication.instance() or QApplication([])
 
-def make(user_choice, engine):
-    host = W.DefaultTerminalHost()
-    host.shell_type = "bash"
-    host.terminal_engine = engine
-    host.terminal_engine_is_user_choice = user_choice
-    tab = W.ShellDeckTerminalWidget(window=host, shell_type="bash", terminal_engine=engine)
-    tab.stop_process(fast=True)
-    tab.terminal_engine = engine
-    proc = tab.create_shell_process()
-    return tab.actual_terminal_engine(), tab.terminal_engine
 
-cases = [
-    ("Vorgabe qprocess, keine Wahl -> Auto-PTY", False, "qprocess", "pty"),
-    ("bewusst qprocess gewaehlt      -> bleibt", True,  "qprocess", "qprocess"),
-    ("bewusst pty gewaehlt           -> bleibt", True,  "pty",      "pty"),
-    ("Vorgabe pty, keine Wahl        -> pty",    False, "pty",      "pty"),
-]
-bad = 0
-for label, uc, engine, expect in cases:
-    actual, stored = make(uc, engine)
-    ok = actual == expect and stored == expect
-    bad += 0 if ok else 1
-    print(("  OK   " if ok else "  FEHL "), f"{label:44s} aktiv={actual:9s} gespeichert={stored}")
-print()
-print("PTY verfuegbar:", W.PtyTerminalProcess.is_available())
-print("FEHLER:", bad)
-sys.exit(1 if bad else 0)
+def run_case(label, selected_engine, expected_engine, pty_available=True):
+    host = widget.DefaultTerminalHost()
+    host.shell_type = "bash"
+    host.terminal_engine = selected_engine
+
+    original_availability_message = widget.PtyTerminalProcess.availability_message
+
+    try:
+        widget.PtyTerminalProcess.availability_message = staticmethod(
+            lambda: "" if pty_available else "PTY für Test nicht verfügbar"
+        )
+
+        normalized = host.normalize_terminal_engine(selected_engine)
+        use_pty = host.should_use_pty_backend(
+            shell_type="bash",
+            engine=normalized,
+        )
+        actual = "pty" if use_pty else "qprocess"
+
+        ok = actual == expected_engine
+        print(
+            ("  OK   " if ok else "  FEHL "),
+            f"{label:48s} Auswahl={normalized:8s} aktiv={actual}",
+        )
+        return ok
+    finally:
+        widget.PtyTerminalProcess.availability_message = original_availability_message
+
+
+def main():
+    cases = [
+        (
+            "Automatisch mit verfügbarem PTY",
+            "auto",
+            "pty",
+            True,
+        ),
+        (
+            "Bewusst QProcess gewählt",
+            "qprocess",
+            "qprocess",
+            True,
+        ),
+        (
+            "Bewusst PTY gewählt und verfügbar",
+            "pty",
+            "pty",
+            True,
+        ),
+        (
+            "Automatisch ohne verfügbares PTY",
+            "auto",
+            "qprocess",
+            False,
+        ),
+        (
+            "Bewusst PTY gewählt, aber nicht verfügbar",
+            "pty",
+            "qprocess",
+            False,
+        ),
+    ]
+
+    failed = 0
+    for label, selected, expected, available in cases:
+        if not run_case(label, selected, expected, available):
+            failed += 1
+
+    print()
+    print("Plattform:", sys.platform)
+    print("Reales PTY verfügbar:", widget.PtyTerminalProcess.is_available())
+    print("Fehler:", failed)
+
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
