@@ -1028,6 +1028,10 @@ class ShellDeckTerminalWidget(QWidget):
         self.password_prompt_active = False
         self._password_dialog_open = False
         self._password_prompt_tail = ""
+        # Geheimnisse niemals im sichtbaren Terminal-/History-Text halten.
+        # Das ist besonders wichtig im Reines-Terminal-Modus, weil dort die
+        # Eingabe sonst direkt in QTextEdit geschrieben und damit sichtbar wird.
+        self._password_input_buffer = ""
         self.interaction_prompt_active = False
         self._interaction_prompt_tail = ""
         self._interaction_prompt_text = ""
@@ -1545,6 +1549,11 @@ class ShellDeckTerminalWidget(QWidget):
             self.arm_inline_prompt()
             if not self.inline_markers_valid():
                 return True
+
+        # sudo/ssh/passphrase: niemals die normale QTextEdit-Eingabe benutzen,
+        # denn diese würde das Geheimnis als Klartext in das Dokument schreiben.
+        if self._handle_password_key_event(event):
+            return True
 
         input_start = self._inline_input_cursor.position()
         cursor = output_area.textCursor()
@@ -3419,6 +3428,10 @@ class ShellDeckTerminalWidget(QWidget):
             and source is input_line
             and event.type() == QEvent.Type.KeyPress
         ):
+            # Auch im klassischen Eingabefeld Passwortzeichen ausschließlich
+            # maskiert anzeigen und nie in den normalen Command-Pfad/History geben.
+            if self._handle_password_key_event(event):
+                return True
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 self.execute_command()
                 return True
@@ -4121,12 +4134,81 @@ class ShellDeckTerminalWidget(QWidget):
             return
         self.activate_password_prompt_mode(open_dialog=True)
 
+    def _set_password_input_buffer(self, value: str) -> None:
+        """Speichert eine Passworteingabe nur intern und zeigt ausschließlich Maskenzeichen."""
+        value = str(value or "")
+        self._password_input_buffer = value
+        masked = "•" * len(value)
+        try:
+            if self.inline_mode_active() and self.inline_markers_valid():
+                self.set_inline_input_text(masked)
+            elif getattr(self, "input_line", None) is not None:
+                self.input_line.setPlainText(masked)
+                self.input_line.moveCursor(QTextCursor.MoveOperation.End)
+        except Exception:
+            pass
+
+    def _clear_password_input_buffer(self) -> None:
+        self._password_input_buffer = ""
+        try:
+            if self.inline_mode_active() and self.inline_markers_valid():
+                self.set_inline_input_text("")
+            elif getattr(self, "input_line", None) is not None:
+                self.input_line.clear()
+        except Exception:
+            pass
+
+    def _handle_password_key_event(self, event) -> bool:
+        """Verarbeitet Passwort-Tasten ohne Klartext in QTextEdit/QPlainTextEdit einzufügen."""
+        if not (self.password_prompt_active or self.visible_output_waits_for_password()):
+            return False
+
+        if not self.password_prompt_active:
+            self.activate_password_prompt_mode(open_dialog=True)
+
+        key = event.key()
+        modifiers = event.modifiers()
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            password = str(getattr(self, "_password_input_buffer", "") or "")
+            if password and self.visible_output_waits_for_password():
+                self.send_password_input(password)
+            else:
+                self._clear_password_input_buffer()
+            return True
+
+        if key == Qt.Key.Key_Backspace:
+            self._set_password_input_buffer(str(getattr(self, "_password_input_buffer", "") or "")[:-1])
+            return True
+
+        if key == Qt.Key.Key_Delete:
+            return True
+
+        if ctrl and key == Qt.Key.Key_V:
+            pasted = QApplication.clipboard().text() or ""
+            pasted = pasted.replace("\r", "").replace("\n", "")
+            self._set_password_input_buffer(str(getattr(self, "_password_input_buffer", "") or "") + pasted)
+            return True
+
+        if ctrl and key in (Qt.Key.Key_C, Qt.Key.Key_X, Qt.Key.Key_A):
+            # Passworttext wird weder kopiert noch ausgeschnitten/markiert.
+            return True
+
+        text = event.text()
+        if text and text.isprintable() and not (modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier)):
+            self._set_password_input_buffer(str(getattr(self, "_password_input_buffer", "") or "") + text)
+            return True
+
+        # Navigation u.ä. nicht an den normalen Editor durchreichen.
+        return True
+
     def activate_password_prompt_mode(self, *, open_dialog=True):
         if getattr(self, "client_mode_active", False):
             return False
         self.password_prompt_active = True
-        self.input_line.clear()
-        self.input_line.setPlaceholderText("Passwort wird angefordert – Eingabe wird nicht gespeichert")
+        self._clear_password_input_buffer()
+        self.input_line.setPlaceholderText("Passwort wird angefordert – Eingabe wird maskiert und nicht gespeichert")
         self.execute_button.setText("Passwort senden")
         self.execute_button.setEnabled(True)
         if open_dialog and not getattr(self, "_password_dialog_open", False):
@@ -4146,7 +4228,7 @@ class ShellDeckTerminalWidget(QWidget):
         """
         self.password_prompt_active = False
         self._password_prompt_tail = ""
-        self.input_line.clear()
+        self._clear_password_input_buffer()
         self.input_line.setPlaceholderText("")
         self.execute_button.setText("Befehl ausführen")
         self.execute_button.setEnabled(True)
@@ -4167,6 +4249,12 @@ class ShellDeckTerminalWidget(QWidget):
             # The dialog may still be open while sudo already finished. Do not
             # close it forcefully here; send_password_input() will reject stale
             # input before anything can be written to the shell.
+            return
+        # queue_terminal_output() schreibt absichtlich gepuffert. Direkt nach
+        # readyRead kann der Prompt deshalb schon im Rohdaten-Tail erkannt sein,
+        # aber noch nicht im QTextEdit stehen. In diesem kurzen Fenster darf der
+        # Passwortmodus nicht sofort wieder zurückgesetzt werden.
+        if self.output_contains_password_prompt(getattr(self, "_password_prompt_tail", "")):
             return
         if not self.visible_output_waits_for_password():
             self.reset_password_prompt_mode()
@@ -4764,7 +4852,13 @@ class ShellDeckTerminalWidget(QWidget):
             # statt als normaler Befehl mit Passwortinhalt zu laufen.
             if self.visible_output_waits_for_password():
                 self.activate_password_prompt_mode(open_dialog=False)
-                self.send_password_input(command_text)
+                password = str(getattr(self, "_password_input_buffer", "") or "")
+                # Nur der interne Secret-Buffer darf gesendet werden. Der sichtbare
+                # Text kann ausschließlich aus Maskenzeichen bestehen.
+                if password:
+                    self.send_password_input(password)
+                else:
+                    self._clear_password_input_buffer()
             else:
                 self.reset_password_prompt_mode("Veraltete Passworteingabe ignoriert")
             return
