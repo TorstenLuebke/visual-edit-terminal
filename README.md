@@ -84,3 +84,22 @@ Windows-Standard-Terminalhost. Die Windows-Konsolendelegierung (ConPTY) ist ein
 separates Projekt.
 
 Details zur Paketierung: siehe `packaging/README.md`.
+
+## Echtes Terminal (VT)
+
+ShellDeck kann pro Tab als echtes VT/ANSI-Terminal laufen: Ansicht → „Echtes
+Terminal (VT)". Dann werden Vollbild-Programme wie `vim`, `htop`, `less` oder
+`nano` korrekt dargestellt. Voraussetzungen sind das optionale Paket `pyte`
+(`pip install pyte`) und die PTY-Engine (wird bei Bedarf automatisch aktiviert).
+
+Im echten Terminalmodus rendert ShellDeck ein echtes Zellgitter (Farben,
+Cursor, Auswahl/Kopieren mit `Ctrl+Shift+C`, Einfügen mit `Ctrl+Shift+V` oder
+Mittelklick, Scrollback per Mausrad) und meldet die Fenstergröße an das PTY.
+
+Die zeilenbasierten Zusatzfunktionen (Befehls-Tabelle, Prompt-Leiste, KI-Prompt)
+gehören zum klassischen Modus und bleiben dort vollständig erhalten; „Reines
+Terminal" und „Echtes Terminal" schließen sich pro Tab gegenseitig aus. Fehlt
+`pyte`, bleibt ShellDeck unverändert bei der klassischen Darstellung. Die
+Emulation ist plattformübergreifend (Windows/Linux/macOS), da `pyte` reines
+Python ist und die Prozess-Ebene weiterhin PTY (Linux/macOS) bzw.
+`pywinpty`/ConPTY (Windows) nutzt.

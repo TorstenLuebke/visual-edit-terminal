@@ -256,6 +256,11 @@ class TerminalWindow(QMainWindow):
         self.pure_terminal_view_action.setCheckable(True)
         self.pure_terminal_view_action.triggered.connect(self.set_current_pure_terminal_mode)
         self.view_menu.addAction(self.pure_terminal_view_action)
+        self.real_terminal_view_action = QAction("Echtes Terminal (VT)", self)
+        self.real_terminal_view_action.setToolTip("Echte VT/ANSI-Terminaldarstellung fuer den aktuellen Tab (benoetigt pyte und die PTY-Engine).")
+        self.real_terminal_view_action.setCheckable(True)
+        self.real_terminal_view_action.triggered.connect(self.set_current_real_terminal_mode)
+        self.view_menu.addAction(self.real_terminal_view_action)
         self.view_menu.addSeparator()
 
         self.view_single_action = QAction("Einzelansicht", self)
@@ -2138,8 +2143,12 @@ class TerminalWindow(QMainWindow):
             self.command_task_expand_action.setEnabled(is_terminal and bool(getattr(tab, "command_task_panel_visible", True)))
             self.command_task_expand_action.setChecked(bool(is_terminal and getattr(tab, "command_task_panel_expanded", False)))
         if hasattr(self, "pure_terminal_view_action"):
-            self.pure_terminal_view_action.setEnabled(is_terminal)
+            self.pure_terminal_view_action.setEnabled(is_terminal and not getattr(tab, "real_terminal_active", False))
             self.pure_terminal_view_action.setChecked(bool(is_terminal and tab.inline_mode_active()))
+        if hasattr(self, "real_terminal_view_action"):
+            available = is_terminal and tab.real_terminal_available()
+            self.real_terminal_view_action.setEnabled(bool(available))
+            self.real_terminal_view_action.setChecked(bool(is_terminal and getattr(tab, "real_terminal_active", False)))
 
     def set_current_command_task_panel_visible(self, checked):
         tab = self.current_terminal()
@@ -2157,6 +2166,19 @@ class TerminalWindow(QMainWindow):
             self.show_status("Letzte Befehle ausgeklappt" if checked else "Letzte Befehle eingeklappt")
             self.update_view_menu_state()
             self.save_settings()
+
+    def set_current_real_terminal_mode(self, checked):
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return
+        ok = tab.set_real_terminal_mode(bool(checked))
+        if not ok:
+            self.show_status("Echtes Terminal benoetigt das Paket pyte (pip install pyte) und die PTY-Engine.")
+        elif bool(checked):
+            self.show_status("Echtes VT-Terminal aktiv.")
+        else:
+            self.show_status("Klassische Ansicht aktiv.")
+        self.update_view_menu_state()
 
     def set_current_pure_terminal_mode(self, checked):
         tab = self.current_terminal()
@@ -4083,6 +4105,12 @@ Systemintegration (Einstellungen -> Systemintegration...)
 - Windows: Der Explorer-Eintrag "In ShellDeck oeffnen" (Ordner, Ordnerhintergrund, optional Laufwerke) kann installiert und entfernt werden; unter Windows 11 ggf. unter "Weitere Optionen anzeigen".
 - Die Windows-Integration macht ShellDeck NICHT zum nativen Standard-Terminalhost (Konsolendelegierung ist ein separates Projekt).
 - Systemaenderungen erfolgen nie automatisch beim Start, sondern nur auf ausdrueckliche Aktion.
+
+Echtes Terminal (VT)
+- Ansicht -> "Echtes Terminal (VT)" schaltet den aktuellen Tab auf echte VT/ANSI-Darstellung; Vollbild-Programme wie vim, htop, less oder nano funktionieren dann korrekt.
+- Voraussetzung: das optionale Paket pyte (pip install pyte) und die PTY-Engine (wird bei Bedarf automatisch aktiviert). Fehlt pyte, bleibt die klassische Ansicht.
+- Auswahl/Kopieren mit Ctrl+Shift+C, Einfuegen mit Ctrl+Shift+V oder Mittelklick, Scrollback per Mausrad; die Fenstergroesse wird an das PTY gemeldet.
+- "Reines Terminal" und "Echtes Terminal" schliessen sich pro Tab aus. Die zeilenbasierten Zusatzfunktionen (Befehls-Tabelle, Prompt-Leiste, KI-Prompt) gehoeren zum klassischen Modus und bleiben dort erhalten.
 
 Hinweise
 - Standard QProcess ist der stabile Kompatibilitätsmodus. Normale Shell-Befehle funktionieren gut; Programme mit Vollbild-Terminalsteuerung können eingeschränkt sein.

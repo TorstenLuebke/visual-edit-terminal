@@ -34,6 +34,17 @@ import urllib.request
 from pathlib import Path
 from shelldeck_ollama import build_generate_payload, extract_generate_response, ollama_api_error_message, normalize_system_prompt
 from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
+
+# Echte VT/ANSI-Terminaldarstellung ist optional. Fehlt pyte (oder das
+# Renderer-Modul), bleibt ShellDeck vollständig funktionsfähig und nutzt die
+# bisherige Textdarstellung; _REAL_TERMINAL_AVAILABLE steuert die Verfügbarkeit.
+try:
+    import shelldeck_vt_screen as _vt_screen
+    from shelldeck_terminal_grid import TerminalGridView
+    _REAL_TERMINAL_AVAILABLE = _vt_screen.is_available()
+except Exception:
+    TerminalGridView = None
+    _REAL_TERMINAL_AVAILABLE = False
 from PySide6.QtWidgets import (
     QApplication, QTextEdit, QPlainTextEdit, QVBoxLayout, QWidget,
     QPushButton, QDialog, QLabel, QInputDialog, QDialogButtonBox,
@@ -607,7 +618,10 @@ class PtyReaderThread(QThread):
                     break
                 except Exception as exc:
                     if not self.isInterruptionRequested():
-                        self.error_ready.emit(str(exc))
+                        try:
+                            self.error_ready.emit(str(exc))
+                        except RuntimeError:
+                            pass
                     exit_code = 1
                     break
 
@@ -616,11 +630,28 @@ class PtyReaderThread(QThread):
                     continue
                 data = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
                 if data:
-                    self.output_ready.emit(data)
+                    try:
+                        self.output_ready.emit(data)
+                    except RuntimeError:
+                        break
                 else:
                     self.msleep(20)
+        except BaseException as exc:
+            # Beim Qt-Shutdown können Python-Signalobjekte bereits freigegeben sein,
+            # während der Reader noch aus dem PTY zurückkehrt. Das darf nicht als
+            # "Error calling Python override of QThread::run()" nach außen gelangen.
+            if not self.isInterruptionRequested():
+                exit_code = 1
+                try:
+                    self.error_ready.emit(str(exc))
+                except Exception:
+                    pass
         finally:
-            self.finished_ready.emit(exit_code, QProcess.ExitStatus.NormalExit)
+            try:
+                self.finished_ready.emit(exit_code, QProcess.ExitStatus.NormalExit)
+            except Exception:
+                pass
+            self.pty_process = None
 
 
 class PosixPtyChild:
@@ -636,6 +667,7 @@ class PosixPtyChild:
         self.pid = int(pid)
         self.fd = int(fd)
         self.exitstatus = None
+        self._closed = False
         try:
             os.set_blocking(self.fd, False)
         except Exception:
@@ -683,7 +715,7 @@ class PosixPtyChild:
     def read(self, size=4096):
         import select
 
-        if not self.isalive():
+        if self._closed or self.fd < 0 or not self.isalive():
             raise EOFError()
         ready, _, _ = select.select([self.fd], [], [], 0.05)
         if not ready:
@@ -696,7 +728,7 @@ class PosixPtyChild:
             raise EOFError()
 
     def write(self, text):
-        if not self.isalive():
+        if self._closed or self.fd < 0 or not self.isalive():
             raise OSError("PTY-Prozess läuft nicht.")
         raw = str(text or "").encode("utf-8", errors="replace")
         return os.write(self.fd, raw)
@@ -727,9 +759,59 @@ class PosixPtyChild:
             except Exception:
                 pass
 
-    def close(self):
+    def set_window_size(self, rows, cols):
+        """Setzt die PTY-Fenstergroesse (Zeilen/Spalten) via TIOCSWINSZ.
+
+        Interaktive Programme (vim, htop, less) fragen die Terminalgroesse ueber
+        das TTY ab; ohne korrekte Groesse brechen sie falsch um. Eine Aenderung
+        loest im Kind zusaetzlich SIGWINCH aus, sodass laufende Programme sich
+        sofort neu ausrichten.
+        """
+        if self._closed or self.fd < 0:
+            return False
         try:
-            os.close(self.fd)
+            rows = max(1, int(rows))
+            cols = max(1, int(cols))
+        except (TypeError, ValueError):
+            return False
+        try:
+            import fcntl
+            import struct
+            import termios
+
+            packed = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, packed)
+            return True
+        except Exception:
+            return False
+
+    def wait_for_exit(self, timeout=1.0):
+        """Wartet, bis der Kindprozess wirklich beendet und eingesammelt ist.
+
+        Wichtig fuer einen sauberen Shutdown: Erst wenn das Kind (z.B. bash)
+        vollstaendig beendet ist, darf der PTY-Master geschlossen werden. Sonst
+        bricht bashs eigene tcsetattr-Wiederherstellung mit
+        "Inappropriate ioctl for device" ab, weil das Slave-TTY schon
+        ungueltig ist. isalive() sammelt den Prozess per waitpid(WNOHANG) ein.
+        """
+        import time
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self.isalive():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        fd, self.fd = self.fd, -1
+        if fd < 0:
+            return
+        try:
+            os.close(fd)
         except Exception:
             pass
 
@@ -922,32 +1004,153 @@ class PtyTerminalProcess(QThread):
     def waitForBytesWritten(self, msecs=30000):
         return self._running
 
+    def set_window_size(self, rows, cols):
+        """Reicht die Terminalgroesse an das PTY/ConPTY weiter (plattformtolerant).
+
+        POSIX-PTY nutzt TIOCSWINSZ (set_window_size), pywinpty unter Windows die
+        Methode setwinsize(rows, cols). Fehlt beides, passiert nichts.
+        """
+        pty = self._pty
+        if pty is None:
+            return False
+        posix_setter = getattr(pty, "set_window_size", None)
+        if callable(posix_setter):
+            return bool(posix_setter(rows, cols))
+        win_setter = getattr(pty, "setwinsize", None)
+        if callable(win_setter):
+            try:
+                win_setter(int(rows), int(cols))
+                return True
+            except Exception:
+                return False
+        return False
+
     def terminate(self):
         if not self._pty:
+            self._running = False
             return
         try:
+            # Erst der interaktiven Shell Gelegenheit geben, ihre eigenen
+            # Terminalattribute noch auf einem gueltigen PTY wiederherzustellen.
             self._pty.write("exit\r")
         except Exception:
             self.kill()
 
+    def _stop_reader_before_pty_close(self, wait_ms=400):
+        reader = self._reader
+        if reader is None:
+            return True
+        try:
+            if reader.isRunning():
+                reader.requestInterruption()
+                return bool(reader.wait(max(0, int(wait_ms))))
+        except RuntimeError:
+            return True
+        except Exception:
+            return False
+        return True
+
     def kill(self):
-        if self._reader is not None and self._reader.isRunning():
-            self._reader.requestInterruption()
-        if self._pty is not None:
-            for name in ("terminate", "kill", "close"):
-                method = getattr(self._pty, name, None)
-                if callable(method):
+        reader_stopped = self._stop_reader_before_pty_close(250)
+        pty = self._pty
+        if pty is not None:
+            terminate = getattr(pty, "terminate", None)
+            if callable(terminate):
+                try:
+                    terminate()
+                except Exception:
+                    pass
+
+            # Der Reader kann in select/read stecken. Nach SIGTERM kurz warten;
+            # nur wenn er nicht sauber endet, den Childprozess hart beenden.
+            if not reader_stopped:
+                reader_stopped = self._stop_reader_before_pty_close(250)
+            if not reader_stopped:
+                hard_kill = getattr(pty, "kill", None)
+                if callable(hard_kill):
                     try:
-                        method()
-                        break
+                        hard_kill()
                     except Exception:
-                        continue
+                        pass
+                self._stop_reader_before_pty_close(250)
+
+            close = getattr(pty, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
         self._running = False
+        self._pty = None
 
     def waitForFinished(self, msecs=30000):
         if self._reader is None:
             return True
-        return self._reader.wait(max(0, int(msecs)))
+        try:
+            return self._reader.wait(max(0, int(msecs)))
+        except RuntimeError:
+            return True
+
+    def _wait_child_exit(self, pty, timeout_ms):
+        """Wartet auf das Ende des Kindprozesses (reap), plattformtolerant.
+
+        Fuer das POSIX-PTY nutzt es wait_for_exit(); fuer Objekte ohne diese
+        Methode (z.B. pywinpty unter Windows) wird ersatzweise auf den Reader
+        gewartet, der endet, sobald das Kind nicht mehr lebt.
+        """
+        if pty is None:
+            return True
+        waiter = getattr(pty, "wait_for_exit", None)
+        if callable(waiter):
+            try:
+                return bool(waiter(max(0.0, timeout_ms / 1000.0)))
+            except Exception:
+                return False
+        return self.waitForFinished(timeout_ms)
+
+    def shutdown(self, graceful_ms=500, force_ms=500):
+        """PTY deterministisch beenden, bevor Qt Elternobjekte zerstoert.
+
+        Reihenfolge bewusst gewaehlt:
+          1. Der Shell freundlich "exit" anbieten (terminate()).
+          2. Auf das tatsaechliche Ende des Kindprozesses warten (reap),
+             damit bash seine Terminalmodi per tcsetattr noch auf einem
+             gueltigen Slave-TTY wiederherstellen kann.
+          3. Erst danach den Reader stoppen und den PTY-Master schliessen.
+        Nur wenn das Kind haengt, wird auf kill() eskaliert. So entsteht im
+        Normalfall weder die "tcsetattr"-Meldung von bash noch ein verwaister
+        Reader-QThread.
+        """
+        pty = self._pty
+        if pty is None and (self._reader is None or not self._reader.isRunning()):
+            self._running = False
+            return True
+
+        # 1) Freundlich beenden.
+        self.terminate()
+
+        # 2) Auf das eingesammelte Ende des Kindprozesses warten.
+        child_gone = self._wait_child_exit(pty, graceful_ms)
+
+        if child_gone:
+            # 3) Kind ist weg -> Reader auslaufen lassen, dann Master schliessen.
+            self._stop_reader_before_pty_close(graceful_ms)
+            self._pty = None
+            close = getattr(pty, "close", None) if pty is not None else None
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            self._running = False
+            return True
+
+        # Kind haengt -> jetzt erst hart beenden (kill() schliesst den Master).
+        self.kill()
+        finished = self.waitForFinished(force_ms)
+        self._running = False
+        return bool(finished)
 
     def errorString(self):
         return self._error_string
@@ -1037,6 +1240,27 @@ class ShellDeckTerminalWidget(QWidget):
         self._interaction_prompt_text = ""
         self._awaiting_command_completion = False
         self._last_sent_shell_command = ""
+
+        # Selbst-Cleanup: den Terminal-Prozess und den PTY-Reader auch dann
+        # deterministisch beenden, wenn dieses Widget in einer Host-App (z.B.
+        # VisualEdit) eingebettet ist und die App geschlossen wird. aboutToQuit
+        # feuert dort zuverlaessig, waehrend ein eingebettetes Kind-Widget nicht
+        # unbedingt ein closeEvent erhaelt. Ohne diesen Hook bliebe ein
+        # verwaister QThread zurueck ("Error calling Python override of
+        # QThread::run()") und bash koennte "tcsetattr"-Meldungen ausgeben.
+        self._terminal_cleaned_up = False
+        # Echter VT-Terminalmodus (optional, nur mit pyte + PTY-Engine).
+        self.real_terminal_active = False
+        self.terminal_grid = None
+        # Zuletzt an das PTY gemeldete Fenstergroesse (Zeilen, Spalten), um
+        # unnoetige TIOCSWINSZ-Aufrufe/SIGWINCH bei jedem Resize zu vermeiden.
+        self._last_pty_size = None
+        _app = QApplication.instance()
+        if _app is not None:
+            try:
+                _app.aboutToQuit.connect(self._cleanup_terminal_on_exit)
+            except Exception:
+                pass
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -3232,6 +3456,10 @@ class ShellDeckTerminalWidget(QWidget):
         new_engine = self.window.normalize_terminal_engine(engine)
         old_engine = self.actual_terminal_engine()
         self.terminal_engine = new_engine
+        # Der echte VT-Modus braucht die PTY-Engine. Wird auf eine andere
+        # Engine gewechselt, den echten Modus vorher sauber verlassen.
+        if getattr(self, "real_terminal_active", False) and str(new_engine).lower() != "pty":
+            self.set_real_terminal_mode(False, focus=False)
         if not restart or new_engine == old_engine:
             self.display_shell_status()
             return True
@@ -3255,6 +3483,52 @@ class ShellDeckTerminalWidget(QWidget):
             self.restore_command = restore_command
             self.schedule_restore_command(restore_command)
         return True
+
+    def resizeEvent(self, event):
+        # Bei jeder Groessenaenderung die aktuelle Zeilen-/Spaltenzahl an ein
+        # aktives PTY melden, damit interaktive Programme korrekt umbrechen.
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.update_terminal_size)
+
+    def _terminal_grid_size(self):
+        """Schaetzt (Zeilen, Spalten) aus Ausgabeflaeche und Schriftmetrik."""
+        area = getattr(self, "output_area", None)
+        if area is None:
+            return None
+        try:
+            metrics = area.fontMetrics()
+            char_width = metrics.horizontalAdvance("M") or metrics.averageCharWidth() or 8
+            line_height = metrics.lineSpacing() or metrics.height() or 16
+            viewport = area.viewport()
+            width = max(1, viewport.width())
+            height = max(1, viewport.height())
+            cols = max(1, int(width // max(1, char_width)))
+            rows = max(1, int(height // max(1, line_height)))
+            return rows, cols
+        except Exception:
+            return None
+
+    def update_terminal_size(self):
+        """Meldet die Terminalgroesse an das PTY, sofern die Engine das kann.
+
+        Fuer den QProcess-Pfad ohne echtes TTY ist das eine no-op, da dort keine
+        set_window_size-Methode existiert.
+        """
+        process = getattr(self, "process", None)
+        setter = getattr(process, "set_window_size", None)
+        if not callable(setter):
+            return
+        size = self._terminal_grid_size()
+        if not size:
+            return
+        if size == getattr(self, "_last_pty_size", None):
+            return
+        self._last_pty_size = size
+        rows, cols = size
+        try:
+            setter(rows, cols)
+        except Exception:
+            pass
 
     def start_shell(self):
         shell_path = self.window.system_shell(self.shell_type)
@@ -3282,6 +3556,9 @@ class ShellDeckTerminalWidget(QWidget):
                 "try { Remove-Module PSReadLine -ErrorAction SilentlyContinue } catch {}",
             ]
         self.process.start(shell_path, shell_args)
+        # Neuer Kindprozess -> Groesse erneut melden (Cache zuruecksetzen).
+        self._last_pty_size = None
+        QTimer.singleShot(0, self.update_terminal_size)
         self.display_shell_status(shell_path)
 
     def restart_shell(self):
@@ -3294,7 +3571,19 @@ class ShellDeckTerminalWidget(QWidget):
         return process is not None and process.state() == QProcess.ProcessState.Running
 
     def finish_process_quickly(self, process, fast=False):
-        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+        if process is None:
+            return
+
+        # Ein PTY kann bereits NotRunning melden, waehrend sein Python-Reader
+        # noch ausläuft. Beim App-Shutdown deshalb immer deterministisch warten.
+        if isinstance(process, PtyTerminalProcess):
+            process.shutdown(
+                graceful_ms=250 if fast else 1200,
+                force_ms=250 if fast else 800,
+            )
+            return
+
+        if process.state() == QProcess.ProcessState.NotRunning:
             return
 
         terminate_timeout = 250 if fast else 1200
@@ -3323,10 +3612,38 @@ class ShellDeckTerminalWidget(QWidget):
         worker.deleteLater()
         self.ollama_worker = None
 
+    def _cleanup_terminal_on_exit(self):
+        """Idempotentes Aufraeumen beim Schliessen/App-Ende.
+
+        Wird sowohl von closeEvent als auch von QApplication.aboutToQuit
+        aufgerufen. Fehler duerfen den Shutdown nicht stoeren.
+        """
+        if getattr(self, "_terminal_cleaned_up", False):
+            return
+        self._terminal_cleaned_up = True
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.aboutToQuit.disconnect(self._cleanup_terminal_on_exit)
+            except (TypeError, RuntimeError):
+                pass
+        try:
+            self.stop_process(fast=True)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        # Auch eingebettet sicher aufraeumen, falls dieses Widget als eigenes
+        # Fenster/Tab geschlossen wird.
+        self._cleanup_terminal_on_exit()
+        super().closeEvent(event)
+
     def stop_process(self, fast=False):
         self.stop_ollama_worker(fast=fast)
         self.stop_client_process(fast=fast)
-        if self.process and self.process.state() == QProcess.ProcessState.Running:
+        if self.process is not None:
+            # Auch bereits beendete PTYs koennen noch einen Reader-QThread
+            # besitzen. finish_process_quickly entscheidet selbst, ob Arbeit noetig ist.
             self.finish_process_quickly(self.process, fast=fast)
 
     def interrupt_current_command(self):
@@ -5262,7 +5579,100 @@ class ShellDeckTerminalWidget(QWidget):
             self._schedule_pty_echo_carry_flush()
         return "".join(kept_lines)
 
+    # --- Echter VT-Terminalmodus -----------------------------------------
+    def real_terminal_available(self):
+        """True, wenn echte VT-Darstellung möglich ist (pyte + PTY-Engine)."""
+        return bool(_REAL_TERMINAL_AVAILABLE) and TerminalGridView is not None
+
+    def set_real_terminal_mode(self, enabled, focus=True):
+        """Schaltet den echten VT-Terminalmodus für diesen Tab ein/aus.
+
+        Additiv und abgesichert: Bei fehlendem pyte wird nichts geändert
+        (Rückgabe False). Der echte Terminalmodus benötigt die PTY-Engine; ist
+        sie nicht aktiv, wird auf sie umgestellt. Beim Ausschalten kehrt die
+        klassische Ansicht unverändert zurück.
+        """
+        enabled = bool(enabled)
+        if enabled == getattr(self, "real_terminal_active", False):
+            return True
+
+        if enabled:
+            if TerminalGridView is None or not _REAL_TERMINAL_AVAILABLE:
+                return False
+            if not self.process_uses_pty_engine():
+                try:
+                    self.set_terminal_engine("pty", restart=True)
+                except Exception:
+                    return False
+                if not self.process_uses_pty_engine():
+                    return False
+            # "Reines Terminal" und "Echtes Terminal" schliessen sich aus.
+            if self.inline_mode_active():
+                self.set_pure_terminal_mode(False, focus=False, save=False)
+            if self.terminal_grid is None:
+                self.terminal_grid = TerminalGridView(parent=self, font=self.window.terminal_font)
+                self.terminal_grid.dataReady.connect(self._write_terminal_grid_input)
+                self.terminal_grid.sizeChanged.connect(self._on_terminal_grid_size)
+                index = self.layout().indexOf(self.output_area)
+                self.layout().insertWidget(max(0, index), self.terminal_grid)
+                self.layout().setStretchFactor(self.terminal_grid, 1)
+                self._apply_theme_to_grid()
+            for widget in (self.output_area, self.command_task_header, self.command_task_list,
+                           self.input_prompt_label, self.input_line, self.execute_button):
+                widget.hide()
+            self.terminal_grid.show()
+            self.real_terminal_active = True
+            if focus:
+                self.terminal_grid.setFocus()
+        else:
+            self.real_terminal_active = False
+            if self.terminal_grid is not None:
+                self.terminal_grid.hide()
+            for widget in (self.output_area, self.input_prompt_label,
+                           self.input_line, self.execute_button):
+                widget.show()
+            # Sichtbarkeit der Befehls-Tabelle gemäß gespeichertem Zustand.
+            try:
+                self.set_command_task_panel_visible(
+                    getattr(self, "command_task_panel_visible", True), save=False)
+            except Exception:
+                pass
+            if focus:
+                self.input_line.setFocus()
+        return True
+
+    def toggle_real_terminal_mode(self):
+        return self.set_real_terminal_mode(not getattr(self, "real_terminal_active", False))
+
+    def _write_terminal_grid_input(self, data):
+        """Eingabebytes des Grids in den Terminal-Prozess schreiben."""
+        process = getattr(self, "process", None)
+        writer = getattr(process, "write", None)
+        if not callable(writer):
+            return
+        try:
+            writer(bytes(data))
+        except Exception:
+            pass
+
+    def _on_terminal_grid_size(self, rows, cols):
+        """Vom Grid gemeldete Größe an das PTY weiterreichen (TIOCSWINSZ)."""
+        process = getattr(self, "process", None)
+        setter = getattr(process, "set_window_size", None)
+        if callable(setter):
+            try:
+                setter(rows, cols)
+            except Exception:
+                pass
+        self._last_pty_size = (int(rows), int(cols))
+
     def handle_stdout(self):
+        if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
+            # Echter Terminalmodus: Rohbytes (inkl. ANSI) direkt in das
+            # VT-Modell geben, statt sie zu bereinigen und zeilenweise
+            # anzuhängen.
+            self.terminal_grid.feed(bytes(self.process.readAllStandardOutput()))
+            return
         data = self.decoded_terminal_output(self.process.readAllStandardOutput())
         self.queue_terminal_output(data)
         self.append_command_task_output("stdout", data)
@@ -5274,6 +5684,9 @@ class ShellDeckTerminalWidget(QWidget):
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_stderr(self):
+        if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
+            self.terminal_grid.feed(bytes(self.process.readAllStandardError()))
+            return
         data = self.decoded_terminal_output(self.process.readAllStandardError())
         self.queue_terminal_output(data, self.terminal_stderr_color())
         self.append_command_task_output("stderr", data)
@@ -5298,7 +5711,30 @@ class ShellDeckTerminalWidget(QWidget):
         self.input_line.setFont(font)
         if hasattr(self, "input_prompt_label"):
             self.input_prompt_label.setFont(font)
+        grid = getattr(self, "terminal_grid", None)
+        if grid is not None:
+            grid.setFont(font)
         self.update_command_task_table_height()
+
+    def _apply_theme_to_grid(self):
+        """Übernimmt Hintergrund-/Vordergrund-/Auswahlfarbe des Themes ins Grid."""
+        grid = getattr(self, "terminal_grid", None)
+        if grid is None:
+            return
+        try:
+            theme = self.window.active_theme()
+            background = self.window.normalize_hex_color(theme.get("background"), "#181818")
+            foreground = self.window.normalize_hex_color(theme.get("foreground"), "#FFFFFF")
+            colors = self.window.terminal_colors()
+            stdout_color = self.window.normalize_hex_color(colors.get("stdout"), foreground)
+            selection = self.window.normalize_hex_color(colors.get("selection"), "#2D5F93")
+            grid.default_bg = QColor(background)
+            grid.default_fg = QColor(stdout_color)
+            grid.selection_bg = QColor(selection)
+            grid.setFont(self.window.terminal_font)
+            grid.update()
+        except Exception:
+            pass
 
     def apply_theme(self):
         theme = self.window.active_theme()
@@ -5387,6 +5823,8 @@ class ShellDeckTerminalWidget(QWidget):
             " background-color: #1E7FCC;"
             "}"
         )
+        # Das echte VT-Grid (falls aktiv) an dieselben Themefarben koppeln.
+        self._apply_theme_to_grid()
 
 
 
