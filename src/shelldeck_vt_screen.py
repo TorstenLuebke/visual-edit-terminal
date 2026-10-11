@@ -14,7 +14,10 @@ Textdarstellung. Es werden beim Import keine Seiteneffekte ausgelöst.
 from __future__ import annotations
 
 import codecs
+from collections import deque
 from typing import Dict, List, Optional
+
+from shelldeck_scrollback import normalize_vt_scrollback_lines
 
 try:  # pyte ist optional; der Import darf ShellDeck nie am Start hindern.
     import pyte
@@ -44,6 +47,30 @@ DEFAULT_FG = "default"
 DEFAULT_BG = "default"
 
 
+class _PrivateSgrCompatibility:
+    """Schuetzt pyte gegen private CSI-SGR-Sequenzen (z.B. ESC[?4m).
+
+    Einige pyte-Versionen reichen ``private=True`` vom Stream an
+    ``select_graphic_rendition`` weiter, obwohl die Screen-Methode dieses
+    Keyword nicht annimmt. Private SGR-Codes sind keine normalen Farb-/
+    Textattribute und muessen ohne Aenderung des Bildschirms ignoriert werden.
+    Die Mixin-Loesung aendert keine globalen pyte-Klassen.
+    """
+
+    def select_graphic_rendition(self, *attrs, private=False):
+        if private:
+            return None
+        return super().select_graphic_rendition(*attrs)
+
+
+if pyte is not None:
+    class _CompatibleHistoryScreen(_PrivateSgrCompatibility, pyte.HistoryScreen):
+        """pyte-HistoryScreen mit kompatibler Behandlung privater SGR-Codes."""
+
+    class _CompatibleScreen(_PrivateSgrCompatibility, pyte.Screen):
+        """pyte-Screen ohne History mit derselben SGR-Absicherung."""
+
+
 class VtScreen:
     """Dünner, rendererfreundlicher Wrapper um pyte.
 
@@ -58,15 +85,16 @@ class VtScreen:
             raise RuntimeError(availability_message())
         self._rows = max(1, int(rows))
         self._cols = max(1, int(cols))
+        self._history_limit = normalize_vt_scrollback_lines(history)
         if enable_history:
             # ratio bestimmt, wie viele Zeilen pro Seitenwechsel gescrollt
             # werden; history die Gesamttiefe des Scrollback-Puffers.
-            self.screen = pyte.HistoryScreen(
+            self.screen = _CompatibleHistoryScreen(
                 self._cols, self._rows,
-                history=max(self._rows, int(history)), ratio=0.5,
+                history=max(self._rows, self._history_limit), ratio=0.5,
             )
         else:
-            self.screen = pyte.Screen(self._cols, self._rows)
+            self.screen = _CompatibleScreen(self._cols, self._rows)
         self.stream = pyte.Stream(self.screen)
         # Inkrementeller UTF-8-Dekoder: Mehrbyte-Zeichen dürfen über PTY-Lese-
         # grenzen hinweg zerteilt ankommen, ohne dass Ersatzzeichen entstehen.
@@ -97,6 +125,42 @@ class VtScreen:
             self.screen.dirty.update(range(rows))
         except Exception:
             pass
+        return True
+
+    @property
+    def history_lines(self) -> int:
+        """Konfigurierter VT-Verlauf (separat vom sichtbaren Zellgitter)."""
+        return self._history_limit
+
+    def set_history_lines(self, lines: int) -> bool:
+        """Aendert die pyte-History im laufenden Betrieb ohne Bildschirm-Reset.
+
+        pyte stellt dafuer derzeit keine oeffentliche Resize-Methode bereit.
+        Wir ersetzen nur seine History-Namedtuple und die begrenzten Deques;
+        Stream, Cursor, Farben und Screen.buffer bleiben unveraendert.
+        Bei einem unbekannten History-Layout wird nichts geaendert.
+        """
+        history = getattr(self.screen, "history", None)
+        if history is None or not hasattr(history, "_replace"):
+            return False
+        size = max(self._rows, normalize_vt_scrollback_lines(lines))
+        if size == history.size:
+            self._history_limit = normalize_vt_scrollback_lines(lines)
+            return False
+        if not isinstance(history.top, deque) or not isinstance(history.bottom, deque):
+            return False
+        # Die oberen Zeilen sind chronologisch: beim Schrumpfen die juengsten
+        # behalten. Beim Zurueckblaettern liegt in 'bottom' die Zukunft;
+        # dort muessen die naechsten (linken) Zeilen erhalten bleiben.
+        top = deque(history.top, maxlen=max(1, size // 2))
+        bottom = deque(list(history.bottom)[:size], maxlen=size)
+        distance = max(0, int(history.size) - int(history.position))
+        position = max(0, size - min(size, distance))
+        self.screen.history = history._replace(
+            top=top, bottom=bottom, size=size, position=position,
+        )
+        self._history_limit = normalize_vt_scrollback_lines(lines)
+        self.screen.dirty.update(range(self._rows))
         return True
 
     @property

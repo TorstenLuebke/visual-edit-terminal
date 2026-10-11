@@ -104,6 +104,71 @@ Emulation ist plattformübergreifend (Windows/Linux/macOS), da `pyte` reines
 Python ist und die Prozess-Ebene weiterhin PTY (Linux/macOS) bzw.
 `pywinpty`/ConPTY (Windows) nutzt.
 
+## Eigene Hilfen fuer weitere Vollbildprogramme
+
+Neue lokale POSIX-Vordergrundprogramme koennen ohne Aenderungen an der
+Terminalsteuerung ueber `~/.config/ShellDeck/program_guides.json` hinzugefuegt
+werden (oder `$XDG_CONFIG_HOME/ShellDeck/program_guides.json`).
+Die Datei wird beim Start geladen; es werden **keine** Shellbefehle aus dieser
+Datei ausgefuehrt. Beispiel fuer ein eigenes lokal installiertes Terminalprogramm:
+
+```json
+{
+  "programs": [
+    {
+      "name": "myviewer",
+      "label": "Mein Dateibetrachter",
+      "help_text": "Beenden: q. Suchen: /.",
+      "keys": ["q"],
+      "aliases": ["myviewer-cli"],
+      "button_label": "Beenden"
+    }
+  ]
+}
+```
+
+Zulaessige Tastencodes: sichtbare ASCII-Einzelzeichen, `CTRL+A` bis `CTRL+Z`,
+`F1` bis `F12`, `ESC`, `ENTER`, `TAB`, `SPACE`, `BACKSPACE`.
+Das Feld `button_label` kann `Beenden` oder `Trennen` sein. Fuer neue Programme
+bitte nur eine **bekannte, normale** Tastenkombination verwenden. Die
+Anwendung erkennt weiterhin ausschliesslich vertrauenswuerdige lokale
+POSIX-Vordergrundprozesse; SSH, Shells und geschuetzte Programmkennungen
+koennen nicht durch Konfiguration ueberschrieben werden. Ein ungueltiger
+Eintrag wird ignoriert; `USER_GUIDE_ERRORS` liefert die Diagnose.
+Bestehende Tabs verwenden die beim Start geladenen Definitionen.
+Fuer Windows-ConPTY und Multiplexer-Unterprogramme ist eine eigene sichere
+Erkennung erforderlich; der Mechanismus wird dort nicht automatisch aktiviert.
+
+## Kontextbezogene Bedienhilfe fuer Vollbildprogramme
+
+Im **echten VT-Modus** erkennt ShellDeck auf Linux/macOS bekannte lokale
+Vordergrundprogramme direkt ueber die aktive PTY-Prozessgruppe. Bei `vim`,
+`vi`, `nvim`, `nano`, `htop`, `top`, `less`, `more`, `man`, `watch`,
+`btop`, `micro`, `mc`, `tmux` und `screen` erscheint
+eine schmale Leiste mit **Beenden** und **Hilfe**. Der Button gibt lediglich
+das programmspezifische Beenden-Kommando an denselben PTY-Job weiter; er
+beendet nicht die Shell und sendet keine systemweiten Kill-Signale.
+
+Bei Vim versucht **Beenden** den normalen Ausstieg (`Esc`, `:q`, Enter).
+Ungespeicherte Aenderungen bleiben dadurch geschuetzt. Zusaetzlich stehen
+unter **Weitere Aktionen** das Speichern und Beenden (`:wq`) und das
+**bestaetigungspflichtige** Verwerfen von Aenderungen (`:q!`) bereit.
+Bei `tmux` und `screen` lautet der Button **Trennen** statt Beenden: Er
+uebermittelt das jeweilige Standard-Detach-Kuerzel (tmux: Strg+B,d;
+screen: Strg+A,d) und beendet keine Sitzung. Bei abweichenden Prefixen
+muss die Sitzung manuell getrennt werden. Die Hilfe erkennt keine innerhalb
+von Multiplexern oder entfernten SSH-Sitzungen laufenden Programme.
+Jeder Tab hat seine eigene Erkennung; normale Tabs bleiben unveraendert.
+
+Nano verwendet `Strg+X` und fragt bei Aenderungen selbst nach. Die Hilfefenster
+geben eine kurze Bedienuebersicht; alle gewohnten Tastenkombinationen bleiben
+erhalten.
+
+Wenn die Prozessgruppe nicht sicher festgestellt werden kann, bleiben die
+Aktionen aus Sicherheitsgruenden ausgeblendet. **ConPTY/Windows** verfuegt
+noch nicht ueber die gleiche sichere Vordergrundprozess-Erkennung; eine
+plattformgleiche Erweiterung ist vorgesehen, nicht bereits implementiert.
+
 ## Prozessstabilitaet (Etappe 1)
 
 - PTY/ConPTY und QProcess bleiben als getrennte, pro Tab auswählbare Backends
@@ -333,3 +398,38 @@ so ihren Zeilenumbruch und ihre Statuszeile erneut anpassen koennen.
   darstellen. Die VT-Ansicht verwendet weiterhin ihre eigenen Größenmeldungen.
 - Regressionstests: `src/test_shelldeck_prompt_repeat_guard.py` und
   `src/test_shelldeck_pty_resize_debounce.py`.
+
+### VT-Scrollback-Grenze (Etappe 2, Patches 035–036)
+
+Unter **Einstellungen → Scrollback-Größe (echtes VT-Terminal)…** kann die
+Anzahl der VT-Verlaufszeilen pro Tab separat auf **100 bis 20.000** eingestellt
+werden (Standard **2.000**). Die Einstellung wird gespeichert und gilt auch
+für bereits geöffnete, geteilte und ausgekoppelte VT-Tabs. Ein Tab ohne aktives
+VT-Gitter übernimmt den Wert beim Einschalten. Bei kleinerem Grenzwert gehen
+nur die ältesten Verlaufszeilen verloren. Der sichtbare Bildschirm, Cursor,
+VT-Parser und laufende Terminalprozesse werden dabei nicht zurückgesetzt.
+Die klassische Scrollback-Einstellung bleibt unabhängig.
+
+### Versionsangabe (Patch 037)
+
+Die Datei **`versions.txt`** im ShellDeck-Projektverzeichnis enthält die
+aktuelle Version (eine Zeile, z. B. `2.16.0`). Sie wird beim Start eingelesen;
+**Fenstertitel**, F1-Hilfe, interne Versionsangaben und **Hilfe → Über**
+verwenden denselben Wert. Nach einer Änderung ShellDeck neu starten.
+Bei Auslieferung von gepackten Anwendungen muss `versions.txt` als Ressource
+mitgeliefert werden (neben der Programmdatei oder im Bundle). Fehlt die Datei,
+startet ShellDeck mit dem zuletzt im Code hinterlegten Rückfallwert.
+
+### Private VT/ANSI-Farbsequenzen (Patch 038–039)
+
+- Einige pyte-Versionen werfen bei privaten CSI-SGR-Sequenzen wie
+  `ESC[?4m` oder `ESC[>4;?m` einen `TypeError` (`private=True`). ShellDeck
+  faengt diese Sonderform in seinem eigenen VT-Screen-Adapter ab: Private
+  SGR-Codes werden ignoriert, normale Farben/Attribute unveraendert an
+  pyte weitergegeben. Die globalen pyte-Klassen bleiben unangetastet.
+- Betrifft beide VT-Bildschirmvarianten (mit und ohne History), insbesondere
+  Ausgaben von interaktiven Terminalprogrammen. Kein Eingriff in PTY,
+  QProcess oder klassische Entwicklerkonsole.
+- Regressionen: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_vt_private_sgr.py`. Die Stream-Integration wird nur
+  bei installiertem pyte getestet.

@@ -48,7 +48,7 @@ except Exception:
     TerminalGridView = None
     _REAL_TERMINAL_AVAILABLE = False
 from PySide6.QtWidgets import (
-    QApplication, QTextEdit, QPlainTextEdit, QVBoxLayout, QWidget,
+    QApplication, QTextEdit, QPlainTextEdit, QVBoxLayout, QHBoxLayout, QWidget,
     QPushButton, QDialog, QLabel, QInputDialog, QDialogButtonBox,
     QMenu, QLineEdit, QListWidget, QListWidgetItem, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox
@@ -57,6 +57,7 @@ from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QEvent, QThread, S
 from shelldeck_session_state import evaluate_session_state
 from shelldeck_output_buffer import TerminalOutputBuffer
 from shelldeck_scrollback import normalize_scrollback_blocks
+from shelldeck_program_assist import GUIDES, foreground_guide
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor,
     QSyntaxHighlighter, QAction, QTextOption
@@ -1175,6 +1176,16 @@ class PtyTerminalProcess(QThread):
     def waitForBytesWritten(self, msecs=30000):
         return self._running
 
+    def foreground_guide(self):
+        """Ermittelt ausschliesslich das erkannte lokale Vordergrund-PTY-Programm.
+
+        Fuer ConPTY besteht derzeit keine gleichwertig sichere Prozessgruppen-
+        Abfrage; deshalb liefert dieses Backend dort bewusst None.
+        """
+        if not self._running:
+            return None
+        return foreground_guide(self._pty)
+
     def set_window_size(self, rows, cols):
         """Reicht die Terminalgroesse an das PTY/ConPTY weiter (plattformtolerant).
 
@@ -1471,7 +1482,37 @@ class ShellDeckTerminalWidget(QWidget):
         self.output_area.installEventFilter(self)
         self.output_area.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.output_area.customContextMenuRequested.connect(self.show_terminal_context_menu)
+        # PTY-Programmbegleiter: keine Eingabe- oder Prozesssteuerung durch
+        # Heuristiken; die Leiste erscheint nur fuer das gepruefte Vordergrundjob.
+        self._assist_identity = None
+        self._assist_process = None
+        self._assist_panel = QWidget(self)
+        assist_layout = QHBoxLayout(self._assist_panel)
+        assist_layout.setContentsMargins(4, 2, 4, 2)
+        assist_layout.setSpacing(6)
+        self._assist_name = QLabel("")
+        self._assist_exit = QPushButton("Beenden")
+        self._assist_exit.setToolTip("Versucht, nur das erkannte Vordergrundprogramm sicher zu beenden.")
+        self._assist_exit.clicked.connect(self._exit_detected_program)
+        self._assist_help = QPushButton("Hilfe")
+        self._assist_help.setToolTip("Kurzbefehle fuer das laufende Terminalprogramm anzeigen.")
+        self._assist_help.clicked.connect(self._show_detected_program_help)
+        self._assist_more = QPushButton("Weitere Aktionen")
+        self._assist_more.clicked.connect(self._show_detected_program_actions)
+        assist_layout.addWidget(self._assist_name)
+        assist_layout.addStretch(1)
+        assist_layout.addWidget(self._assist_exit)
+        assist_layout.addWidget(self._assist_help)
+        assist_layout.addWidget(self._assist_more)
+        # Die Bedienhilfe ist nur ein zusaetzliches, anfangs verborgenes Widget.
+        # output_area MUSS als eigenes Widget im Layout bleiben: Ohne diese
+        # Zeile verschwindet die klassische Terminalanzeige vollstaendig.
+        layout.addWidget(self._assist_panel)
+        self._assist_panel.hide()
         layout.addWidget(self.output_area)
+        self._assist_timer = QTimer(self)
+        self._assist_timer.setInterval(350)
+        self._assist_timer.timeout.connect(self._refresh_detected_program)
 
         self.command_tasks = []
         self.active_command_task = None
@@ -6079,6 +6120,102 @@ class ShellDeckTerminalWidget(QWidget):
             self._schedule_pty_echo_carry_flush()
         return "".join(kept_lines)
 
+    # --- Programmspezifische VT-Bedienhilfe --------------------------------
+    def _refresh_detected_program(self):
+        """Sicherer, lesender PTY-Vordergrundcheck pro Tab, nie /proc-Scanning."""
+        process = getattr(self, "process", None)
+        identity = None
+        if (getattr(self, "real_terminal_active", False)
+                and process is not None and self.process_uses_pty_engine()):
+            probe = getattr(process, "foreground_guide", None)
+            if callable(probe):
+                try:
+                    identity = probe()
+                except (OSError, RuntimeError, ValueError):
+                    identity = None
+        if identity is not None:
+            # Unbekannte Programme werden nie mit einem generischen Signal
+            # beendet: kein versehentliches Schliessen von ssh, shell, sudo.
+            key = identity[0]
+            if key not in GUIDES:
+                identity = None
+        if self._assist_identity == identity and self._assist_process is process:
+            return
+        self._assist_identity = identity
+        self._assist_process = process if identity else None
+        if identity:
+            guide = GUIDES[identity[0]]
+            self._assist_name.setText(f"{guide.label} läuft")
+            self._assist_exit.setText(guide.primary_label)
+            self._assist_exit.setToolTip(
+                "Nur diese Sitzung trennen (laufende Programme bleiben erhalten)."
+                if guide.primary_label == "Trennen" else
+                "Nur den erkannten Vordergrundprozess regulär beenden."
+            )
+            self._assist_more.setVisible(identity[0] == "vim")
+            self._assist_panel.show()
+        else:
+            self._assist_panel.hide()
+
+    def _checked_detected_program(self):
+        """Unmittelbar vor der Aktion sicherstellen, dass der Job noch derselbe ist."""
+        identity = self._assist_identity
+        process = self._assist_process
+        if (identity is None or process is not getattr(self, "process", None)
+                or not getattr(self, "real_terminal_active", False)):
+            return None
+        probe = getattr(process, "foreground_guide", None)
+        try:
+            if not callable(probe) or probe() != identity:
+                self._refresh_detected_program()
+                return None
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return GUIDES.get(identity[0])
+
+    def _send_assist_input(self, raw):
+        guide = self._checked_detected_program()
+        if guide is None:
+            return False
+        self._write_terminal_grid_input(raw)
+        return True
+
+    def _exit_detected_program(self):
+        guide = self._checked_detected_program()
+        if guide is not None:
+            self._send_assist_input(guide.exit_bytes)
+            # Vim/Nano/Micro entscheiden selbst ueber ungespeicherte Aenderungen.
+            # Tmux/Screen erhalten ausschliesslich die programmseitige Detach-Tastenfolge.
+            if self.terminal_grid is not None:
+                self.terminal_grid.setFocus()
+
+    def _show_detected_program_help(self):
+        guide = self._checked_detected_program()
+        if guide is not None:
+            QMessageBox.information(self, f"{guide.label} – Kurzhilfe", guide.help_text)
+
+    def _show_detected_program_actions(self):
+        guide = self._checked_detected_program()
+        if guide is None or guide.name != "vim":
+            return
+        menu = QMenu(self)
+        save = menu.addAction("Speichern und beenden (:wq)")
+        discard = menu.addAction("Ohne Speichern beenden (:q!) …")
+        selected = menu.exec(self._assist_more.mapToGlobal(self._assist_more.rect().bottomLeft()))
+        if selected is save:
+            self._send_assist_input(b"\x1b:wq\r")
+        elif selected is discard:
+            result = QMessageBox.warning(
+                self, "Ungespeicherte Änderungen verwerfen?",
+                "Alle ungespeicherten Änderungen in Vim gehen verloren. Fortfahren?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result == QMessageBox.StandardButton.Yes:
+                self._send_assist_input(b"\x1b:q!\r")
+        if self.terminal_grid is not None:
+            self.terminal_grid.setFocus()
+
     # --- Echter VT-Terminalmodus -----------------------------------------
     def real_terminal_available(self):
         """True, wenn echte VT-Darstellung möglich ist (pyte + PTY-Engine)."""
@@ -6110,7 +6247,10 @@ class ShellDeckTerminalWidget(QWidget):
             if self.inline_mode_active():
                 self.set_pure_terminal_mode(False, focus=False, save=False)
             if self.terminal_grid is None:
-                self.terminal_grid = TerminalGridView(parent=self, font=self.window.terminal_font)
+                self.terminal_grid = TerminalGridView(
+                    parent=self, font=self.window.terminal_font,
+                    history=getattr(self.window, "vt_scrollback_lines", 2000),
+                )
                 self.terminal_grid.dataReady.connect(self._write_terminal_grid_input)
                 self.terminal_grid.sizeChanged.connect(self._on_terminal_grid_size)
                 index = self.layout().indexOf(self.output_area)
@@ -6122,10 +6262,14 @@ class ShellDeckTerminalWidget(QWidget):
                 widget.hide()
             self.terminal_grid.show()
             self.real_terminal_active = True
+            self._assist_timer.start()
+            self._refresh_detected_program()
             if focus:
                 self.terminal_grid.setFocus()
         else:
             self.real_terminal_active = False
+            self._assist_timer.stop()
+            self._refresh_detected_program()
             if self.terminal_grid is not None:
                 self.terminal_grid.hide()
             for widget in (self.output_area, self.input_prompt_label,

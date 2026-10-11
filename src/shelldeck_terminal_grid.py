@@ -24,6 +24,8 @@ from PySide6.QtCore import Qt, QRect, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
+from shelldeck_scrollback import normalize_vt_scrollback_lines
+
 import shelldeck_key_encoding as keyenc
 import shelldeck_vt_screen as vt
 
@@ -101,9 +103,11 @@ class TerminalGridView(QWidget):
     dataReady = Signal(object)
 
     def __init__(self, parent=None, rows: int = 24, cols: int = 80,
-                 font: Optional[QFont] = None, enable_history: bool = True):
+                 font: Optional[QFont] = None, enable_history: bool = True,
+                 history: int = 2000):
         super().__init__(parent)
-        self._model = vt.VtScreen(rows=rows, cols=cols, enable_history=enable_history) \
+        self._model = vt.VtScreen(rows=rows, cols=cols,
+                                  enable_history=enable_history, history=history) \
             if vt.is_available() else None
 
         base_font = font or QFont("Monospace", 11)
@@ -145,6 +149,15 @@ class TerminalGridView(QWidget):
 
     def model(self) -> Optional[vt.VtScreen]:
         return self._model
+
+    def set_history_lines(self, lines: int) -> bool:
+        """Aendert die Scrollback-Grenze, ohne das sichtbare Gitter zu loeschen."""
+        if self._model is None or not self._model.has_history():
+            return False
+        changed = self._model.set_history_lines(normalize_vt_scrollback_lines(lines))
+        if changed:
+            self.update()
+        return changed
 
     # --- Schrift/Metrik ---------------------------------------------------
     def setFont(self, font: QFont) -> None:  # noqa: N802 (Qt-Namenskonvention)

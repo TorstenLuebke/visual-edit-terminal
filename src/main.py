@@ -25,6 +25,7 @@ if __name__ == "__main__" and os.name == "posix":
     if _session_result is not None:
         raise SystemExit(_session_result)
 
+from shelldeck_version import APP_VERSION
 from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
 from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
@@ -36,6 +37,8 @@ from shelldeck_cli import parse_launch_arguments, resolve_directory
 from shelldeck_scrollback import (
     DEFAULT_SCROLLBACK_BLOCKS, MIN_SCROLLBACK_BLOCKS, MAX_SCROLLBACK_BLOCKS,
     normalize_scrollback_blocks,
+    DEFAULT_VT_SCROLLBACK_LINES, MIN_VT_SCROLLBACK_LINES, MAX_VT_SCROLLBACK_LINES,
+    normalize_vt_scrollback_lines,
 )
 import shelldeck_system_integration as system_integration
 from PySide6.QtWidgets import (
@@ -61,7 +64,6 @@ from shelldeck_terminal_widget import (
 LOG_FILE = Path.home() / "TerminalApp.log"
 _LOG_HANDLE = None
 APP_NAME = "ShellDeck Terminal"
-APP_VERSION = "2.16.0"
 
 def install_crash_logging():
     global _LOG_HANDLE
@@ -161,6 +163,7 @@ class TerminalWindow(QMainWindow):
         self.terminal_engine_is_user_choice = False
         self.max_history_size = 1000
         self.scrollback_blocks = DEFAULT_SCROLLBACK_BLOCKS
+        self.vt_scrollback_lines = DEFAULT_VT_SCROLLBACK_LINES
         self.terminal_font = QFont("Courier New", 10)
         self.saved_tabs = []
         self.saved_paths = []
@@ -354,6 +357,14 @@ class TerminalWindow(QMainWindow):
         )
         scrollback_action.triggered.connect(self.show_scrollback_dialog)
         settings_menu.addAction(scrollback_action)
+
+        vt_scrollback_action = QAction("Scrollback-Größe (echtes VT-Terminal)…", self)
+        vt_scrollback_action.setToolTip(
+            "Begrenzt den separaten VT-Verlauf pro Tab; aktuelles Bild, Cursor und "
+            "laufende interaktive Programme bleiben beim Ändern erhalten."
+        )
+        vt_scrollback_action.triggered.connect(self.show_vt_scrollback_dialog)
+        settings_menu.addAction(vt_scrollback_action)
 
         self.carry_profiles_action = QAction("Profiländerungen beim Beenden übernehmen", self)
         self.carry_profiles_action.setCheckable(True)
@@ -3083,6 +3094,9 @@ class TerminalWindow(QMainWindow):
         self.scrollback_blocks = normalize_scrollback_blocks(
             settings.get("scrollback_blocks", self.scrollback_blocks)
         )
+        self.vt_scrollback_lines = normalize_vt_scrollback_lines(
+            settings.get("vt_scrollback_lines", self.vt_scrollback_lines)
+        )
 
         engine_value = str(settings.get("terminal_engine", self.terminal_engine or "auto") or "auto").lower().strip()
         self.terminal_engine = engine_value if engine_value in {"auto", "qprocess", "pty"} else "auto"
@@ -3136,6 +3150,7 @@ class TerminalWindow(QMainWindow):
             "default_command": self.default_command,
             "max_history_size": self.max_history_size,
             "scrollback_blocks": normalize_scrollback_blocks(self.scrollback_blocks),
+            "vt_scrollback_lines": normalize_vt_scrollback_lines(self.vt_scrollback_lines),
             "shell_type": self.shell_type,
             "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
             **terminal_engine_settings,
@@ -3737,6 +3752,27 @@ class TerminalWindow(QMainWindow):
             tab.set_scrollback_blocks(self.scrollback_blocks)
         self.save_settings()
 
+    def show_vt_scrollback_dialog(self):
+        size, ok = QInputDialog.getInt(
+            self,
+            "VT-Scrollback-Größe",
+            "Maximale Verlaufszeilen pro Tab (echtes VT-Terminal):",
+            normalize_vt_scrollback_lines(self.vt_scrollback_lines),
+            MIN_VT_SCROLLBACK_LINES,
+            MAX_VT_SCROLLBACK_LINES,
+            100,
+        )
+        if not ok:
+            return
+        self.vt_scrollback_lines = normalize_vt_scrollback_lines(size)
+        # Die Grenze gilt auch fuer bereits offene, geteilte und ausgekoppelte Tabs.
+        # Tabs ohne VT-Gitter uebernehmen sie erst beim Einschalten des VT-Modus.
+        for _, _, tab in self.all_terminal_tabs():
+            grid = getattr(tab, "terminal_grid", None)
+            if grid is not None:
+                grid.set_history_lines(self.vt_scrollback_lines)
+        self.save_settings()
+
     def ollama_models(self):
         return list_ollama_models()
 
@@ -4057,7 +4093,8 @@ Einstellungen-Menü
 - Design auf Standard zurücksetzen: stellt die Standardfarben wieder her.
 - Standardbefehl: Befehl, der beim Start eines neuen Tabs automatisch ausgeführt wird.
 - History-Größe: maximale Anzahl gespeicherter Befehle.
-- Scrollback-Größe (klassische Ansicht): maximal 1.000 bis 100.000 Textblöcke je Tab (Standard 25.000). Alte Zeilen werden beim Verkleinern gelöscht; der VT-Modus hat einen eigenen Verlauf.
+- Scrollback-Größe (klassische Ansicht): maximal 1.000 bis 100.000 Textblöcke je Tab (Standard 25.000). Alte Zeilen werden beim Verkleinern gelöscht.
+- Scrollback-Größe (echtes VT-Terminal): separat 100 bis 20.000 Verlaufszeilen je Tab (Standard 2.000), dauerhaft gespeichert. Eine Aenderung wirkt auf bestehende VT-Tabs und behaelt das sichtbare Bild und laufende Programme bei.
 - Shell-Backend: wechselt das Shell-Backend des aktuellen Tabs.
 - KI-Menü / Ollama aktivieren: zeigt oder versteckt das KI-Menü.
 
@@ -4171,11 +4208,12 @@ Systemintegration (Einstellungen -> Systemintegration...)
 
 Echtes Terminal (VT)
 - Ansicht -> "Echtes Terminal (VT)" schaltet den aktuellen Tab auf echte VT/ANSI-Darstellung; Vollbild-Programme wie vim, htop, less oder nano funktionieren dann korrekt.
+- Bei erkanntem lokalem Vordergrundprogramm (Linux/macOS-PTY: vim/vi/nvim, nano, htop, top, less/more, man, watch, btop, micro, mc, tmux, screen) erscheint eine kleine Leiste mit Beenden bzw. Trennen und Kurzhilfe. Tmux/Screen werden ueber die Standard-Prefix-Tasten getrennt und nicht beendet. Vim wird ohne Datenverlustversuch beendet (:q); Verwerfen erfordert eine Bestaetigung. Ohne sichere Erkennung bleibt die Leiste verborgen (auch bei Windows/ConPTY).
 - Diese Programme nicht in der klassischen Textansicht ausfuehren: Sie sendet zwar PTY-Eingaben, interpretiert aber keine vollstaendigen VT-Cursor- und Screen-Sequenzen.
 - Wiederholte interaktive Rueckfragen duerfen eingegebene Antworten nicht loeschen; im klassischen Modus werden Fenstergroessenwechsel gebuendelt an das PTY gemeldet.
 - Voraussetzung: das optionale Paket pyte (pip install pyte) und die PTY-Engine (wird bei Bedarf automatisch aktiviert). Fehlt pyte, bleibt die klassische Ansicht.
 - Text mit der linken Maustaste markieren; Rechtsklick bietet Kopieren, Einfuegen, Alles Sichtbare markieren und Markierung aufheben. Alternativ Ctrl+Shift+C/V oder Ctrl+Insert/Shift+Insert; unter Linux ist auch Mittelklick moeglich. Ctrl+C und Ctrl+V bleiben Eingaben an interaktive Programme. Scrollback per Mausrad.
-- Die VT-Zellzeichnung verwendet wiederverwendete Schriftvarianten und einen begrenzten Farbcache; bei kleinen Aenderungen werden nur betroffene Zeilen neu gezeichnet. Bei einer Groessenaenderung wird dagegen die gesamte VT-Flaeche neu gezeichnet und nur die aktive VT-Gittergroesse an das PTY gemeldet. Der VT-Scrollback bleibt vorerst getrennt von der klassischen Scrollback-Einstellung.
+- Die VT-Zellzeichnung verwendet wiederverwendete Schriftvarianten und einen begrenzten Farbcache; bei kleinen Aenderungen werden nur betroffene Zeilen neu gezeichnet. Bei einer Groessenaenderung wird dagegen die gesamte VT-Flaeche neu gezeichnet und nur die aktive VT-Gittergroesse an das PTY gemeldet. VT- und klassische Scrollback-Grenze werden getrennt eingestellt und gespeichert.
 - "Reines Terminal" und "Echtes Terminal" schliessen sich pro Tab aus. Die zeilenbasierten Zusatzfunktionen (Befehls-Tabelle, Prompt-Leiste, KI-Prompt) gehoeren zum klassischen Modus und bleiben dort erhalten.
 
 Hinweise

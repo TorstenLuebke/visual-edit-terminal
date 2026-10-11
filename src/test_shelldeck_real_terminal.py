@@ -80,6 +80,22 @@ class RealTerminalModeTests(unittest.TestCase):
         widget.process = _FakeProcess()
         return widget
 
+    def test_program_assist_preserves_classic_output_layout(self):
+        """Die optionale Hilfsleiste darf die klassische Ansicht nicht ersetzen."""
+        w = self._make_widget()
+        layout = w.layout()
+        assist_index = layout.indexOf(w._assist_panel)
+        output_index = layout.indexOf(w.output_area)
+        self.assertGreaterEqual(assist_index, 0)
+        self.assertEqual(output_index, assist_index + 1)
+        self.assertTrue(w._assist_panel.isHidden())
+        self.assertFalse(w.output_area.isHidden())
+        self.assertTrue(w.set_real_terminal_mode(True))
+        self.assertEqual(layout.indexOf(w.terminal_grid), output_index)
+        self.assertTrue(w.set_real_terminal_mode(False))
+        self.assertGreaterEqual(layout.indexOf(w.output_area), 0)
+        self.assertFalse(w.output_area.isHidden())
+
     def test_enable_activates_grid(self):
         w = self._make_widget()
         self.assertTrue(w.real_terminal_available())
@@ -134,6 +150,58 @@ class RealTerminalModeTests(unittest.TestCase):
         w.process.size = None
         w.update_terminal_size()
         self.assertIsNone(w.process.size)
+
+    def test_foreground_program_controls_are_bound_to_active_job(self):
+        w = self._make_widget()
+        w.process.foreground_guide = lambda: ("vim", 333)
+        self.assertTrue(w.set_real_terminal_mode(True))
+        self.assertEqual(w._assist_identity, ("vim", 333))
+        self.assertFalse(w._assist_panel.isHidden())
+        w._exit_detected_program()
+        self.assertEqual(w.process.written[-1], b"\x1b:q\r")
+        # Ein inzwischen neuer foreground-Job darf keine alten Eingaben erhalten.
+        w.process.foreground_guide = lambda: ("nano", 444)
+        before = list(w.process.written)
+        w._exit_detected_program()
+        self.assertEqual(w.process.written, before)
+        self.assertEqual(w._assist_identity, ("nano", 444))
+        w._exit_detected_program()
+        self.assertEqual(w.process.written[-1], b"\x18")
+        w.set_real_terminal_mode(False)
+        self.assertTrue(w._assist_panel.isHidden())
+        self.assertFalse(w._assist_timer.isActive())
+
+    def test_multiplexer_controls_are_tab_local_and_detach_only(self):
+        tab_tmux = self._make_widget()
+        tab_normal = self._make_widget()
+        tab_tmux.process.foreground_guide = lambda: ("tmux", 712)
+        tab_normal.process.foreground_guide = lambda: None
+        self.assertTrue(tab_tmux.set_real_terminal_mode(True))
+        self.assertTrue(tab_normal.set_real_terminal_mode(True))
+        self.assertFalse(tab_tmux._assist_panel.isHidden())
+        self.assertEqual(tab_tmux._assist_exit.text(), "Trennen")
+        self.assertTrue(tab_normal._assist_panel.isHidden())
+        tab_tmux._exit_detected_program()
+        self.assertEqual(tab_tmux.process.written[-1], b"\x02d")
+        self.assertFalse(tab_normal.process.written)
+        # Die Prozessgruppe wechselt: alte Aktion darf keine Eingabe senden.
+        before = list(tab_tmux.process.written)
+        tab_tmux.process.foreground_guide = lambda: ("screen", 723)
+        tab_tmux._exit_detected_program()
+        self.assertEqual(tab_tmux.process.written, before)
+        self.assertEqual(tab_tmux._assist_exit.text(), "Trennen")
+        tab_tmux._exit_detected_program()
+        self.assertEqual(tab_tmux.process.written[-1], b"\x01d")
+        tab_tmux.process.foreground_guide = lambda: None
+        tab_tmux._refresh_detected_program()
+        self.assertTrue(tab_tmux._assist_panel.isHidden())
+
+    def test_unknown_foreground_never_offers_exit(self):
+        w = self._make_widget()
+        w.process.foreground_guide = lambda: None
+        w.set_real_terminal_mode(True)
+        self.assertTrue(w._assist_panel.isHidden())
+        self.assertIsNone(w._checked_detected_program())
 
     def test_disable_restores_classic(self):
         w = self._make_widget()

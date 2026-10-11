@@ -37,3 +37,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Von GitDesk vorgeschlagene lokale Dateien
+*.swo
+*.swp
