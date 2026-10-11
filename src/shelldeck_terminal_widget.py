@@ -2385,10 +2385,71 @@ class ShellDeckTerminalWidget(QWidget):
             self.update_input_prompt_label()
         return self.current_working_directory
 
+    def qprocess_linux_descendant_pids(self):
+        """Find children of this tab's QProcess shell, never the GUI process.
+
+        A pipe is not a terminal: writing ETX to bash's stdin does not
+        interrupt its foreground child. On Linux, send SIGINT to the shell's
+        descendants instead. Do not signal the process group: bash may share
+        the GUI's process group in QProcess mode.
+        """
+        process = getattr(self, "process", None)
+        if not sys.platform.startswith("linux") or process is None:
+            return []
+        try:
+            root_pid = int(process.processId())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return []
+        if root_pid <= 0:
+            return []
+        found = []
+        visited = {root_pid}
+        pending = [root_pid]
+        while pending and len(visited) < 256:
+            pid = pending.pop(0)
+            try:
+                children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            except OSError:
+                continue
+            for item in children:
+                try:
+                    child = int(item)
+                except ValueError:
+                    continue
+                if child > 0 and child not in visited:
+                    visited.add(child)
+                    pending.append(child)
+                    found.append(child)
+        return found
+
     def send_control_character(self, byte_value):
-        if self.process and self.process.state() == QProcess.ProcessState.Running:
-            self.process.write(byte_value)
-            self.process.waitForBytesWritten(1000)
+        process = getattr(self, "process", None)
+        if process is None or process.state() != QProcess.ProcessState.Running:
+            self.window.show_status("Kein laufender Terminalprozess vorhanden")
+            return False
+        if self.process_uses_pty_engine():
+            result = process.write(byte_value)
+            process.waitForBytesWritten(1000)
+            return result is not None and result >= 0
+        # QProcess uses pipes, not a controlling terminal. Terminal control
+        # bytes such as ETX/SUSP/EOF are just input data there.
+        if bytes(byte_value) == b"\x03" and sys.platform.startswith("linux"):
+            import signal
+            descendants = self.qprocess_linux_descendant_pids()
+            interrupted = False
+            for pid in reversed(descendants):
+                try:
+                    os.kill(pid, signal.SIGINT)
+                    interrupted = True
+                except (OSError, ProcessLookupError):
+                    pass
+            if interrupted:
+                self.window.show_status("SIGINT an laufenden QProcess-Kindprozess gesendet")
+                return True
+        self.window.show_status(
+            "Tastensignal in QProcess nicht verfügbar; für echte Terminalsignale PTY/ConPTY verwenden"
+        )
+        return False
 
     def send_return_key(self):
         """Send a plain Return/Enter to the currently running process.
@@ -3446,6 +3507,21 @@ class ShellDeckTerminalWidget(QWidget):
         process.finished.connect(self.handle_finished)
         process.errorOccurred.connect(self.handle_process_error)
 
+    def disconnect_shell_process(self, process):
+        """Detach callbacks before replacing an engine's asynchronous process."""
+        if process is None:
+            return
+        for name, callback in (
+            ("readyReadStandardOutput", self.handle_stdout),
+            ("readyReadStandardError", self.handle_stderr),
+            ("finished", self.handle_finished),
+            ("errorOccurred", self.handle_process_error),
+        ):
+            try:
+                getattr(process, name).disconnect(callback)
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+
     def actual_terminal_engine(self):
         process_engine = str(getattr(getattr(self, "process", None), "_shelldeck_engine", "") or "").lower().strip()
         if process_engine in {"qprocess", "pty"}:
@@ -3455,6 +3531,22 @@ class ShellDeckTerminalWidget(QWidget):
     def set_terminal_engine(self, engine, *, restart=True):
         new_engine = self.window.normalize_terminal_engine(engine)
         old_engine = self.actual_terminal_engine()
+        if restart and new_engine != old_engine:
+            # Changing the engine closes and replaces the shell. With a
+            # foreground command (e.g. ping) this is destructive and previously
+            # raced the PTY reader's callbacks, occasionally crashing the app.
+            # Require the user to interrupt the command and wait for its prompt.
+            if (
+                self.command_appears_to_be_running()
+                or getattr(self, "client_mode_active", False)
+                or getattr(self, "password_prompt_active", False)
+                or (getattr(self, "interaction_prompt_active", False)
+                    and not self.output_ends_with_shell_prompt(self.terminal_output_text_for_state_checks()))
+            ):
+                self.window.show_status(
+                    "Engine-Wechsel abgelehnt: Zuerst den laufenden Befehl mit Strg+C beenden"
+                )
+                return False
         self.terminal_engine = new_engine
         # Der echte VT-Modus braucht die PTY-Engine. Wird auf eine andere
         # Engine gewechselt, den echten Modus vorher sauber verlassen.
@@ -3466,8 +3558,11 @@ class ShellDeckTerminalWidget(QWidget):
 
         current_dir = self.refresh_current_working_directory()
         restore_command = self.current_restore_command()
-        self.stop_process(fast=False)
         old_process = getattr(self, "process", None)
+        self.disconnect_shell_process(old_process)
+        self.stop_process(fast=False)
+        self._awaiting_command_completion = False
+        self.reset_interaction_prompt_mode()
         if old_process is not None:
             try:
                 old_process.deleteLater()
@@ -3657,9 +3752,7 @@ class ShellDeckTerminalWidget(QWidget):
             self.set_client_mode(False)
             return
         if self.process and self.process.state() == QProcess.ProcessState.Running:
-            self.process.write(b"\x03")
-            self.process.waitForBytesWritten(1000)
-            if self.client_mode_active:
+            if self.send_control_character(b"\x03") and self.client_mode_active:
                 self.set_client_mode(False)
         else:
             self.output_area.append("Kein laufender Prozess zum Unterbrechen.")
@@ -4675,7 +4768,7 @@ class ShellDeckTerminalWidget(QWidget):
             # ging roh an die Shell — ohne cls/clear-Uebersetzung, ohne
             # Historie und ohne Ordneranzeige.
             re.compile(
-                r"(?:^|\n)\s*(?:\([^\r\n()]*\)\s*)?"
+                r"(?:^|\n)\s*(?:\([^\r\n]{0,80}\)\s*)?"
                 r"(?:bash|sh|dash|ksh|zsh|fish)-[0-9][0-9.a-zA-Z]*\s*[#$%]\s*$",
                 re.IGNORECASE,
             ),
@@ -5142,6 +5235,13 @@ class ShellDeckTerminalWidget(QWidget):
 
     def execute_command(self):
         command_text = self.input_line.toPlainText().strip()
+        # A finished command can leave the input in "Antwort an laufenden
+        # Prozess" mode if its last prompt was queued during the UI update.
+        # Recheck before routing the NEW command; otherwise cls and the
+        # Vorbefehl are silently bypassed. Preserve command_text first,
+        # because resetting the stale mode clears the input widget.
+        if not getattr(self, "client_mode_active", False) and not getattr(self, "password_prompt_active", False):
+            self.update_command_completion_state_from_output()
         if not command_text:
             # Leere Eingaben sind im Antwort-Modus gültig: Sie schließen z.B.
             # eine PowerShell-Continuation (">>") ab oder bestätigen
@@ -5667,6 +5767,9 @@ class ShellDeckTerminalWidget(QWidget):
         self._last_pty_size = (int(rows), int(cols))
 
     def handle_stdout(self):
+        emitter = self.sender()
+        if emitter is not None and emitter is not getattr(self, "process", None):
+            return  # Signal from a replaced engine; never read the new process.
         if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
             # Echter Terminalmodus: Rohbytes (inkl. ANSI) direkt in das
             # VT-Modell geben, statt sie zu bereinigen und zeilenweise
@@ -5684,6 +5787,9 @@ class ShellDeckTerminalWidget(QWidget):
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_stderr(self):
+        emitter = self.sender()
+        if emitter is not None and emitter is not getattr(self, "process", None):
+            return  # Signal from a replaced engine; never read the new process.
         if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
             self.terminal_grid.feed(bytes(self.process.readAllStandardError()))
             return
@@ -5698,11 +5804,17 @@ class ShellDeckTerminalWidget(QWidget):
         QTimer.singleShot(120, self.update_input_prompt_label)
 
     def handle_finished(self, exit_code, exit_status):
+        emitter = self.sender()
+        if emitter is not None and emitter is not getattr(self, "process", None):
+            return  # Signal from a replaced engine; never read the new process.
         self.set_client_mode(False)
         self.finish_active_command_task(status=("erfolgreich" if int(exit_code) == 0 else "Fehler"), exit_code=exit_code)
         self.queue_terminal_output(f"\nProcess finished with exit code {exit_code}")
 
     def handle_process_error(self, error):
+        emitter = self.sender()
+        if emitter is not None and emitter is not getattr(self, "process", None):
+            return  # Signal from a replaced engine; never read the new process.
         self.set_client_mode(False)
         self.queue_terminal_output(f"\nShell konnte nicht gestartet werden: {self.process.errorString()}")
 

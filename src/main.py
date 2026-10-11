@@ -16,6 +16,15 @@ import getpass
 import urllib.error
 import urllib.request
 from pathlib import Path
+# The GUI and its embedded PTYs must not consume the launcher's controlling
+# terminal. Isolate terminal-launched GUI sessions before importing Qt;
+# graphical desktop launches without a controlling terminal are unchanged.
+if __name__ == "__main__" and os.name == "posix":
+    from shelldeck_startup_session import relaunch_without_controlling_tty
+    _session_result = relaunch_without_controlling_tty()
+    if _session_result is not None:
+        raise SystemExit(_session_result)
+
 from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
 from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
@@ -677,6 +686,8 @@ class TerminalWindow(QMainWindow):
 
     def set_terminal_engine(self, engine, *, show_message=True, save=True, apply_to_current_tab=True, user_choice=False):
         new_engine = self.normalize_terminal_engine(engine)
+        previous_engine = self.terminal_engine
+        previous_choice = self.terminal_engine_is_user_choice
         self.terminal_engine_is_user_choice = bool(user_choice and new_engine != "auto")
         if new_engine == "pty":
             message = PtyTerminalProcess.availability_message()
@@ -686,7 +697,14 @@ class TerminalWindow(QMainWindow):
         old_display_engine = self.current_terminal_engine()
         self.terminal_engine = new_engine
         if isinstance(current_tab, TerminalTab):
-            current_tab.set_terminal_engine(new_engine, restart=True)
+            if not current_tab.set_terminal_engine(new_engine, restart=True):
+                # The tab rejected a destructive engine switch while a command
+                # was still running. Neither the global preference nor the
+                # visible combo box should falsely claim the change happened.
+                self.terminal_engine = previous_engine
+                self.terminal_engine_is_user_choice = previous_choice
+                self.update_terminal_engine_ui()
+                return False
         self.update_terminal_engine_ui()
         if save:
             self.save_terminal_engine_persistent_settings()
@@ -719,7 +737,7 @@ class TerminalWindow(QMainWindow):
         combo.blockSignals(False)
         combo.setToolTip(
             f"Terminal-Engine des aktuellen Tabs: {self.terminal_engine_label(engine)}. "
-            "Eine Änderung startet den aktuellen Tab mit der gewählten Engine neu und wird als Vorgabe gespeichert."
+            "Der Wechsel startet den Tab neu und ist während laufender Befehle gesperrt."
         )
 
     def normalize_pre_command_text(self, text):

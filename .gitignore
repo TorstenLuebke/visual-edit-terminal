@@ -4,6 +4,11 @@ __pycache__/
 *.pyo
 *.pyd
 .venv/
+
+# Gesicherte und temporaere virtuelle Umgebungen
+.venv_backup*/
+venv_backup*/
+.venv_visualedit_new*/
 venv/
 env/
 
