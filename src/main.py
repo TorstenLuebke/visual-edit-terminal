@@ -1841,7 +1841,9 @@ class TerminalWindow(QMainWindow):
             while tab_widget.count() > 0:
                 tab = tab_widget.widget(0)
                 if isinstance(tab, TerminalTab):
-                    tab.stop_process(fast=True)
+                    # Auch beim Workspace-Wechsel den gesamten Sitzungs-Cleanup
+                    # verwenden: Timer entwerten und aboutToQuit abmelden.
+                    tab._cleanup_terminal_on_exit()
                 tab_widget.removeTab(0)
                 if tab is not None:
                     tab.deleteLater()
@@ -2054,7 +2056,9 @@ class TerminalWindow(QMainWindow):
             return
         tab = tab_widget.widget(index)
         if isinstance(tab, TerminalTab):
-            tab.stop_process(fast=True)
+            # Ein blosses stop_process() markiert den Tab nicht als geschlossen.
+            # Verzoegerte Qt-Timer koennten sonst noch darauf zugreifen.
+            tab._cleanup_terminal_on_exit()
         tab_widget.removeTab(index)
         if tab is not None:
             tab.deleteLater()
@@ -3958,6 +3962,8 @@ Vorbefehl-Leiste oben rechts
 - Im Eingabefeld daneben kannst du einen oder mehrere Vorbefehle eintragen; mehrere Vorbefehle werden mit Semikolon getrennt.
 - Beispiel: oben cls, unten dir -> zuerst wird cls ausgeführt, danach dir.
 - Die Vorbefehl-Leiste wirkt auf normale Befehle aus dem unteren Eingabefeld und auf „Einfügen + Ausführen“.
+- Nach der Rückkehr eines erkannten Shell-Prompts – auch bei mehrfach aktivierten virtuellen Umgebungen – werden normale Eingaben wieder mit Vorbefehl ausgeführt.
+- Während eine Anwendung tatsächlich auf Antworten wartet, bleibt die Eingabe roh; Vorbefehle werden dabei bewusst nicht angewendet.
 - Im Client-Modus wird der Vorbefehl bewusst nicht angewendet, damit Python, SQL, Node oder Ollama keine unerwarteten Zusatzzeilen erhalten.
 - Sichtbarkeit, Aktiv-Haken, aktueller Vorbefehl und die letzten Vorbefehle werden gespeichert.
 - Ansicht → Vorbefehl-Leiste anzeigen blendet die Leiste ein oder aus.
@@ -4354,14 +4360,26 @@ Hinweise
             self.show_status("Befehl wird nicht ausgeführt (würde ShellDeck erneut starten): " + command_string)
             return
 
+        # Eine verzögerte CLI-Aktion darf niemals auf eine andere Shell
+        # oder einen inzwischen geschlossenen Tab uebergehen.
+        target_process = getattr(tab, "process", None)
+        target_generation = getattr(tab, "_shell_generation", 0)
+
         def run_when_ready(attempt=0):
-            process = getattr(tab, "process", None)
+            if (getattr(tab, "_terminal_cleaned_up", False)
+                    or getattr(tab, "process", None) is not target_process
+                    or getattr(tab, "_shell_generation", 0) != target_generation):
+                return
             try:
-                running = process is not None and process.state() == QProcess.ProcessState.Running
-            except Exception:
+                running = (target_process is not None
+                           and target_process.state() == QProcess.ProcessState.Running)
+            except (RuntimeError, AttributeError):
                 running = False
-            if not running and attempt < 20:
-                QTimer.singleShot(150, lambda: run_when_ready(attempt + 1))
+            if not running:
+                if attempt < 20:
+                    QTimer.singleShot(150, lambda: run_when_ready(attempt + 1))
+                else:
+                    self.show_status("Startbefehl nicht ausgefuehrt: Shell konnte nicht starten")
                 return
             tab.run_text_command(command_string)
 
@@ -4458,7 +4476,8 @@ Hinweise
         self.save_command_history()
         self.save_settings()
         for _, _, tab in self.all_terminal_tabs():
-            tab.stop_process(fast=True)
+            # Idempotent auch bei bereits geschlossenem/abgetrenntem Tab.
+            tab._cleanup_terminal_on_exit()
         for window in list(getattr(self, "detached_windows", [])):
             window._closing_from_owner = True
             window.close()

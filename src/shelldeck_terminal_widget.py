@@ -686,13 +686,58 @@ class PosixPtyChild:
         self.fd = int(fd)
         self.exitstatus = None
         self._closed = False
+        # Reader und GUI koennen gleichzeitig waitpid(WNOHANG) aufrufen.
+        # Ohne Lock koennte der zweite Aufruf ChildProcessError ausloesen
+        # und den bereits ermittelten Exit-Code ueberschreiben.
+        import threading
+        self._waitpid_lock = threading.Lock()
         try:
             os.set_blocking(self.fd, False)
         except Exception:
             pass
 
     @classmethod
-    def spawn(cls, command_line, cwd=None):
+    def _spawn_with_posix_spawn(cls, args, cwd):
+        """Startet ein PTY ohne fork() im bereits mehrthreadigen GUI-Prozess.
+
+        POSIX_SPAWN_OPEN oeffnet das Slave-TTY *nach* setsid() im Kind.
+        Dadurch wird es sein steuerndes Terminal (Job-Control bleibt aktiv).
+        Alle anderen Deskriptoren bleiben im Elternprozess unveraendert.
+        """
+        master_fd, slave_fd = os.openpty()
+        try:
+            slave_name = os.ttyname(slave_fd)
+            file_actions = [
+                (os.POSIX_SPAWN_OPEN, 0, slave_name, os.O_RDWR, 0o600),
+                (os.POSIX_SPAWN_DUP2, 0, 1),
+                (os.POSIX_SPAWN_DUP2, 0, 2),
+            ]
+            argv = list(args)
+            if cwd:
+                # Python bietet fuer posix_spawn keine portable chdir-Aktion.
+                # Die Shell wechselt nur den Ordner; exec ersetzt sie durch das
+                # eigentliche Programm. "$@" bewahrt alle Argumentgrenzen.
+                argv = [
+                    "/bin/sh", "-c",
+                    'cd "$1" || exit 127; shift; exec "$@"',
+                    "shelldeck-cwd", os.path.abspath(cwd), *argv,
+                ]
+            environment = os.environ.copy()
+            environment.setdefault("TERM", "xterm-256color")
+            pid = os.posix_spawnp(
+                argv[0], argv, environment,
+                file_actions=file_actions, setsid=True,
+            )
+            return cls(pid, master_fd)
+        except BaseException:
+            os.close(master_fd)
+            raise
+        finally:
+            os.close(slave_fd)
+
+    @classmethod
+    def _spawn_with_fork(cls, args, cwd):
+        """Kompatibilitaetsweg, falls POSIX_SPAWN_SETSID nicht verfuegbar ist."""
         import pty
 
         pid, fd = pty.fork()
@@ -701,34 +746,55 @@ class PosixPtyChild:
                 if cwd:
                     os.chdir(cwd)
                 os.environ.setdefault("TERM", "xterm-256color")
-                args = shlex.split(str(command_line or ""), posix=True)
-                if not args:
-                    os._exit(127)
                 os.execvp(args[0], args)
             except BaseException:
                 os._exit(127)
         return cls(pid, fd)
 
+    @classmethod
+    def spawn(cls, command_line, cwd=None):
+        import errno
+
+        args = shlex.split(str(command_line or ""), posix=True)
+        if not args:
+            raise ValueError("Kein PTY-Startbefehl angegeben.")
+        # Linux unterstuetzt POSIX_SPAWN_SETSID; dort entfällt das potentiell
+        # deadlockgefaehrdete forkpty() aus dem mehrthreadigen Qt-Prozess.
+        # Aeltere POSIX-Systeme duerfen beim bewaehrten PTY-Weg bleiben.
+        if all(hasattr(os, name) for name in
+               ("posix_spawnp", "openpty", "POSIX_SPAWN_OPEN", "POSIX_SPAWN_DUP2")):
+            try:
+                return cls._spawn_with_posix_spawn(args, cwd)
+            except (TypeError, NotImplementedError):
+                pass
+            except OSError as exc:
+                if exc.errno not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+                    raise
+        return cls._spawn_with_fork(args, cwd)
+
     def isalive(self):
-        if self.exitstatus is not None:
+        # Nur eine Thread-Seite darf waitpid() ausfuehren. Insbesondere beim
+        # Tab-Schliessen arbeiten Reader und GUI sonst am selben Kindprozess.
+        with self._waitpid_lock:
+            if self.exitstatus is not None:
+                return False
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self.exitstatus = 0
+                return False
+            except OSError:
+                self.exitstatus = 1
+                return False
+            if pid == 0:
+                return True
+            if os.WIFEXITED(status):
+                self.exitstatus = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                self.exitstatus = 128 + os.WTERMSIG(status)
+            else:
+                self.exitstatus = 0
             return False
-        try:
-            pid, status = os.waitpid(self.pid, os.WNOHANG)
-        except ChildProcessError:
-            self.exitstatus = 0
-            return False
-        except OSError:
-            self.exitstatus = 1
-            return False
-        if pid == 0:
-            return True
-        if os.WIFEXITED(status):
-            self.exitstatus = os.WEXITSTATUS(status)
-        elif os.WIFSIGNALED(status):
-            self.exitstatus = 128 + os.WTERMSIG(status)
-        else:
-            self.exitstatus = 0
-        return False
 
     def read(self, size=4096):
         import select
@@ -1087,38 +1153,42 @@ class PtyTerminalProcess(QThread):
         return True
 
     def kill(self):
-        reader_stopped = self._stop_reader_before_pty_close(250)
+        # Der Reader darf den PTY-Master nicht mehr benutzen, waehrend er
+        # geschlossen wird. Sein Ende ist aber NICHT das Ende des Kindes.
+        self._stop_reader_before_pty_close(250)
         pty = self._pty
-        if pty is not None:
-            terminate = getattr(pty, "terminate", None)
-            if callable(terminate):
+        if pty is None:
+            self._running = False
+            return self._stop_reader_before_pty_close(250)
+
+        terminate = getattr(pty, "terminate", None)
+        if callable(terminate):
+            try:
+                terminate()
+            except Exception:
+                pass
+        # Auch bei bereits beendetem Reader den Kindprozess einsammeln.
+        child_gone = self._wait_child_exit(pty, 250)
+        if not child_gone:
+            hard_kill = getattr(pty, "kill", None)
+            if callable(hard_kill):
                 try:
-                    terminate()
+                    hard_kill()
                 except Exception:
                     pass
+            child_gone = self._wait_child_exit(pty, 500)
 
-            # Der Reader kann in select/read stecken. Nach SIGTERM kurz warten;
-            # nur wenn er nicht sauber endet, den Childprozess hart beenden.
-            if not reader_stopped:
-                reader_stopped = self._stop_reader_before_pty_close(250)
-            if not reader_stopped:
-                hard_kill = getattr(pty, "kill", None)
-                if callable(hard_kill):
-                    try:
-                        hard_kill()
-                    except Exception:
-                        pass
-                self._stop_reader_before_pty_close(250)
-
-            close = getattr(pty, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-
+        close = getattr(pty, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        # close() kann einen noch blockierten Reader aus select/read loesen.
+        reader_stopped = self._stop_reader_before_pty_close(500)
         self._running = False
         self._pty = None
+        return bool(child_gone and reader_stopped)
 
     def waitForFinished(self, msecs=30000):
         if self._reader is None:
@@ -1143,6 +1213,20 @@ class PtyTerminalProcess(QThread):
                 return bool(waiter(max(0.0, timeout_ms / 1000.0)))
             except Exception:
                 return False
+        # Manche ConPTY-Backends besitzen nur isalive(). Ein zuvor
+        # unterbrochener Reader ist kein Beleg fuer ein beendetes Kind.
+        isalive = getattr(pty, "isalive", None)
+        if callable(isalive):
+            deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
+            while True:
+                try:
+                    if not isalive():
+                        return True
+                except Exception:
+                    return False
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
         return self.waitForFinished(timeout_ms)
 
     def shutdown(self, graceful_ms=500, force_ms=500):
@@ -1180,13 +1264,15 @@ class PtyTerminalProcess(QThread):
                 except Exception:
                     pass
             self._running = False
-            return True
+            # Nach close() erneut pruefen; ein QThread darf nicht mit seinem
+            # QObject-Elternobjekt zerstoert werden, solange er noch laeuft.
+            return self._stop_reader_before_pty_close(force_ms)
 
-        # Kind haengt -> jetzt erst hart beenden (kill() schliesst den Master).
-        self.kill()
+        # Kind haengt -> jetzt erst hart beenden (kill() sammelt es ein).
+        killed = self.kill()
         finished = self.waitForFinished(force_ms)
         self._running = False
-        return bool(finished)
+        return bool(killed and finished)
 
     def errorString(self):
         return self._error_string
@@ -4868,7 +4954,19 @@ class ShellDeckTerminalWidget(QWidget):
             re.compile(r"(?:^|\n)\s*PS\s+[^\r\n>]+>\s*$"),
             re.compile(r"(?:^|\n)\s*\([^\r\n()]+\)\s*PS\s+[^\r\n>]+>\s*$"),
             re.compile(r"(?:^|\n)\s*[A-Za-z]:[\\/][^\r\n>]*>\s*$"),
-            re.compile(r"(?:^|\n)\s*(?:\([^\r\n()]+\)\s*)?[^@\s:\r\n]+@[^:\r\n]+:[^\r\n#$]*[#$]\s*$"),
+            # Virtuelle Umgebungen koennen mehrfach aktiviert sein und auch
+            # geschachtelte Klammern im Prompt erzeugen, etwa:
+            #   ((.venv_A)) ((.venv) ) name@host:~/projekt$
+            # Der alte Ausdruck erlaubte genau *eine* ungeklammerte venv.
+            # Dadurch blieb QProcess nach einem fertigen Befehl faelschlich im
+            # interaktiven Antwortmodus, der Vorbefehle bewusst umgeht.
+            # Die Klammer-Praefixe werden zeilenbegrenzt und einzeln beschraenkt;
+            # vor dem name@host:pfad-Suffix muss weiterhin ein gueltiger
+            # Prompt-Aufbau stehen.
+            re.compile(
+                r"(?:^|\n)\s*(?:\([^\r\n]{1,100}\)\s*)*"
+                r"[^@\s:\r\n]+@[^:\r\n]+:[^\r\n#$]*[#$]\s*$"
+            ),
             # Bash/sh ohne eigenes PS1 — genau das liefert
             # shell_start_args() mit "--noprofile --norc":
             #   "bash-5.2$", "sh-5.2#", "(.venv) bash-5.2$"

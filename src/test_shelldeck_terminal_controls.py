@@ -74,9 +74,21 @@ class TerminalControlRegressionTests(unittest.TestCase):
             "((.venv) ) bash-5.3$ ",
             "PING localhost\n((.venv) ) bash-5.3$ ",
             "(.venv) bash-5.3$ ",
+            # QProcess: mehrfach aktivierte venvs mit geklammerten Labels.
+            "((.venv_visualedit_new_20261010_060516)) ((.venv) ) torsten@Ubuntu:~/Programme/PDF-Formular-Designer$ ",
+            "Fehlermeldung\n((.venv_A) ) ((.venv_B)) user@hostname:/tmp/a folder$ ",
+            # Ein einfaches user@host-Prompt darf weiterhin erkannt werden.
+            "user@host:/tmp$ ",
         ):
             self.assertTrue(tab.output_ends_with_shell_prompt(text), text)
-        self.assertFalse(tab.output_ends_with_shell_prompt("PING localhost\n64 bytes ..."))
+        for text in (
+            "PING localhost\n64 bytes ...",
+            # Eine *alte* Promptzeile im Scrollback beweist kein Kommandoende.
+            "user@host:~/projekt$ ls\nDatei1\nDatei2",
+            "((.venv_A)) user@host:~/projekt$ python main.py\nLade Daten ...",
+            "read -p 'Continue?' ",
+        ):
+            self.assertFalse(tab.output_ends_with_shell_prompt(text), text)
 
     def test_stale_response_mode_no_longer_skips_precommand(self):
         names = ("execute_command", "shell_prompt_patterns", "output_ends_with_shell_prompt",
@@ -114,6 +126,58 @@ class TerminalControlRegressionTests(unittest.TestCase):
         tab.execute_command()
         self.assertEqual(tab.written, ["echo VORBEFEHL", "echo TEST"])
         self.assertEqual(tab.command_history, ["echo TEST"])
+
+    def test_nested_venv_prompt_restores_precommand_after_process_exits(self):
+        """QProcess: Ein zurueckgekehrter Shell-Prompt darf cls nicht umgehen."""
+        names = ("execute_command", "shell_prompt_patterns", "output_ends_with_shell_prompt",
+                 "command_appears_to_be_running", "update_command_completion_state_from_output",
+                 "command_sequence_from_text")
+        methods = _methods(*names)
+        from types import MethodType
+        tab = SimpleNamespace()
+        for name in names:
+            setattr(tab, name, MethodType(getattr(methods, name), tab))
+        tab.input_line = _Input("ls")
+        tab.window = SimpleNamespace(active_pre_command_text=lambda: "cls",
+                                     remember_pre_command_text=lambda text: None)
+        tab.process = _Process("qprocess")
+        tab.client_mode_active = False
+        tab.password_prompt_active = False
+        tab.interaction_prompt_active = True  # Der bislang haengengebliebene Modus.
+        tab._awaiting_command_completion = True
+        tab.terminal_output_text_for_state_checks = lambda: (
+            "Traceback: No module named numpy\n"
+            "((.venv_A) ) ((.venv) ) user@Ubuntu:~/Programme/projekt$ "
+        )
+        cleared = []
+        tab.output_area = SimpleNamespace(clear=lambda: cleared.append(True))
+        tab.update_input_prompt_label = lambda: None
+        tab.reset_interaction_prompt_mode = lambda: (
+            setattr(tab, "interaction_prompt_active", False), tab.input_line.clear()
+        )
+        tab.finish_active_command_task_if_prompt_returned = lambda: None
+        tab.visible_output_waits_for_password = lambda: False
+        tab.visible_output_waits_for_interaction = lambda: False
+        tab.add_command_history = lambda command: history.append(command)
+        history = []
+        tab.update_restore_command_from_command = lambda command: None
+        tab.translate_cross_platform_command = lambda command: (
+            "clear" if command == "cls" else command
+        )
+        tab.parse_ollama_run_model = lambda command: None
+        tab.parse_direct_client_command = lambda command: None
+        tab.start_command_task = lambda *args: None
+        tab.extract_interactive_prompt_from_command = lambda command: ""
+        tab.detect_client_mode_name = lambda command: ""
+        sent = []
+        tab.write_shell_command = sent.append
+        tab.send_interactive_input = lambda command: self.fail("Befehl ging roh an die Shell")
+
+        tab.execute_command()
+        self.assertEqual(cleared, [True])
+        self.assertEqual(sent, ["ls"])
+        self.assertEqual(history, ["ls"])
+        self.assertFalse(tab.interaction_prompt_active)
 
     def test_pty_control_character_uses_terminal_bytes(self):
         methods = _methods("send_control_character")

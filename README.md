@@ -131,3 +131,71 @@ Python ist und die Prozess-Ebene weiterhin PTY (Linux/macOS) bzw.
   und Antwortpuffer werden bei jedem Shell-Neustart gelöscht.
 - Regressionstests: `PYTHONPATH=src python -m pytest -q
   src/test_shelldeck_session_state.py src/test_shelldeck_session_timer_guards.py`.
+
+
+### Thread-sicherer POSIX-PTY-Start (Patches 013–014)
+
+- Unter Linux startet die PTY-Engine neue Shells mit `os.posix_spawnp`
+  statt mit `pty.fork`. Die neue Sitzung bekommt ueber `setsid` und das
+  neu geoeffnete PTY-Slave ihre eigene Terminal-Steuerung (Job-Control).
+  Damit entfaellt dort die Python-Warnung zum `forkpty()`-Aufruf aus einer
+  mehrthreadigen Qt-Anwendung.
+- Terminalgroesse, interaktive Eingabe, Exit-Code und die QProcess-Engine
+  bleiben unveraendert. Ein Arbeitsverzeichnis wird durch eine kleine
+  `sh -c`-Startumhuellung gesetzt; die eigentlichen Argumente werden mit
+  `"$@"` unveraendert an das Zielprogramm uebergeben.
+- Falls das Betriebssystem `posix_spawn(..., setsid=True)` nicht anbietet,
+  bleibt der bisherige `pty.fork`-Start als Kompatibilitaetsweg erhalten.
+  Insbesondere auf macOS muss das Verhalten mit der jeweils verwendeten
+  System-/Python-Version separat getestet werden.
+- Regressionstests (auch ohne Qt): `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_pty_lifecycle.py src/test_shelldeck_pty_spawn.py`.
+  Der echte GUI-/Mehr-Tab-Test ist weiterhin Pflicht.
+
+### Verlaessliches Schliessen von Terminal-Tabs (Patch 015)
+
+- Tab-Schliessen, Workspace-Wechsel und App-Ende verwenden jetzt denselben
+  idempotenten Sitzungs-Cleanup. Dadurch werden Prozesse gestoppt, offene
+  `aboutToQuit`-Verbindungen getrennt und verzoegerte Shell-Timer entwertet.
+- Andere laufende Tabs bleiben beim Schliessen einer Registerkarte erhalten.
+- Regressionstests: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_tab_cleanup.py`.
+
+### Verzoegerte CLI-Startbefehle (Patch 016)
+
+- Ueber `--execute` angeforderte Befehle laufen erst, wenn die *urspruengliche*
+  Shell im Tab tatsaechlich bereit ist. Bei Tab-Schliessen, Shell-Neustart oder
+  Engine-Wechsel wird ein noch ausstehender Startbefehl verworfen.
+- Scheitert der Shell-Start dauerhaft, wird der Befehl nicht blind nach dem
+  Timeout ausgefuehrt, sondern eine Statusmeldung angezeigt. Andere Tabs
+  koennen ihre eigenen Startbefehle weiterhin unabhaengig ausfuehren.
+- Regressionstests: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_cli_session_fence.py`.
+
+### Verschachtelte virtuelle Umgebungen und Vorbefehle (Patch 017)
+
+- Die Shell-Prompt-Erkennung toleriert mehrere hintereinanderliegende oder
+  geklammerte Aktivierungs-Praefixe virtueller Umgebungen (z. B. `((.venv_A))
+  ((.venv) ) name@host:~/projekt$`). Nach Rueckkehr dieses Prompts schaltet
+  ShellDeck aus dem Antwortmodus wieder auf normale Befehle um, sodass ein
+  aktivierter Vorbefehl wie `cls` beim naechsten Befehl wirkt.
+- Solange ein Prozess wirklich interaktiv auf Eingaben wartet, werden
+  Vorbefehle weiterhin **nicht** vor Antworten ausgefuehrt.
+- Regressionstest: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_terminal_controls.py`.
+
+### PTY-Prozessende bei parallelen Sitzungen (Patches 018–019)
+
+- POSIX-PTY-Leser und GUI synchronisieren `waitpid()`, damit ein gleichzeitiger
+  Aufruf den echten Exit-Code nicht durch einen zweiten Reap-Versuch ersetzt.
+- Bei erzwungener PTY-Beendigung wird nicht nur der Reader gestoppt: Der
+  Kindprozess wird nach einer kurzen SIGTERM-Frist bei Bedarf hart beendet
+  und sein Ende, soweit das Backend dies anbietet, gesondert abgewartet.
+- Der Shutdown-Erfolg haengt auch davon ab, dass der Reader tatsaechlich
+  beendet wurde. Bei Backends mit `isalive()` gilt das Reader-Ende nicht
+  mehr als Nachweis fuer ein beendetes Kind.
+- Regressionen ohne Qt: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_pty_shutdown.py src/test_shelldeck_parallel_pty_shutdown.py`.
+  Der Linux-Test startet zwei unabhaengige PTYs, beendet das erste und
+  prueft, dass das zweite weiterhin interaktiv antwortet. Die GUI- und
+  macOS-/Windows-Praxistests bleiben zusaetzlich erforderlich.
