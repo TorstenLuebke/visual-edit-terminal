@@ -53,27 +53,31 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QEvent, QThread, Signal, QTimer
 from shelldeck_session_state import evaluate_session_state
+from shelldeck_output_buffer import TerminalOutputBuffer
+from shelldeck_scrollback import normalize_scrollback_blocks
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor,
     QSyntaxHighlighter, QAction, QTextOption
 )
 
 # Terminal-Ausgaben dürfen den Qt-UI-Thread nicht mit einem einzigen
-# riesigen QTextEdit-Insert blockieren. Der Drain läuft deshalb
-# zeitbudgetiert: Intervall 0 = im nächsten Event-Loop-Durchlauf
-# (quasi Echtzeit), und pro Durchlauf wird so viel Text eingefügt,
-# wie in das Zeitbudget passt. Dazwischen kann Qt zeichnen und
-# Eingaben verarbeiten.
-TERMINAL_OUTPUT_DRAIN_INTERVAL_MS = 0
-# Etwa eine halbe Frame-Zeit bei 60 Hz: flüssiges Scrollen, keine
-# spürbaren Hänger, automatische Anpassung an die reale Einfügegeschwindigkeit.
-TERMINAL_OUTPUT_DRAIN_TIME_BUDGET_MS = 8
-# Ein Slice pro Edit-Block: groß genug für hohen Durchsatz, klein genug,
-# damit die Zeitbudget-Prüfung zwischen den Slices greifen kann.
-TERMINAL_OUTPUT_DRAIN_SLICE_CHARS = 65536
+# riesigen QTextEdit-Insert blockieren. Der zeitbudgetierte Drain laesst
+# zwischen Durchlaeufen kurz Zeit fuer Eingaben und andere Tabs.
+TERMINAL_OUTPUT_DRAIN_INTERVAL_MS = 2
+# Kleines Zeitbudget, damit Qt zwischen den Drain-Durchlaeufen auch
+# Eingaben und andere Tabs bedienen kann. Eine einzelne Qt-Einfuegung kann
+# laenger dauern als der Budgetwert; daher sind die Slices ebenfalls klein.
+TERMINAL_OUTPUT_DRAIN_TIME_BUDGET_MS = 5
+# Pro Edit-Block maximal 8 Ki-Zeichen: Qt kann QTextDocument-Mutationen
+# nicht unterbrechen. Mit 64 Ki-Zeichen waren einzelne Aufrufe merkbar lang.
+TERMINAL_OUTPUT_DRAIN_SLICE_CHARS = 8192
 TERMINAL_OUTPUT_LARGE_CHUNK_CHARS = 60000
 TERMINAL_OUTPUT_MAX_BLOCKS = 25000
 TERMINAL_OUTPUT_HARD_WRAP_COLUMN = 12000
+# Regex-Erkennung von Shell-Prompts, Passwort-/Rückfragen betrachtet maximal
+# 2.500 Zeichen. Der Sicherheitszuschlag deckt über Chunkgrenzen laufende
+# Prompts ab, ohne bei jeder Ausgabe das gesamte Scrollback zu kopieren.
+TERMINAL_STATE_TAIL_CHARS = 6000
 TERMINAL_HIGHLIGHT_MAX_DOCUMENT_CHARS = 450000
 TERMINAL_HIGHLIGHT_MAX_BLOCKS = 3500
 TERMINAL_HIGHLIGHT_MAX_LINE_CHARS = 3000
@@ -1394,7 +1398,7 @@ class ShellDeckTerminalWidget(QWidget):
         self.output_area.setFont(self.window.terminal_font)
         self.output_area.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.output_area.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
-        self.output_area.document().setMaximumBlockCount(TERMINAL_OUTPUT_MAX_BLOCKS)
+        self.set_scrollback_blocks(getattr(self.window, "scrollback_blocks", TERMINAL_OUTPUT_MAX_BLOCKS))
         self.output_area.setTextInteractionFlags(
             self.output_area.textInteractionFlags() | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
@@ -1447,13 +1451,23 @@ class ShellDeckTerminalWidget(QWidget):
         self.load_persistent_command_tasks(getattr(self.window, "command_history_entries", []))
 
         self.highlighter = TerminalHighlighter(self.output_area.document(), self.window.terminal_colors())
-        self._output_queue = []
+        self._output_queue = TerminalOutputBuffer()
         self._output_drain_timer = QTimer(self)
         self._output_drain_timer.setInterval(TERMINAL_OUTPUT_DRAIN_INTERVAL_MS)
         self._output_drain_timer.timeout.connect(self.drain_terminal_output_queue)
         self._highlighter_restore_timer = QTimer(self)
         self._highlighter_restore_timer.setSingleShot(True)
         self._highlighter_restore_timer.timeout.connect(self.restore_terminal_highlighter_if_safe)
+        # readyRead darf bei sehr grossen Logs zehntausende Male feuern. Nur
+        # ein ausstehender Qt-Timer je Anzeigeaufgabe; keine singleShot-Flut.
+        self._prompt_label_refresh_timer = QTimer(self)
+        self._prompt_label_refresh_timer.setSingleShot(True)
+        self._prompt_label_refresh_timer.setInterval(120)
+        self._prompt_label_refresh_timer.timeout.connect(self.update_input_prompt_label)
+        self._task_output_refresh_timer = QTimer(self)
+        self._task_output_refresh_timer.setSingleShot(True)
+        self._task_output_refresh_timer.setInterval(100)
+        self._task_output_refresh_timer.timeout.connect(self.refresh_active_command_task_output)
 
         # Reines-Terminal-Modus: Eingabe direkt im Ausgabebereich.
         self.pure_terminal_mode = False
@@ -1497,6 +1511,16 @@ class ShellDeckTerminalWidget(QWidget):
 
     def terminal_stdout_color(self):
         return QColor(self.window.terminal_color("stdout", "#FFFFFF"))
+
+    def set_scrollback_blocks(self, blocks):
+        """Begrenzt den angezeigten Verlauf dieses klassischen Terminal-Tabs.
+
+        QTextDocument verwirft beim Verringern der Grenze die aeltesten
+        Textbloecke. Das echte VT-Zellgitter ist davon unabhaengig.
+        """
+        size = normalize_scrollback_blocks(blocks)
+        self.output_area.document().setMaximumBlockCount(size)
+        return size
 
     def terminal_stderr_color(self):
         return QColor(self.window.terminal_color("stderr", "#FCA5A5"))
@@ -1571,13 +1595,9 @@ class ShellDeckTerminalWidget(QWidget):
         qcolor = QColor(color) if color is not None else self.terminal_stdout_color()
         if len(value) >= TERMINAL_OUTPUT_LARGE_CHUNK_CHARS or self._output_queue:
             self.suspend_terminal_highlighter_for_bulk_output()
-        if self._output_queue and self._output_queue[-1][1] == qcolor:
-            # Gleichfarbige Chunks zusammenfassen: QProcess liefert oft viele
-            # kleine Häppchen, ein zusammenhängender Text lässt sich in einem
-            # Rutsch einfügen.
-            self._output_queue[-1][0] += value
-        else:
-            self._output_queue.append([value, qcolor])
+        # Nicht bei jedem readyRead erneut an einen immer groesseren String
+        # anhaengen: viele kleine Chunks wuerden sonst quadratisch teuer.
+        self._output_queue.append(value, qcolor)
         if not self._output_drain_timer.isActive():
             self._output_drain_timer.start()
 
@@ -1587,46 +1607,31 @@ class ShellDeckTerminalWidget(QWidget):
             self._highlighter_restore_timer.start(750)
             return
 
-        pending = sum(len(item[0]) for item in self._output_queue)
-        if pending >= TERMINAL_OUTPUT_LARGE_CHUNK_CHARS:
+        if self._output_queue.pending_chars >= TERMINAL_OUTPUT_LARGE_CHUNK_CHARS:
             self.suspend_terminal_highlighter_for_bulk_output()
 
         deadline = time.perf_counter() + TERMINAL_OUTPUT_DRAIN_TIME_BUDGET_MS / 1000.0
         self.output_area.setUpdatesEnabled(False)
         try:
             while self._output_queue:
-                # Eigener Cursor auf dem Dokument statt des Widget-Cursors:
-                # vermeidet Cursor-Signale/Auto-Scroll pro Einfügung, und
-                # begin/endEditBlock fasst einen ganzen Slice zu einer
-                # einzigen Dokumentänderung (= einer Layout-Neuvermessung)
-                # zusammen. Nach jedem Slice wird das Zeitbudget geprüft,
-                # sodass auch teure Layout-Läufe (z.B. beim Kürzen alter
-                # Blöcke) den UI-Thread nie länger als ~ein halbes Frame
-                # blockieren.
-                budget = TERMINAL_OUTPUT_DRAIN_SLICE_CHARS
+                # Ein Slice bleibt zeitlich begrenzt. Die FIFO fasst beim
+                # Entnehmen benachbarte Stuecke gleicher Farbe zusammen; Qt
+                # muss dadurch deutlich seltener insertText() aufrufen.
                 cursor = QTextCursor(self.output_area.document())
                 insert_position = self.inline_output_insert_position()
                 if insert_position is None:
                     cursor.movePosition(QTextCursor.MoveOperation.End)
                 else:
-                    # Reines-Terminal-Modus: Ausgabe vor dem gepinnten
-                    # Prompt einfügen, die Eingabezeile bleibt unten stehen.
                     cursor.setPosition(insert_position)
                 cursor.beginEditBlock()
                 try:
-                    while self._output_queue and budget > 0:
-                        text, color = self._output_queue[0]
-                        take = self.terminal_queue_split_index(text, budget)
-                        part = text[:take]
-                        rest = text[take:]
+                    for part, color in self._output_queue.take(
+                        TERMINAL_OUTPUT_DRAIN_SLICE_CHARS,
+                        self.terminal_queue_split_index,
+                    ):
                         fmt = QTextCharFormat()
                         fmt.setForeground(color)
                         cursor.insertText(part, fmt)
-                        budget -= len(part)
-                        if rest:
-                            self._output_queue[0][0] = rest
-                            break
-                        self._output_queue.pop(0)
                 finally:
                     cursor.endEditBlock()
                 if time.perf_counter() >= deadline:
@@ -1644,8 +1649,6 @@ class ShellDeckTerminalWidget(QWidget):
             self._output_drain_timer.stop()
             self._highlighter_restore_timer.start(750)
             if self.inline_mode_active():
-                # Nach neuer Ausgabe entscheiden, ob der eigene Prompt nötig
-                # ist oder der native Shell-Prompt sichtbar geworden ist.
                 self.refresh_inline_prompt()
 
     # ---- Reines-Terminal-Modus: Eingabe direkt im Ausgabebereich ----
@@ -1676,22 +1679,9 @@ class ShellDeckTerminalWidget(QWidget):
         return f"{self.input_prompt_text()} "
 
     def inline_prompt_context_text(self):
-        """Sichtbarer Text vor dem Inline-Prompt inkl. noch nicht gezeichneter Queue."""
-        if self.inline_markers_valid():
-            cursor = QTextCursor(self.output_area.document())
-            cursor.setPosition(0)
-            cursor.setPosition(self._inline_prompt_cursor.position(), QTextCursor.MoveMode.KeepAnchor)
-            text = cursor.selectedText().replace(chr(0x2029), "\n")
-        else:
-            try:
-                text = self.output_area.toPlainText()
-            except Exception:
-                text = ""
-        try:
-            queued = "".join(str(item[0] or "") for item in getattr(self, "_output_queue", []) if item)
-        except Exception:
-            queued = ""
-        return text + queued
+        """Textende vor dem Inline-Prompt einschliesslich noch offener Ausgabe."""
+        end = self._inline_prompt_cursor.position() if self.inline_markers_valid() else None
+        return self.output_tail_context(end_position=end)
 
     def inline_prompt_should_be_visible(self):
         """Eigenen Prompt nur zeigen, wenn kein echter Shell-Prompt sichtbar ist.
@@ -3159,7 +3149,15 @@ class ShellDeckTerminalWidget(QWidget):
             return
         key = "stderr" if stream_name == "stderr" else "stdout"
         task[key] = self.trim_command_task_text(str(task.get(key) or "") + str(text or ""))
-        self.update_command_task_item(task)
+        # Das Tabellen-Tooltip ist teuer (5 Zellen) und muss nicht fuer
+        # jedes readyRead-Paket neu gezeichnet werden.
+        if not self._task_output_refresh_timer.isActive():
+            self._task_output_refresh_timer.start()
+
+    def refresh_active_command_task_output(self):
+        task = self.active_command_task
+        if task is not None and task.get("status") == "läuft":
+            self.update_command_task_item(task)
 
     def finish_active_command_task(self, status="", exit_code=None):
         task = self.active_command_task
@@ -3179,6 +3177,9 @@ class ShellDeckTerminalWidget(QWidget):
                 task["status"] = "Fehler"
             elif status in {"", "unbekannt"}:
                 task["status"] = "erfolgreich"
+        # Beim Abschluss unbedingt den letzten Output-Ausschnitt und den
+        # finalen Status sofort aktualisieren; der Timer darf entfallen.
+        self._task_output_refresh_timer.stop()
         self.update_command_task_item(task)
         self.active_command_task = None
         callback = getattr(self.window, "register_completed_command_task", None)
@@ -3899,6 +3900,10 @@ class ShellDeckTerminalWidget(QWidget):
         if getattr(self, "_terminal_cleaned_up", False):
             return
         self._terminal_cleaned_up = True
+        for timer_name in ("_prompt_label_refresh_timer", "_task_output_refresh_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
         app = QApplication.instance()
         if app is not None:
             try:
@@ -5002,25 +5007,49 @@ class ShellDeckTerminalWidget(QWidget):
         last = lines[-1]
         return bool(re.search(r"^(?:>>|\.\.>|>>>|\.\.\.|dquote>|quote>|pipe>)\s*$", last, re.IGNORECASE))
 
-    def terminal_output_text_for_state_checks(self):
-        """Return visible output plus queued text that is not painted yet.
+    def terminal_document_tail(self, limit=TERMINAL_STATE_TAIL_CHARS, *, end_position=None):
+        """Begrenzten Dokumentausschnitt lesen, statt alles zuPlainText().
 
-        Terminal output is drained asynchronously for UI performance. The shell
-        prompt can already be in ``_output_queue`` while ``output_area`` still
-        does not contain it. State checks must include that queued text,
-        otherwise a finished command can be mistaken for an interactive/running
-        process and the next normal command bypasses history, Vorbefehl and
-        command translation.
+        QTextDocument kann zehntausende Scrollback-Blöcke enthalten. Ein
+        QTextCursor selektiert nur das fuer Prompt-Pruefungen benoetigte Ende.
+        Die Qt-internen Absatztrenner werden in Newlines zurueckuebersetzt.
         """
-        try:
-            output = self.output_area.toPlainText()
-        except Exception:
-            output = ""
-        try:
-            queued = "".join(str(item[0] or "") for item in getattr(self, "_output_queue", []) if item)
-        except Exception:
-            queued = ""
-        return output + queued
+        cursor = QTextCursor(self.output_area.document())
+        if end_position is None:
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            end = cursor.position()
+        else:
+            end = max(0, min(int(end_position), cursor.document().characterCount() - 1))
+            cursor.setPosition(end)
+        cursor.setPosition(max(0, end - max(0, int(limit))), QTextCursor.MoveMode.KeepAnchor)
+        return cursor.selectedText().replace("\u2029", "\n")
+
+    def output_tail_context(self, limit=TERMINAL_STATE_TAIL_CHARS, *, end_position=None):
+        """Nur sichtbares Textende + FIFO-Ende für Zustands- und Prompt-Prüfung.
+
+        Ausgabe in der noch ungezeichneten FIFO hat Vorrang, da der gerade
+        zurueckgekehrte Shell-Prompt sonst vom alten Scrollback ueberlagert
+        wuerde. Die volle FIFO und das volle Dokument bleiben unveraendert.
+        """
+        limit = max(0, int(limit))
+        if not limit:
+            return ""
+        queue = getattr(self, "_output_queue", None)
+        queued = queue.tail(limit) if queue is not None else ""
+        if len(queued) >= limit:
+            return queued[-limit:]
+        visible = self.terminal_document_tail(limit - len(queued), end_position=end_position)
+        return (visible + queued)[-limit:]
+
+    def terminal_output_text_for_state_checks(self):
+        """Letzte Ausgabe inkl. FIFO fuer Shell-, Passwort- und Dialogstatus.
+
+        Vorher wurde bei jeder readyRead-Benachrichtigung das komplette
+        QTextDocument kopiert und die gesamte FIFO verkettet. Das verursachte
+        bei großen Logs erhebliche, wiederholte Arbeit auf dem GUI-Thread.
+        Alle aufrufenden Erkennungen untersuchen ohnehin nur das Textende.
+        """
+        return self.output_tail_context()
 
     def command_appears_to_be_running(self):
         if not getattr(self, "_awaiting_command_completion", False):
@@ -5204,7 +5233,7 @@ class ShellDeckTerminalWidget(QWidget):
             return
         combined = str(getattr(self, "_interaction_prompt_tail", "") or "") + str(text or "")
         try:
-            current_tail = self.output_area.toPlainText()[-2500:]
+            current_tail = self.terminal_document_tail(2500)
             combined = current_tail + combined
         except Exception:
             pass
@@ -5992,7 +6021,8 @@ class ShellDeckTerminalWidget(QWidget):
         self.refresh_password_prompt_state_after_output()
         self.refresh_interaction_prompt_state_after_output()
         self.finish_active_command_task_if_prompt_returned()
-        QTimer.singleShot(120, self.update_input_prompt_label)
+        if not self._prompt_label_refresh_timer.isActive():
+            self._prompt_label_refresh_timer.start()
 
     def handle_stderr(self):
         emitter = self.sender()
@@ -6009,7 +6039,8 @@ class ShellDeckTerminalWidget(QWidget):
         self.refresh_password_prompt_state_after_output()
         self.refresh_interaction_prompt_state_after_output()
         self.finish_active_command_task_if_prompt_returned()
-        QTimer.singleShot(120, self.update_input_prompt_label)
+        if not self._prompt_label_refresh_timer.isActive():
+            self._prompt_label_refresh_timer.start()
 
     def handle_finished(self, exit_code, exit_status):
         emitter = self.sender()

@@ -199,3 +199,51 @@ Python ist und die Prozess-Ebene weiterhin PTY (Linux/macOS) bzw.
   Der Linux-Test startet zwei unabhaengige PTYs, beendet das erste und
   prueft, dass das zweite weiterhin interaktiv antwortet. Die GUI- und
   macOS-/Windows-Praxistests bleiben zusaetzlich erforderlich.
+
+## Etappe 2: Ausgabeleistung und Scrollback (Patches 020–021)
+
+- **Klassische Ansicht / Entwicklerkonsole:** Der vorhandene zeitbudgetierte
+  GUI-Drain bleibt bestehen. Ankommende Ausgabestücke werden nun in einer
+  FIFO gesammelt und erst beim Zeichnen nach Farben zusammengefasst. Das
+  vermeidet wiederholte Verkettungen großer Zeichenketten sowie das lineare
+  Entfernen am Listenanfang. Textreihenfolge, Farbgrenzen, Prompt-Erkennung
+  und die Ausgabeexport-Funktion bleiben erhalten.
+- **Einstellungen → Scrollback-Größe (klassische Ansicht)…:** Legt die
+  maximale Anzahl im QTextDocument gespeicherter Textblöcke je Tab fest
+  (1.000 bis 100.000, Standard 25.000). Die Einstellung wird gespeichert
+  und auf vorhandene, neue, geteilte und entkoppelte Tabs angewandt. Beim
+  Verkleinern gehen die ältesten bereits angezeigten Zeilen verloren;
+  diese können nicht aus dem Scrollback wiederhergestellt werden.
+- **Echter VT-Modus:** Nutzt weiterhin seinen eigenen pyte-History-Speicher
+  (derzeit Standard 2.000 Zeilen) und ist von dieser Einstellung noch nicht
+  betroffen. Eine gemeinsame konfigurierte Begrenzung beider Darstellungen
+  folgt in einem weiteren Entwicklungsschritt.
+- Die Warteschlange eingehender Prozessausgabe wird *noch nicht hart*
+  speicherbegrenzt. Dafür ist ein gesondertes Backpressure-Konzept nötig,
+  das während interaktiver Programme keine wichtigen Bytes verliert.
+- Tests: `PYTHONPATH=src python -m pytest -q src/test_shelldeck_output_buffer.py
+  src/test_shelldeck_scrollback.py`; die Qt-/GUI-Prüfung erfolgt zusätzlich
+  auf den Zielplattformen.
+
+### Ausgabe-Tail fuer Statuspruefungen (Patch 022)
+
+- Die Erkennung von Shell-Prompt, Passwort-/Rueckfragen und Inline-Prompt
+  betrachtet nur die letzten maximal 6.000 Zeichen der angezeigten Ausgabe
+  samt noch nicht gezeichneter FIFO. Das vermeidet wiederholte Volltextkopien
+  bei sehr grossen Logs; die gespeicherte Anzeige und Warteschlange werden
+  dabei weder geloescht noch gekuerzt.
+- Regressionstests: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_output_tail.py`.
+
+### Fairere GUI-Aktualisierung bei Ausgabefluten (Patch 023)
+
+- Die klassische Ansicht verarbeitet pro Qt-Einfügevorgang maximal 8.192
+  Zeichen und gibt dem Event-Loop zwischen Durchlaeufen Zeit fuer andere
+  Fenster und Eingaben. Keine Ausgabe wird wegen des Zeitbudgets verworfen.
+- Prompt-Anzeige und Tooltips der Befehlsliste werden bei vielen
+  `readyRead`-Meldungen gebuendelt, statt fuer jeden Ausgabeblock neue
+  Qt-Timer beziehungsweise Tabellendarstellungen anzulegen. Beim
+  Befehlsabschluss erfolgt die finale Tabellenaktualisierung sofort.
+- Die Warteschlange bleibt vorerst unbegrenzt. Ein echter Speicherschutz
+  gegen extrem viel schneller eintreffende Ausgabe benoetigt Backpressure,
+  ohne dabei Terminal-/Prompt-Daten zu verlieren.

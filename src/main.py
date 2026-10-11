@@ -33,6 +33,10 @@ from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
 from shelldeck_backend_manager import missing_backend_packages, start_backend_package_install
 from shelldeck_command_history import CommandHistoryDialog
 from shelldeck_cli import parse_launch_arguments, resolve_directory
+from shelldeck_scrollback import (
+    DEFAULT_SCROLLBACK_BLOCKS, MIN_SCROLLBACK_BLOCKS, MAX_SCROLLBACK_BLOCKS,
+    normalize_scrollback_blocks,
+)
 import shelldeck_system_integration as system_integration
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
@@ -156,6 +160,7 @@ class TerminalWindow(QMainWindow):
         # create_shell_process() unter Linux/macOS automatisch auf PTY anheben.
         self.terminal_engine_is_user_choice = False
         self.max_history_size = 1000
+        self.scrollback_blocks = DEFAULT_SCROLLBACK_BLOCKS
         self.terminal_font = QFont("Courier New", 10)
         self.saved_tabs = []
         self.saved_paths = []
@@ -341,6 +346,14 @@ class TerminalWindow(QMainWindow):
         history_action = QAction("History-Größe", self)
         history_action.triggered.connect(self.show_history_dialog)
         settings_menu.addAction(history_action)
+
+        scrollback_action = QAction("Scrollback-Größe (klassische Ansicht)…", self)
+        scrollback_action.setToolTip(
+            "Begrenzt die Anzahl gespeicherter Textzeilen je Tab in der klassischen "
+            "Ansicht. Der echte VT-Modus hat einen eigenen Verlaufspuffer."
+        )
+        scrollback_action.triggered.connect(self.show_scrollback_dialog)
+        settings_menu.addAction(scrollback_action)
 
         self.carry_profiles_action = QAction("Profiländerungen beim Beenden übernehmen", self)
         self.carry_profiles_action.setCheckable(True)
@@ -3067,6 +3080,9 @@ class TerminalWindow(QMainWindow):
             self.max_history_size = 1000
 
         self.history = self.history[-self.max_history_size:]
+        self.scrollback_blocks = normalize_scrollback_blocks(
+            settings.get("scrollback_blocks", self.scrollback_blocks)
+        )
 
         engine_value = str(settings.get("terminal_engine", self.terminal_engine or "auto") or "auto").lower().strip()
         self.terminal_engine = engine_value if engine_value in {"auto", "qprocess", "pty"} else "auto"
@@ -3119,6 +3135,7 @@ class TerminalWindow(QMainWindow):
             "window_opacity": self.window_opacity,
             "default_command": self.default_command,
             "max_history_size": self.max_history_size,
+            "scrollback_blocks": normalize_scrollback_blocks(self.scrollback_blocks),
             "shell_type": self.shell_type,
             "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
             **terminal_engine_settings,
@@ -3702,6 +3719,24 @@ class TerminalWindow(QMainWindow):
             self.save_history()
             self.save_settings()
 
+    def show_scrollback_dialog(self):
+        size, ok = QInputDialog.getInt(
+            self,
+            "Scrollback-Größe",
+            "Maximale Textblöcke pro Tab (klassische Ansicht):",
+            normalize_scrollback_blocks(self.scrollback_blocks),
+            MIN_SCROLLBACK_BLOCKS,
+            MAX_SCROLLBACK_BLOCKS,
+            1000,
+        )
+        if not ok:
+            return
+        self.scrollback_blocks = normalize_scrollback_blocks(size)
+        # Auch ausgekoppelte und geteilte Tabs mitnehmen.
+        for _, _, tab in self.all_terminal_tabs():
+            tab.set_scrollback_blocks(self.scrollback_blocks)
+        self.save_settings()
+
     def ollama_models(self):
         return list_ollama_models()
 
@@ -4022,6 +4057,7 @@ Einstellungen-Menü
 - Design auf Standard zurücksetzen: stellt die Standardfarben wieder her.
 - Standardbefehl: Befehl, der beim Start eines neuen Tabs automatisch ausgeführt wird.
 - History-Größe: maximale Anzahl gespeicherter Befehle.
+- Scrollback-Größe (klassische Ansicht): maximal 1.000 bis 100.000 Textblöcke je Tab (Standard 25.000). Alte Zeilen werden beim Verkleinern gelöscht; der VT-Modus hat einen eigenen Verlauf.
 - Shell-Backend: wechselt das Shell-Backend des aktuellen Tabs.
 - KI-Menü / Ollama aktivieren: zeigt oder versteckt das KI-Menü.
 
@@ -4060,6 +4096,7 @@ Ausgabe, Suche und Export
 - Ausgabe kann als Text oder Markdown gespeichert werden.
 - Kopieren ohne Steuerzeichen entfernt ANSI-/Terminal-Steuerzeichen aus der kopierten Ausgabe.
 - Ausgabe leeren entfernt nur den sichtbaren Inhalt, nicht den laufenden Prozess.
+- Umfangreiche Ausgaben werden in der klassischen Ansicht zeitbudgetiert und farbgetreu gebündelt eingefügt. Die Begrenzung des angezeigten Scrollbacks wirkt nicht auf die noch wartende Prozessausgabe.
 
 Befehlspalette
 - Ctrl+Shift+P öffnet die Befehlspalette.
