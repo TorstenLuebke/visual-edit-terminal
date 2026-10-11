@@ -108,6 +108,33 @@ class RealTerminalModeTests(unittest.TestCase):
         w.terminal_grid.sizeChanged.emit(11, 42)
         self.assertEqual(w.process.size, (11, 42))
 
+    def test_delayed_window_resize_does_not_restore_hidden_classic_size(self):
+        """Alte output_area-Groesse darf das VT-PTY nicht ueberschreiben."""
+        w = self._make_widget()
+        self.assertTrue(w.set_real_terminal_mode(True))
+        grid = w.terminal_grid
+        self.assertIsNotNone(grid)
+        grid.model().resize(17, 53)
+        self.assertEqual(w._terminal_grid_size(), (17, 53))
+        w._last_pty_size = None
+        w.update_terminal_size()
+        self.assertEqual(w.process.size, (17, 53))
+        # Ein spaeterer klassischer Groessenabgleich ist idempotent.
+        w.process.size = None
+        w.update_terminal_size()
+        self.assertIsNone(w.process.size)
+
+    def test_vt_size_change_followed_by_deferred_sync_is_stable(self):
+        w = self._make_widget()
+        self.assertTrue(w.set_real_terminal_mode(True))
+        grid = w.terminal_grid
+        grid.model().resize(11, 41)
+        w._on_terminal_grid_size(11, 41)
+        self.assertEqual(w.process.size, (11, 41))
+        w.process.size = None
+        w.update_terminal_size()
+        self.assertIsNone(w.process.size)
+
     def test_disable_restores_classic(self):
         w = self._make_widget()
         w.set_real_terminal_mode(True)

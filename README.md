@@ -244,6 +244,92 @@ Python ist und die Prozess-Ebene weiterhin PTY (Linux/macOS) bzw.
   `readyRead`-Meldungen gebuendelt, statt fuer jeden Ausgabeblock neue
   Qt-Timer beziehungsweise Tabellendarstellungen anzulegen. Beim
   Befehlsabschluss erfolgt die finale Tabellenaktualisierung sofort.
-- Die Warteschlange bleibt vorerst unbegrenzt. Ein echter Speicherschutz
-  gegen extrem viel schneller eintreffende Ausgabe benoetigt Backpressure,
-  ohne dabei Terminal-/Prompt-Daten zu verlieren.
+- Bei PTY/ConPTY wird der Reader ab Patch 025 per Backpressure gebremst;
+  QProcess braucht weiterhin eine eigene Begrenzungsstrategie. Die
+  begrenzte Anzeigehistorie ist vom wartenden Ausgabetext getrennt.
+
+### PTY-Rueckstau ohne Byteverlust (Patches 024–025)
+
+- Unter Linux/macOS (POSIX-PTY) und Windows (ConPTY/pywinpty) wartet der
+  PTY-Reader nach jedem Signal auf die Uebernahme durch den GUI-Thread. Ein
+  blockierter Qt-Eventloop kann damit keine unbegrenzte Zahl noch nicht
+  verarbeiteter Reader-Signale aufbauen.
+- In der **klassischen Terminalansicht** bremst der Reader ab 1.048.576
+  noch nicht angezeigten Zeichen. Er liest erst wieder aus dem PTY, wenn der
+  ausstehende Text auf 262.144 Zeichen abgearbeitet wurde. Die Bytes bleiben
+  im Terminaldatenstrom und werden nicht stillschweigend geloescht.
+- Beim Tab-Schliessen/Prozessabbruch kann der Reader trotz Rueckstau beendet
+  werden. Der echte VT-Modus verwendet weiterhin seine separate Darstellung.
+- **Geltungsbereich:** Diese Stufe begrenzt den *PTY-Reader-Rueckstau*, nicht
+  den gesamten Prozessspeicher. Insbesondere QProcess-Puffer, das sichtbare
+  Scrollback und andere Ausgabeverbraucher benoetigen eigene Grenzwerte.
+- Regressionen: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_pty_backpressure.py` und anschliessend alle Tests.
+
+### QProcess-Pipe-Ausgabe portionsweise bearbeiten (Patches 026–027)
+
+- Auch der klassische QProcess-Pipe-Modus liest stdout/stderr jetzt in
+  Schritten von maximal 32.768 Bytes pro Ereignisdurchlauf. Verbleibende Daten
+  holt ein einzelner Qt-Timer nach; separate Kanaele behalten ihre Farben.
+- Ab 1.048.576 noch nicht gezeichneten Zeichen setzt ShellDeck das Abholen
+  aus dem QProcess-Pipe-Puffer aus. Nach Rueckgang auf 262.144 Zeichen
+  wird wieder gelesen. Es werden keine gepufferten Bytes absichtlich verworfen.
+- Eine bereits beendete Shell liefert ihre verbleibende stdout-/stderr-Ausgabe
+  vor der Abschlussmeldung aus. Unter Linux/macOS bleiben UTF-8-Zeichen
+  erhalten, die zwischen zwei Leseschritten geteilt werden.
+- **Grenze:** Qt kann die Daten aus Betriebssystem-Pipes intern weiter puffern.
+  Dies ist daher eine Begrenzung der GUI-Warteschlange und der Verarbeitung
+  pro Ereignis, **keine harte Speicherobergrenze** für den QProcess-Backend.
+  Die PTY-Backpressure aus 024–025 bleibt unveraendert.
+- Regressionstests: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_qprocess_output_pump.py`; zusaetzlich die GUI und
+  die reale Prozessbeendigung mit `QProcess` pruefen.
+
+### Echter VT-Modus: sparsamere Zellzeichnung (Patches 028–029)
+
+- Der VT-Renderer verwendet Schriftvarianten (fett, kursiv, unterstrichen,
+  durchgestrichen) wieder, anstatt fuer jedes dargestellte Zeichen ein neues
+  Qt-Schriftobjekt zu erzeugen. Explizite ANSI-/Truecolor-Farben werden mit
+  einem auf 256 Eintraege begrenzten Cache aufgeloest.
+- Nicht benachbarte veraenderte VT-Zeilen werden getrennt zum Neuzeichnen
+  angemeldet; reine Cursorbewegungen aktualisieren alte und neue Cursorzeilen.
+  Bei grossflaechigen Aenderungen wird weiterhin gebuendelt neu gezeichnet.
+- Das begrenzte pyte-Scrollback (derzeit standardmaessig 2.000 Zeilen) bleibt
+  von dieser Optimierung unberuehrt. Eine einstellbare VT-Historie und
+  umfassendere VT-Lasttests sind spaetere Ausbauschritte.
+- Tests: `PYTHONPATH=src QT_QPA_PLATFORM=offscreen python -m pytest -q
+  src/test_shelldeck_terminal_grid.py` und anschliessend alle Tests.
+
+### Zwischenablage im echten VT-Modus
+
+Text mit der Maus markieren und per Rechtsklick kopieren oder einfuegen.
+Alternativ `Ctrl+Shift+C` / `Ctrl+Shift+V`, `Ctrl+Insert` / `Shift+Insert`
+und unter Linux die mittlere Maustaste nutzen. Das Kontextmenue kann auch
+den sichtbaren Bildschirm markieren. `Ctrl+C` und `Ctrl+V` werden weiterhin an
+interaktive Anwendungen durchgereicht und duerfen nicht als globale
+Zwischenablage-Kuerzel verwendet werden.
+
+### Groessenaenderung im echten VT-Modus
+
+Bei aktivem VT-Modus wird die Terminalgroesse ausschliesslich aus dem
+VT-Zellgitter und nicht aus der ausgeblendeten klassischen Textansicht
+ermittelt. Nach Groessenaenderungen wird das komplette Gitter neu gezeichnet
+und die PTY-Groesse aktualisiert. Vollbildprogramme wie vim/htop muessen
+so ihren Zeilenumbruch und ihre Statuszeile erneut anpassen koennen.
+
+### Interaktive Rückfragen und PTY-Größenänderungen (Patches 033–034)
+
+- Identische erneut gesendete Rückfragen aktivieren den Antwortmodus nicht
+  erneut. Bereits eingegebene Antworten werden auch bei Ausgabe oder
+  Größenänderungen nicht mehr ungefragt gelöscht. Die Prompt-Anzeige wird
+  nur bei tatsächlicher Textänderung aktualisiert.
+- Größenänderungen der klassischen ShellDeck-Ansicht werden nach 100 ms
+  ohne weitere Resize-Ereignisse an das PTY gemeldet. Das reduziert
+  SIGWINCH-/Neuzeichnungsstürme beim Ziehen des Fensterrands.
+- **Wichtig:** Die klassische Textansicht ist kein VT-Bildschirmemulator.
+  `vim`, `htop`, `nano` und ähnliche interaktive Vollbildprogramme müssen
+  im Modus Ansicht → Echtes Terminal (VT) mit PTY laufen. Der reine
+  QTextEdit-Ausgabebereich kann Cursorbewegungen/Alternate-Screen nicht
+  darstellen. Die VT-Ansicht verwendet weiterhin ihre eigenen Größenmeldungen.
+- Regressionstests: `src/test_shelldeck_prompt_repeat_guard.py` und
+  `src/test_shelldeck_pty_resize_debounce.py`.

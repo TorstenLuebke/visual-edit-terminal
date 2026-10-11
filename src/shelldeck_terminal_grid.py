@@ -17,11 +17,12 @@ zeigt an, ob echte Terminaldarstellung möglich ist.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Dict, Optional
 
 from PySide6.QtCore import Qt, QRect, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 import shelldeck_key_encoding as keyenc
 import shelldeck_vt_screen as vt
@@ -58,6 +59,38 @@ _ANSI_PALETTE = {
 _HEXDIGITS = set("0123456789abcdefABCDEF")
 
 
+@lru_cache(maxsize=256)
+def _cached_terminal_color(value: str) -> QColor:
+    """Cache limited to 256 explicit colors, including RGB/ANSI palette values.
+
+    Truecolor input can contain millions of unique values, so the cache must
+    not grow without bound. Default/theme colors are handled by the widget.
+    """
+    hexname = _ANSI_PALETTE.get(value.lower())
+    if hexname:
+        return QColor(hexname)
+    if len(value) == 6 and all(c in _HEXDIGITS for c in value):
+        return QColor("#" + value)
+    return QColor(value)
+
+
+def _coalesce_dirty_rows(rows, row_count: int):
+    """Combine changed VT rows into inclusive intervals, ignoring invalid rows."""
+    valid = sorted({int(y) for y in rows if 0 <= int(y) < row_count})
+    if not valid:
+        return []
+    spans = []
+    start = end = valid[0]
+    for y in valid[1:]:
+        if y == end + 1:
+            end = y
+        else:
+            spans.append((start, end))
+            start = end = y
+    spans.append((start, end))
+    return spans
+
+
 class TerminalGridView(QWidget):
     """Rendert ein VtScreen-Modell als monospaced Terminalgitter."""
 
@@ -77,6 +110,9 @@ class TerminalGridView(QWidget):
         base_font.setStyleHint(QFont.StyleHint.TypeWriter)
         base_font.setFixedPitch(True)
         self._font = base_font
+        # Only 16 combinations of bold/italic/underline/strikethrough exist.
+        # Avoid constructing a new QFont for every printed character.
+        self._glyph_fonts = {}
 
         # Farbschema (kann vom ShellDeck-Theme gesetzt werden).
         self.default_fg = QColor("#d0d0d0")
@@ -90,7 +126,7 @@ class TerminalGridView(QWidget):
         self._cell_w = 1.0
         self._cell_h = 1.0
         self._ascent = 0.0
-        self._last_cursor_y = 0
+        self._last_cursor = None
 
         self._cursor_visible_phase = True
         self.cursor_blink = True
@@ -115,6 +151,7 @@ class TerminalGridView(QWidget):
         font.setFixedPitch(True)
         super().setFont(font)
         self._font = font
+        self._glyph_fonts.clear()
         self._recompute_metrics()
         self._apply_grid_from_size()
         self.update()
@@ -146,18 +183,27 @@ class TerminalGridView(QWidget):
         if self._model is None:
             return
         dirty = set(self._model.dirty_lines())
-        cursor_y = self._model.cursor.get("y", 0)
-        dirty.add(cursor_y)
-        dirty.add(self._last_cursor_y)
-        self._last_cursor_y = cursor_y
+        cursor = self._model.cursor
+        cursor_state = (cursor.get("x", 0), cursor.get("y", 0),
+                        cursor.get("hidden", False))
+        if cursor_state != self._last_cursor:
+            # Even pure cursor-movement sequences must redraw the old/new
+            # cursor cells, including movement within the same row.
+            dirty.add(cursor_state[1])
+            if self._last_cursor is not None:
+                dirty.add(self._last_cursor[1])
+        self._last_cursor = cursor_state
         self._model.clear_dirty()
-        if not dirty:
+        spans = _coalesce_dirty_rows(dirty, self._model.rows)
+        if not spans:
             return
-        top = max(0, min(dirty))
-        bottom = min(self._model.rows - 1, max(dirty))
-        y_px = int(top * self._cell_h)
-        h_px = int((bottom - top + 1) * self._cell_h) + 1
-        self.update(0, y_px, self.width(), h_px)
+        # Avoid a storm of repaint requests for heavily fragmented updates.
+        if len(spans) > 8 or sum(end - start + 1 for start, end in spans) > self._model.rows // 2:
+            spans = [(spans[0][0], spans[-1][1])]
+        for top, bottom in spans:
+            y_px = int(top * self._cell_h)
+            h_px = int((bottom - top + 1) * self._cell_h) + 1
+            self.update(0, y_px, self.width(), h_px)
 
     # --- Geometrie --------------------------------------------------------
     def _grid_size_for(self, width: int, height: int):
@@ -170,6 +216,10 @@ class TerminalGridView(QWidget):
             return
         rows, cols = self._grid_size_for(self.width(), self.height())
         if self._model.resize(rows, cols):
+            # Bei einer veraenderten Zellgeometrie sind alle Zeilen neu zu
+            # zeichnen, nicht nur die von Qt neu freigelegte Fensterregion.
+            self._last_cursor = None
+            self.update()
             self.sizeChanged.emit(rows, cols)
 
     def resizeEvent(self, event) -> None:
@@ -222,14 +272,22 @@ class TerminalGridView(QWidget):
     def _resolve_color(self, value, default: QColor) -> QColor:
         if not value or value == "default":
             return default
-        text = str(value)
-        hexname = _ANSI_PALETTE.get(text.lower())
-        if hexname:
-            return QColor(hexname)
-        if len(text) == 6 and all(c in _HEXDIGITS for c in text):
-            return QColor("#" + text)
-        color = QColor(text)
+        color = _cached_terminal_color(str(value))
         return color if color.isValid() else default
+
+    def _font_for_cell(self, cell: Dict) -> QFont:
+        """Return a reused font for the four terminal text attributes."""
+        key = (bool(cell["bold"]), bool(cell["italics"]),
+               bool(cell["underscore"]), bool(cell["strikethrough"]))
+        result = self._glyph_fonts.get(key)
+        if result is None:
+            result = QFont(self._font)
+            result.setBold(key[0])
+            result.setItalic(key[1])
+            result.setUnderline(key[2])
+            result.setStrikeOut(key[3])
+            self._glyph_fonts[key] = result
+        return result
 
     # --- Tastatureingabe --------------------------------------------------
     def keyPressEvent(self, event) -> None:
@@ -249,6 +307,16 @@ class TerminalGridView(QWidget):
             event.accept()
             return
         if ctrl and shift and key == Qt.Key.Key_V:
+            self.paste_clipboard()
+            event.accept()
+            return
+        # Verbreitete zusaetzliche Terminal-Kuerzel. Ctrl+V bleibt beim
+        # laufenden Programm (z. B. vim: Literal-Insert).
+        if ctrl and not shift and key == Qt.Key.Key_Insert:
+            self.copy_selection()
+            event.accept()
+            return
+        if shift and not ctrl and key == Qt.Key.Key_Insert:
             self.paste_clipboard()
             event.accept()
             return
@@ -316,6 +384,43 @@ class TerminalGridView(QWidget):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def _create_context_menu(self) -> QMenu:
+        """Kontextmenue nur fuer die VT-Ansicht; Shell-Tasten bleiben intakt."""
+        menu = QMenu(self)
+        copy_action = menu.addAction("Kopieren (Strg+Umschalt+C / Strg+Einfg)")
+        copy_action.setEnabled(self.has_selection())
+        copy_action.triggered.connect(self.copy_selection)
+        paste_action = menu.addAction("Einfuegen (Strg+Umschalt+V / Umschalt+Einfg)")
+        paste_action.setEnabled(bool(QApplication.clipboard().text()))
+        paste_action.triggered.connect(self.paste_clipboard)
+        menu.addSeparator()
+        select_action = menu.addAction("Alles Sichtbare markieren")
+        select_action.setEnabled(self._model is not None)
+        select_action.triggered.connect(self.select_all_visible)
+        clear_action = menu.addAction("Markierung aufheben")
+        clear_action.setEnabled(self.has_selection())
+        clear_action.triggered.connect(self.clear_selection)
+        return menu
+
+    def contextMenuEvent(self, event) -> None:
+        if self._model is None:
+            super().contextMenuEvent(event)
+            return
+        menu = self._create_context_menu()
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            menu.deleteLater()
+        event.accept()
+
+    def select_all_visible(self) -> None:
+        """Nur die sichtbare VT-Seite markieren, nicht unbemerkt Scrollback."""
+        if self._model is None:
+            return
+        self._sel_anchor = (0, 0)
+        self._sel_head = (self._model.rows - 1, self._model.cols - 1)
+        self.update()
 
     def clear_selection(self) -> None:
         if self._sel_anchor is not None or self._sel_head is not None:
@@ -408,6 +513,8 @@ class TerminalGridView(QWidget):
             and (not self.cursor_blink or self._cursor_visible_phase)
         )
         cur_x, cur_y = cursor.get("x", 0), cursor.get("y", 0)
+        last_font = None
+        last_pen = None
 
         for y in range(first, last + 1):
             cells = self._model.row_cells(y)
@@ -431,13 +538,13 @@ class TerminalGridView(QWidget):
 
                 char = cell["char"]
                 if char and char != " ":
-                    glyph_font = QFont(self._font)
-                    glyph_font.setBold(cell["bold"])
-                    glyph_font.setItalic(cell["italics"])
-                    glyph_font.setUnderline(cell["underscore"])
-                    glyph_font.setStrikeOut(cell["strikethrough"])
-                    painter.setFont(glyph_font)
-                    painter.setPen(fg)
+                    glyph_font = self._font_for_cell(cell)
+                    if glyph_font is not last_font:
+                        painter.setFont(glyph_font)
+                        last_font = glyph_font
+                    if fg != last_pen:
+                        painter.setPen(fg)
+                        last_pen = fg
                     painter.drawText(int(x_px), int(y_px + self._ascent), char)
 
 

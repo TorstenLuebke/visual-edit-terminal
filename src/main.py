@@ -4097,6 +4097,8 @@ Ausgabe, Suche und Export
 - Kopieren ohne Steuerzeichen entfernt ANSI-/Terminal-Steuerzeichen aus der kopierten Ausgabe.
 - Ausgabe leeren entfernt nur den sichtbaren Inhalt, nicht den laufenden Prozess.
 - Umfangreiche Ausgaben werden in der klassischen Ansicht zeitbudgetiert und farbgetreu gebündelt eingefügt. Die Begrenzung des angezeigten Scrollbacks wirkt nicht auf die noch wartende Prozessausgabe.
+- Bei PTY/ConPTY werden Lesesignale einzeln bestaetigt; ab rund 1 Mi noch nicht angezeigten Zeichen pausiert das Lesen bis auf 256 Ki Rueckstau. Dadurch entstehen keine unbegrenzt wartenden Reader-Signale.
+- QProcess-Shells lesen stdout/stderr in maximal 32-KiB-Schritten. Bei grossem Rueckstau im GUI-Ausgabepuffer pausiert das Abholen; nach Entlastung folgen die verbleibenden Bytes. Die Qt-internen Pipe-Puffer bleiben davon unberuehrt: Es gibt noch keine harte Speichergrenze fuer QProcess.
 
 Befehlspalette
 - Ctrl+Shift+P öffnet die Befehlspalette.
@@ -4169,8 +4171,11 @@ Systemintegration (Einstellungen -> Systemintegration...)
 
 Echtes Terminal (VT)
 - Ansicht -> "Echtes Terminal (VT)" schaltet den aktuellen Tab auf echte VT/ANSI-Darstellung; Vollbild-Programme wie vim, htop, less oder nano funktionieren dann korrekt.
+- Diese Programme nicht in der klassischen Textansicht ausfuehren: Sie sendet zwar PTY-Eingaben, interpretiert aber keine vollstaendigen VT-Cursor- und Screen-Sequenzen.
+- Wiederholte interaktive Rueckfragen duerfen eingegebene Antworten nicht loeschen; im klassischen Modus werden Fenstergroessenwechsel gebuendelt an das PTY gemeldet.
 - Voraussetzung: das optionale Paket pyte (pip install pyte) und die PTY-Engine (wird bei Bedarf automatisch aktiviert). Fehlt pyte, bleibt die klassische Ansicht.
-- Auswahl/Kopieren mit Ctrl+Shift+C, Einfuegen mit Ctrl+Shift+V oder Mittelklick, Scrollback per Mausrad; die Fenstergroesse wird an das PTY gemeldet.
+- Text mit der linken Maustaste markieren; Rechtsklick bietet Kopieren, Einfuegen, Alles Sichtbare markieren und Markierung aufheben. Alternativ Ctrl+Shift+C/V oder Ctrl+Insert/Shift+Insert; unter Linux ist auch Mittelklick moeglich. Ctrl+C und Ctrl+V bleiben Eingaben an interaktive Programme. Scrollback per Mausrad.
+- Die VT-Zellzeichnung verwendet wiederverwendete Schriftvarianten und einen begrenzten Farbcache; bei kleinen Aenderungen werden nur betroffene Zeilen neu gezeichnet. Bei einer Groessenaenderung wird dagegen die gesamte VT-Flaeche neu gezeichnet und nur die aktive VT-Gittergroesse an das PTY gemeldet. Der VT-Scrollback bleibt vorerst getrennt von der klassischen Scrollback-Einstellung.
 - "Reines Terminal" und "Echtes Terminal" schliessen sich pro Tab aus. Die zeilenbasierten Zusatzfunktionen (Befehls-Tabelle, Prompt-Leiste, KI-Prompt) gehoeren zum klassischen Modus und bleiben dort erhalten.
 
 Hinweise

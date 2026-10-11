@@ -29,6 +29,8 @@ import subprocess
 import shlex
 import socket
 import getpass
+import threading
+import codecs
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -74,6 +76,16 @@ TERMINAL_OUTPUT_DRAIN_SLICE_CHARS = 8192
 TERMINAL_OUTPUT_LARGE_CHUNK_CHARS = 60000
 TERMINAL_OUTPUT_MAX_BLOCKS = 25000
 TERMINAL_OUTPUT_HARD_WRAP_COLUMN = 12000
+# PTY/ConPTY: bei 1 Mi Zeichen wartender klassischer Ausgabe bremsen;
+# erst nach Abbau auf 256 Ki wieder freigeben (Hysterese).
+# QProcess ist davon noch nicht betroffen: dort liegt die Lesepufferung in Qt.
+TERMINAL_PTY_BACKPRESSURE_HIGH_CHARS = 1_048_576
+TERMINAL_PTY_BACKPRESSURE_LOW_CHARS = 262_144
+# QProcess: begrenzte Leseschritte verhindern einen langen readyRead-Slot.
+# Der Qt-interne Pipe-Puffer selbst ist damit NICHT hart begrenzt.
+TERMINAL_QPROCESS_READ_SLICE_BYTES = 32_768
+TERMINAL_QPROCESS_BACKPRESSURE_HIGH_CHARS = 1_048_576
+TERMINAL_QPROCESS_BACKPRESSURE_LOW_CHARS = 262_144
 # Regex-Erkennung von Shell-Prompts, Passwort-/Rückfragen betrachtet maximal
 # 2.500 Zeichen. Der Sicherheitszuschlag deckt über Chunkgrenzen laufende
 # Prompts ab, ohne bei jeder Ausgabe das gesamte Scrollback zu kopieren.
@@ -602,11 +614,37 @@ class PtyReaderThread(QThread):
     def __init__(self, pty_process, parent=None):
         super().__init__(parent)
         self.pty_process = pty_process
+        # Nur ein noch nicht bestaetigtes Datenpaket darf auf dem Qt-Eventloop
+        # warten. Zusaetzlich kann die Anzeige den PTY-Read anhalten, statt
+        # bei einer Ausgabeflut unbeschraenkt Qt-Signale zu erzeugen.
+        self._delivery_ack = threading.Event()
+        self._delivery_ack.set()
+        self._read_permission = threading.Event()
+        self._read_permission.set()
+
+    def set_read_paused(self, paused):
+        if paused:
+            self._read_permission.clear()
+        else:
+            self._read_permission.set()
+
+    def acknowledge_output(self):
+        self._delivery_ack.set()
 
     def run(self):
         exit_code = 0
         try:
             while not self.isInterruptionRequested():
+                # Bei vollem GUI-Puffer bleibt das PTY ungelesen. Der
+                # Kernel/ConPTY bremst dadurch den schreibenden Prozess, ohne
+                # dass ShellDeck Terminal-Bytes verwerfen muss.
+                permission = getattr(self, "_read_permission", None)
+                if permission is not None:
+                    while not permission.wait(0.05):
+                        if self.isInterruptionRequested():
+                            break
+                    if self.isInterruptionRequested():
+                        break
                 proc = self.pty_process
                 if proc is None:
                     break
@@ -632,10 +670,22 @@ class PtyReaderThread(QThread):
                     chunk = b""
                 data = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
                 if data:
+                    ack = getattr(self, "_delivery_ack", None)
+                    if ack is not None:
+                        ack.clear()
                     try:
                         self.output_ready.emit(data)
                     except RuntimeError:
                         break
+                    # Erst wenn der GUI-Slot das Signal verarbeitet hat,
+                    # darf der Reader das naechste Paket senden. So koennen
+                    # auch blockierte Eventloops keine Signalflut aufbauen.
+                    if ack is not None:
+                        while not ack.wait(0.05):
+                            if self.isInterruptionRequested():
+                                break
+                        if self.isInterruptionRequested():
+                            break
                 else:
                     # Erst nach einem leeren Read die Kind-Liveness pruefen.
                     # So bleiben letzte Ausgabezeilen nach dem Exit erhalten.
@@ -1020,10 +1070,25 @@ class PtyTerminalProcess(QThread):
         # nachdem eine neue Shell gestartet wurde. Niemals die neue Sitzung
         # mit Daten des alten PTYs vermischen.
         sender = self.sender()
-        if sender is not None and sender is not self._reader:
+        reader = self._reader
+        if sender is not None and sender is not reader:
             return
-        self._stdout_buffer.extend(bytes(data or b""))
-        self.readyReadStandardOutput.emit()
+        try:
+            self._stdout_buffer.extend(bytes(data or b""))
+            # handle_stdout() wird im GUI-Thread synchron aufgerufen und
+            # uebernimmt die Bytes in den Ausgabepuffer/das VT-Modell.
+            self.readyReadStandardOutput.emit()
+        finally:
+            ack = getattr(reader, "acknowledge_output", None)
+            if callable(ack):
+                ack()
+
+    def set_output_paused(self, paused):
+        """Backpressure nur fuer die aktuelle PTY-Reader-Generation."""
+        reader = self._reader
+        setter = getattr(reader, "set_read_paused", None)
+        if callable(setter):
+            setter(bool(paused))
 
     def _handle_reader_error(self, message):
         sender = self.sender()
@@ -1455,6 +1520,15 @@ class ShellDeckTerminalWidget(QWidget):
         self._output_drain_timer = QTimer(self)
         self._output_drain_timer.setInterval(TERMINAL_OUTPUT_DRAIN_INTERVAL_MS)
         self._output_drain_timer.timeout.connect(self.drain_terminal_output_queue)
+        # Der separate QProcess-Pipe-Puffer wird bei Rueckstau nur in kleinen
+        # Schritten gelesen. Der Timer gehoert zur Tab-Instanz, nicht zur Shell.
+        self._qprocess_output_timer = QTimer(self)
+        self._qprocess_output_timer.setSingleShot(True)
+        self._qprocess_output_timer.setInterval(2)
+        self._qprocess_output_timer.timeout.connect(self._pump_qprocess_output)
+        self._qprocess_output_paused = False
+        self._qprocess_deferred_finish = None
+        self._qprocess_decoders = self._new_qprocess_decoders()
         self._highlighter_restore_timer = QTimer(self)
         self._highlighter_restore_timer.setSingleShot(True)
         self._highlighter_restore_timer.timeout.connect(self.restore_terminal_highlighter_if_safe)
@@ -1468,6 +1542,13 @@ class ShellDeckTerminalWidget(QWidget):
         self._task_output_refresh_timer.setSingleShot(True)
         self._task_output_refresh_timer.setInterval(100)
         self._task_output_refresh_timer.timeout.connect(self.refresh_active_command_task_output)
+        # Beim Ziehen des Fensterrands nicht fuer jedes Resize-Ereignis ein
+        # SIGWINCH ausloesen: Vollbildprogramme koennen sonst die Ausgabe
+        # schneller neu zeichnen, als die GUI sie verarbeiten kann.
+        self._terminal_resize_timer = QTimer(self)
+        self._terminal_resize_timer.setSingleShot(True)
+        self._terminal_resize_timer.setInterval(100)
+        self._terminal_resize_timer.timeout.connect(self.update_terminal_size)
 
         # Reines-Terminal-Modus: Eingabe direkt im Ausgabebereich.
         self.pure_terminal_mode = False
@@ -1588,6 +1669,21 @@ class ShellDeckTerminalWidget(QWidget):
             self.highlighter.setDocument(self.output_area.document())
         self.highlighter.set_terminal_colors(self.window.terminal_colors())
 
+    def sync_pty_output_backpressure(self):
+        """PTY-Reader anhalten/freigeben, ohne seine Rohbytes zu verwerfen.
+
+        Hysterese verhindert Pendeln bei jedem GUI-Drain. QProcess hat keine
+        set_output_paused()-Methode und behaelt deshalb sein altes Verhalten.
+        """
+        setter = getattr(getattr(self, "process", None), "set_output_paused", None)
+        if not callable(setter):
+            return
+        pending = self._output_queue.pending_chars
+        if pending >= TERMINAL_PTY_BACKPRESSURE_HIGH_CHARS:
+            setter(True)
+        elif pending <= TERMINAL_PTY_BACKPRESSURE_LOW_CHARS:
+            setter(False)
+
     def queue_terminal_output(self, text, color=None):
         value = self.prepare_terminal_output_for_display(text)
         if not value:
@@ -1598,12 +1694,20 @@ class ShellDeckTerminalWidget(QWidget):
         # Nicht bei jedem readyRead erneut an einen immer groesseren String
         # anhaengen: viele kleine Chunks wuerden sonst quadratisch teuer.
         self._output_queue.append(value, qcolor)
+        self.sync_pty_output_backpressure()
+        self._sync_qprocess_output_backpressure()
         if not self._output_drain_timer.isActive():
             self._output_drain_timer.start()
 
     def drain_terminal_output_queue(self):
         if not self._output_queue:
             self._output_drain_timer.stop()
+            sync = getattr(self, "sync_pty_output_backpressure", None)
+            if callable(sync):
+                sync()
+            resume = getattr(self, "_sync_qprocess_output_backpressure", None)
+            if callable(resume):
+                resume()
             self._highlighter_restore_timer.start(750)
             return
 
@@ -1638,6 +1742,14 @@ class ShellDeckTerminalWidget(QWidget):
                     break
         finally:
             self.output_area.setUpdatesEnabled(True)
+            # Auch nach einem Qt-Fehler duerfen pausierte PTY-Reader nicht
+            # dauerhaft auf einen GUI-Drain warten.
+            sync = getattr(self, "sync_pty_output_backpressure", None)
+            if callable(sync):
+                sync()
+            resume = getattr(self, "_sync_qprocess_output_backpressure", None)
+            if callable(resume):
+                resume()
 
         scrollbar = self.output_area.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -3634,6 +3746,11 @@ class ShellDeckTerminalWidget(QWidget):
         """Detach callbacks before replacing an engine's asynchronous process."""
         if process is None:
             return
+        timer = getattr(self, "_qprocess_output_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._qprocess_deferred_finish = None
+        self._qprocess_output_paused = False
         for name, callback in (
             ("readyReadStandardOutput", self.handle_stdout),
             ("readyReadStandardError", self.handle_stderr),
@@ -3703,13 +3820,34 @@ class ShellDeckTerminalWidget(QWidget):
         return True
 
     def resizeEvent(self, event):
-        # Bei jeder Groessenaenderung die aktuelle Zeilen-/Spaltenzahl an ein
-        # aktives PTY melden, damit interaktive Programme korrekt umbrechen.
+        # Groessenaenderungen zusammenfassen: bei Ziehen des Fensterrands
+        # darf keine unbeschraenkte Folge von 0-ms-Timern/SIGWINCH entstehen.
         super().resizeEvent(event)
-        QTimer.singleShot(0, self.update_terminal_size)
+        self._schedule_terminal_size_update()
+
+    def _schedule_terminal_size_update(self):
+        """Melde erst die letzte Fenstergroesse nach einer kurzen Ruhephase."""
+        if getattr(self, "_terminal_cleaned_up", False):
+            return
+        timer = getattr(self, "_terminal_resize_timer", None)
+        if timer is not None:
+            timer.start()  # erneutes start() setzt einen laufenden Timer zurueck
+        else:
+            # Kompatibilitaet mit Test-Doubles / aelteren Hosts.
+            QTimer.singleShot(0, self.update_terminal_size)
 
     def _terminal_grid_size(self):
-        """Schaetzt (Zeilen, Spalten) aus Ausgabeflaeche und Schriftmetrik."""
+        """Aktive Gittergroesse, sonst klassische Ansicht (Zeilen, Spalten).
+
+        Die klassische Ausgabe wird im VT-Modus ausgeblendet. Ihre gespeicherte
+        Widget-Groesse darf niemals nachtraeglich die echte PTY-Groesse
+        ueberschreiben (z. B. nach Fenstergroessenaenderung mit vim).
+        """
+        if getattr(self, "real_terminal_active", False):
+            grid = getattr(self, "terminal_grid", None)
+            model = grid.model() if grid is not None else None
+            if model is not None:
+                return int(model.rows), int(model.cols)
         area = getattr(self, "output_area", None)
         if area is None:
             return None
@@ -3756,6 +3894,14 @@ class ShellDeckTerminalWidget(QWidget):
         self._pending_interactive_response_echoes = []
         self._pty_echo_carry = ""
         self._pty_echo_carry_generation = int(getattr(self, "_pty_echo_carry_generation", 0)) + 1
+        timer = getattr(self, "_qprocess_output_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._qprocess_output_paused = False
+        self._qprocess_deferred_finish = None
+        decoder_factory = getattr(self, "_new_qprocess_decoders", None)
+        if callable(decoder_factory):
+            self._qprocess_decoders = decoder_factory()
 
     def _schedule_shell_callback(self, delay_ms, callback):
         """Timer strikt an Tab, Prozessobjekt und Shell-Generation binden."""
@@ -3900,7 +4046,8 @@ class ShellDeckTerminalWidget(QWidget):
         if getattr(self, "_terminal_cleaned_up", False):
             return
         self._terminal_cleaned_up = True
-        for timer_name in ("_prompt_label_refresh_timer", "_task_output_refresh_timer"):
+        for timer_name in ("_prompt_label_refresh_timer", "_task_output_refresh_timer",
+                           "_qprocess_output_timer", "_terminal_resize_timer"):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 timer.stop()
@@ -5248,8 +5395,18 @@ class ShellDeckTerminalWidget(QWidget):
             return False
         if getattr(self, "password_prompt_active", False):
             return False
+        new_prompt = self.compact_interactive_prompt_text(prompt_text) if prompt_text else ""
+        if getattr(self, "interaction_prompt_active", False):
+            # Der Reader kann dieselbe Rueckfrage in mehreren Paketen oder
+            # nach SIGWINCH erneut liefern. Die Antwort, die der Benutzer
+            # gerade eintippt, darf dabei weder verschwinden noch bei jedem
+            # Paket eine komplette Qt-Aktualisierung ausloesen.
+            if new_prompt != getattr(self, "_interaction_prompt_text", ""):
+                self._interaction_prompt_text = new_prompt
+                self.update_input_prompt_label()
+            return True
         self.interaction_prompt_active = True
-        self._interaction_prompt_text = self.compact_interactive_prompt_text(prompt_text) if prompt_text else ""
+        self._interaction_prompt_text = new_prompt
         if clear_input:
             self.input_line.clear()
         if self._interaction_prompt_text:
@@ -5297,8 +5454,9 @@ class ShellDeckTerminalWidget(QWidget):
                 output = ""
             prompt_text = self.extract_interactive_prompt_from_output(output)
             if prompt_text:
-                self._interaction_prompt_text = prompt_text
-                self.update_input_prompt_label()
+                if prompt_text != getattr(self, "_interaction_prompt_text", ""):
+                    self._interaction_prompt_text = prompt_text
+                    self.update_input_prompt_label()
             elif self.output_ends_with_shell_prompt(output):
                 self.reset_interaction_prompt_mode()
 
@@ -5639,8 +5797,13 @@ class ShellDeckTerminalWidget(QWidget):
                     continue
         return value.encode("utf-8", errors="replace")
 
-    def decoded_terminal_output(self, raw):
-        text = self._decode_process_output(raw)
+    def decoded_terminal_output(self, raw, *, qprocess_stream=None):
+        # POSIX-QProcess gibt jetzt begrenzte Byte-Pakete aus. UTF-8 kann an
+        # deren Grenze getrennt sein: daher pro Kanal inkrementell dekodieren.
+        if qprocess_stream is not None and sys.platform != "win32":
+            text = self._qprocess_decoders[qprocess_stream].decode(bytes(raw), final=False)
+        else:
+            text = self._decode_process_output(raw)
         uses_pty = self.process_uses_pty_engine()
         # Auch die QProcess-Engine bekommt unter Linux/macOS ANSI-Sequenzen
         # geliefert: Bash uebernimmt ein gefaerbtes PS1 aus der Umgebung und
@@ -6003,17 +6166,110 @@ class ShellDeckTerminalWidget(QWidget):
                 pass
         self._last_pty_size = (int(rows), int(cols))
 
-    def handle_stdout(self):
-        emitter = self.sender()
-        if emitter is not None and emitter is not getattr(self, "process", None):
-            return  # Signal from a replaced engine; never read the new process.
-        if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
-            # Echter Terminalmodus: Rohbytes (inkl. ANSI) direkt in das
-            # VT-Modell geben, statt sie zu bereinigen und zeilenweise
-            # anzuhängen.
-            self.terminal_grid.feed(bytes(self.process.readAllStandardOutput()))
+    @staticmethod
+    def _new_qprocess_decoders():
+        return {
+            "stdout": codecs.getincrementaldecoder("utf-8")("replace"),
+            "stderr": codecs.getincrementaldecoder("utf-8")("replace"),
+        }
+
+    def _qprocess_buffered_bytes(self, process, stream):
+        """Nur fuer echte QProcess-Pipes; PTY/ConPTY bleibt unveraendert."""
+        channel = (QProcess.ProcessChannel.StandardOutput if stream == "stdout"
+                   else QProcess.ProcessChannel.StandardError)
+        original = process.readChannel()
+        try:
+            process.setReadChannel(channel)
+            return max(0, int(process.bytesAvailable()))
+        finally:
+            process.setReadChannel(original)
+
+    def _take_shell_output_chunk(self, stream):
+        process = self.process
+        if not isinstance(process, QProcess):
+            reader = (process.readAllStandardOutput if stream == "stdout"
+                      else process.readAllStandardError)
+            return bytes(reader())
+        if self._qprocess_output_paused:
+            return b""
+        channel = (QProcess.ProcessChannel.StandardOutput if stream == "stdout"
+                   else QProcess.ProcessChannel.StandardError)
+        original = process.readChannel()
+        try:
+            process.setReadChannel(channel)
+            return bytes(process.read(TERMINAL_QPROCESS_READ_SLICE_BYTES))
+        finally:
+            process.setReadChannel(original)
+
+    def _schedule_qprocess_output_pump(self):
+        process = getattr(self, "process", None)
+        if not isinstance(process, QProcess) or self._qprocess_output_paused:
             return
-        data = self.decoded_terminal_output(self.process.readAllStandardOutput())
+        if (self._qprocess_buffered_bytes(process, "stdout")
+                or self._qprocess_buffered_bytes(process, "stderr")):
+            if not self._qprocess_output_timer.isActive():
+                self._qprocess_output_timer.start()
+        else:
+            self._complete_qprocess_finish_if_drained()
+
+    def _sync_qprocess_output_backpressure(self):
+        process = getattr(self, "process", None)
+        if not isinstance(process, QProcess):
+            return
+        pending = self._output_queue.pending_chars
+        if pending >= TERMINAL_QPROCESS_BACKPRESSURE_HIGH_CHARS:
+            self._qprocess_output_paused = True
+        elif pending <= TERMINAL_QPROCESS_BACKPRESSURE_LOW_CHARS:
+            self._qprocess_output_paused = False
+            self._schedule_qprocess_output_pump()
+
+    def _pump_qprocess_output(self):
+        process = getattr(self, "process", None)
+        if not isinstance(process, QProcess) or self._qprocess_output_paused:
+            return
+        # Maximal ein Leseschritt pro Kanal und Qt-Tick, auch wenn Qt selbst
+        # bereits sehr viele Bytes gepuffert hat.
+        self.handle_stdout(_from_pump=True)
+        self.handle_stderr(_from_pump=True)
+        self._schedule_qprocess_output_pump()
+
+    def _complete_qprocess_finish_if_drained(self):
+        finish = self._qprocess_deferred_finish
+        if finish is None:
+            return
+        process, generation, code = finish
+        if (self.process is not process or self._shell_generation != generation
+                or self._qprocess_output_paused):
+            return
+        if (self._qprocess_buffered_bytes(process, "stdout")
+                or self._qprocess_buffered_bytes(process, "stderr")):
+            return
+        self._qprocess_deferred_finish = None
+        # Bei einer unvollstaendigen UTF-8-Sequenz zum Ende kein Byte verlieren.
+        for stream in ("stdout", "stderr"):
+            tail = self._qprocess_decoders[stream].decode(b"", final=True)
+            if tail:
+                self.queue_terminal_output(tail, self.terminal_stderr_color() if stream == "stderr" else None)
+        self._finalize_shell_process_finished(code)
+
+    def _finalize_shell_process_finished(self, exit_code):
+        self.set_client_mode(False)
+        self.finish_active_command_task(status=("erfolgreich" if int(exit_code) == 0 else "Fehler"), exit_code=exit_code)
+        self.queue_terminal_output(f"\nProcess finished with exit code {exit_code}")
+
+    def handle_stdout(self, _from_pump=False):
+        emitter = self.sender()
+        if not _from_pump and emitter is not None and emitter is not getattr(self, "process", None):
+            return  # Signal from a replaced engine; never read the new process.
+        raw = self._take_shell_output_chunk("stdout")
+        if not raw:
+            return
+        if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
+            self.terminal_grid.feed(raw)
+            self._schedule_qprocess_output_pump()
+            return
+        data = self.decoded_terminal_output(
+            raw, qprocess_stream="stdout" if isinstance(self.process, QProcess) else None)
         self.queue_terminal_output(data)
         self.append_command_task_output("stdout", data)
         self.handle_possible_password_prompt(data)
@@ -6023,15 +6279,21 @@ class ShellDeckTerminalWidget(QWidget):
         self.finish_active_command_task_if_prompt_returned()
         if not self._prompt_label_refresh_timer.isActive():
             self._prompt_label_refresh_timer.start()
+        self._schedule_qprocess_output_pump()
 
-    def handle_stderr(self):
+    def handle_stderr(self, _from_pump=False):
         emitter = self.sender()
-        if emitter is not None and emitter is not getattr(self, "process", None):
+        if not _from_pump and emitter is not None and emitter is not getattr(self, "process", None):
             return  # Signal from a replaced engine; never read the new process.
-        if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
-            self.terminal_grid.feed(bytes(self.process.readAllStandardError()))
+        raw = self._take_shell_output_chunk("stderr")
+        if not raw:
             return
-        data = self.decoded_terminal_output(self.process.readAllStandardError())
+        if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
+            self.terminal_grid.feed(raw)
+            self._schedule_qprocess_output_pump()
+            return
+        data = self.decoded_terminal_output(
+            raw, qprocess_stream="stderr" if isinstance(self.process, QProcess) else None)
         self.queue_terminal_output(data, self.terminal_stderr_color())
         self.append_command_task_output("stderr", data)
         self.handle_possible_password_prompt(data)
@@ -6041,14 +6303,19 @@ class ShellDeckTerminalWidget(QWidget):
         self.finish_active_command_task_if_prompt_returned()
         if not self._prompt_label_refresh_timer.isActive():
             self._prompt_label_refresh_timer.start()
+        self._schedule_qprocess_output_pump()
 
     def handle_finished(self, exit_code, exit_status):
         emitter = self.sender()
         if emitter is not None and emitter is not getattr(self, "process", None):
             return  # Signal from a replaced engine; never read the new process.
-        self.set_client_mode(False)
-        self.finish_active_command_task(status=("erfolgreich" if int(exit_code) == 0 else "Fehler"), exit_code=exit_code)
-        self.queue_terminal_output(f"\nProcess finished with exit code {exit_code}")
+        if isinstance(self.process, QProcess):
+            self._qprocess_deferred_finish = (
+                self.process, self._shell_generation, int(exit_code))
+            self._sync_qprocess_output_backpressure()
+            self._schedule_qprocess_output_pump()
+            return
+        self._finalize_shell_process_finished(exit_code)
 
     def handle_process_error(self, error):
         emitter = self.sender()
