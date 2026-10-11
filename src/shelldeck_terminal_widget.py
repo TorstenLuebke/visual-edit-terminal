@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView, QMessageBox
 )
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QEvent, QThread, Signal, QTimer
+from shelldeck_session_state import evaluate_session_state
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor,
     QSyntaxHighlighter, QAction, QTextOption
@@ -605,13 +606,9 @@ class PtyReaderThread(QThread):
                 proc = self.pty_process
                 if proc is None:
                     break
-                try:
-                    is_alive = bool(proc.isalive()) if hasattr(proc, "isalive") else False
-                except Exception:
-                    is_alive = False
-                if not is_alive:
-                    break
-
+                # Zuerst auch die bereits gepufferten Restbytes lesen. Ein
+                # Prozess kann beendet sein, obwohl noch Daten im PTY liegen.
+                # Ein vorzeitiges isalive()-break verlor die letzte Ausgabe.
                 try:
                     chunk = proc.read(4096)
                 except EOFError:
@@ -625,9 +622,10 @@ class PtyReaderThread(QThread):
                     exit_code = 1
                     break
 
+                # Manche Backends liefern bei einem Timeout None statt b"";
+                # pruefen wir danach ebenfalls, ob das Kind beendet ist.
                 if chunk is None:
-                    self.msleep(20)
-                    continue
+                    chunk = b""
                 data = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
                 if data:
                     try:
@@ -635,6 +633,14 @@ class PtyReaderThread(QThread):
                     except RuntimeError:
                         break
                 else:
+                    # Erst nach einem leeren Read die Kind-Liveness pruefen.
+                    # So bleiben letzte Ausgabezeilen nach dem Exit erhalten.
+                    try:
+                        is_alive = bool(proc.isalive()) if hasattr(proc, "isalive") else False
+                    except Exception:
+                        is_alive = False
+                    if not is_alive:
+                        break
                     self.msleep(20)
         except BaseException as exc:
             # Beim Qt-Shutdown können Python-Signalobjekte bereits freigegeben sein,
@@ -647,6 +653,18 @@ class PtyReaderThread(QThread):
                 except Exception:
                     pass
         finally:
+            # QThread-Ende != Prozess-Exitcode: POSIX waitpid() und pywinpty
+            # liefern (wenn verfuegbar) den echten Rueckgabewert des Kindes.
+            proc = self.pty_process
+            if proc is not None:
+                try:
+                    if hasattr(proc, "isalive"):
+                        proc.isalive()
+                    actual_exit = getattr(proc, "exitstatus", None)
+                    if actual_exit is not None:
+                        exit_code = int(actual_exit)
+                except (OSError, ValueError, TypeError):
+                    pass
             try:
                 self.finished_ready.emit(exit_code, QProcess.ExitStatus.NormalExit)
             except Exception:
@@ -715,8 +733,10 @@ class PosixPtyChild:
     def read(self, size=4096):
         import select
 
-        if self._closed or self.fd < 0 or not self.isalive():
+        if self._closed or self.fd < 0:
             raise EOFError()
+        # isalive() hier NICHT abfragen: nach Exit des Kindes koennen noch
+        # lesbare Daten im PTY-Master liegen. EOF kommt erst bei leerem PTY.
         ready, _, _ = select.select([self.fd], [], [], 0.05)
         if not ready:
             return b""
@@ -926,16 +946,32 @@ class PtyTerminalProcess(QThread):
             QTimer.singleShot(0, lambda: self.errorOccurred.emit(QProcess.ProcessError.FailedToStart))
 
     def _append_stdout(self, data):
+        # Ein alter Reader kann noch bereits gequeue-te Qt-Signale senden,
+        # nachdem eine neue Shell gestartet wurde. Niemals die neue Sitzung
+        # mit Daten des alten PTYs vermischen.
+        sender = self.sender()
+        if sender is not None and sender is not self._reader:
+            return
         self._stdout_buffer.extend(bytes(data or b""))
         self.readyReadStandardOutput.emit()
 
     def _handle_reader_error(self, message):
+        sender = self.sender()
+        if sender is not None and sender is not self._reader:
+            return
         self._error_string = str(message or "Unbekannter PTY/ConPTY-Fehler")
         self._stderr_buffer.extend(("\n[PTY/ConPTY-Fehler] " + self._error_string + "\n").encode("utf-8", errors="replace"))
         self.readyReadStandardError.emit()
         self.errorOccurred.emit(QProcess.ProcessError.UnknownError)
 
     def _handle_reader_finished(self, exit_code, exit_status):
+        sender = self.sender()
+        if sender is not None and sender is not self._reader:
+            return
+        # shutdown() kann den Reader bereits beenden und den Prozess
+        # abmelden. Ein verspaetetes finished darf nicht doppelt eintreffen.
+        if not self._running:
+            return
         self._running = False
         self.finished.emit(int(exit_code), exit_status)
 
@@ -3625,7 +3661,34 @@ class ShellDeckTerminalWidget(QWidget):
         except Exception:
             pass
 
+    def _reset_shell_transient_state(self):
+        """Alte Echo-/Interaktionspuffer niemals in eine neue Shell übernehmen."""
+        self._awaiting_command_completion = False
+        self._last_sent_shell_command = ""
+        self._pending_pty_command_echoes = []
+        self._pending_interactive_response_echoes = []
+        self._pty_echo_carry = ""
+        self._pty_echo_carry_generation = int(getattr(self, "_pty_echo_carry_generation", 0)) + 1
+
+    def _schedule_shell_callback(self, delay_ms, callback):
+        """Timer strikt an Tab, Prozessobjekt und Shell-Generation binden."""
+        process = getattr(self, "process", None)
+        generation = getattr(self, "_shell_generation", 0)
+
+        def invoke():
+            if (getattr(self, "_terminal_cleaned_up", False)
+                    or getattr(self, "process", None) is not process
+                    or getattr(self, "_shell_generation", 0) != generation):
+                return
+            callback()
+
+        QTimer.singleShot(int(delay_ms), invoke)
+
     def start_shell(self):
+        # Identitaet einer gestarteten Shell, auch wenn das selbe QProcess-
+        # Objekt bei einem Restart wiederverwendet wird.
+        self._shell_generation = getattr(self, "_shell_generation", 0) + 1
+        self._reset_shell_transient_state()
         shell_path = self.window.system_shell(self.shell_type)
         if not shell_path:
             shell_path = self.window.system_shell("powershell" if sys.platform == "win32" else "bash")
@@ -3661,6 +3724,40 @@ class ShellDeckTerminalWidget(QWidget):
             self.stop_process(fast=False)
         self.output_area.clear()
         self.start_shell()
+
+    def get_session_state(self):
+        """Liest den Zustand dieses Tabs (ohne neue GUI-/Prozess-Flags).
+
+        Im Gegensatz zu process.state() unterscheidet dies laufende Shell,
+        laufenden Befehl und interaktive Eingabe. Bereits zurückgekehrte
+        Prompts in der Ausgabewarteschlange zählen als READY.
+        """
+        process = getattr(self, "process", None)
+        try:
+            process_state = process.state() if process is not None else QProcess.ProcessState.NotRunning
+        except (AttributeError, RuntimeError):
+            process_state = QProcess.ProcessState.NotRunning
+        pending = bool(getattr(self, "_awaiting_command_completion", False))
+        interactive = bool(getattr(self, "client_mode_active", False)
+                           or getattr(self, "password_prompt_active", False)
+                           or getattr(self, "interaction_prompt_active", False))
+        if pending or interactive:
+            # Kein Seiteneffekt: anders als command_appears_to_be_running()
+            # werden die internen Flags bei dieser Abfrage nicht geändert.
+            output = self.terminal_output_text_for_state_checks()
+            if self.output_ends_with_shell_prompt(output) and not getattr(self, "client_mode_active", False):
+                pending = False
+                interactive = False
+        return evaluate_session_state(
+            process_state=process_state,
+            running_state=QProcess.ProcessState.Running,
+            starting_state=QProcess.ProcessState.Starting,
+            command_pending=pending,
+            interactive=interactive,
+            closed=bool(getattr(self, "_terminal_cleaned_up", False)),
+            engine=self.actual_terminal_engine(),
+            generation=getattr(self, "_shell_generation", 0),
+        )
 
     def process_is_running(self, process):
         return process is not None and process.state() == QProcess.ProcessState.Running
@@ -3983,7 +4080,20 @@ class ShellDeckTerminalWidget(QWidget):
         text = str(command or "").strip() or self.current_restore_command()
         if not text:
             return False
-        QTimer.singleShot(int(delay_ms), lambda t=text: self.run_restore_command(t))
+        # Restore-Timer gehoeren zu EINER Shell-Generation in EINEM Tab.
+        # Nach Restart, Engine-Wechsel oder Tab-Schliessung darf ein alter
+        # Callback keinen Befehl in eine neue Sitzung senden.
+        process = getattr(self, "process", None)
+        generation = getattr(self, "_shell_generation", 0)
+
+        def restore_if_current():
+            if (getattr(self, "_terminal_cleaned_up", False)
+                    or getattr(self, "process", None) is not process
+                    or getattr(self, "_shell_generation", 0) != generation):
+                return
+            self.run_restore_command(text)
+
+        QTimer.singleShot(int(delay_ms), restore_if_current)
         return True
 
     def is_safe_restore_command(self, command):
@@ -5231,7 +5341,7 @@ class ShellDeckTerminalWidget(QWidget):
         self._awaiting_command_completion = True
         self.process.write(self.encode_process_input(text))
         self.process.waitForBytesWritten(1000)
-        QTimer.singleShot(300, self.refresh_process_input_mode_hint)
+        self._schedule_shell_callback(300, self.refresh_process_input_mode_hint)
 
     def execute_command(self):
         command_text = self.input_line.toPlainText().strip()
@@ -5590,7 +5700,7 @@ class ShellDeckTerminalWidget(QWidget):
         self._pty_echo_carry_generation = int(getattr(self, "_pty_echo_carry_generation", 0)) + 1
         generation = self._pty_echo_carry_generation
         try:
-            QTimer.singleShot(800, lambda: self._flush_pty_echo_carry(generation))
+            self._schedule_shell_callback(800, lambda: self._flush_pty_echo_carry(generation))
         except Exception:
             pass
 

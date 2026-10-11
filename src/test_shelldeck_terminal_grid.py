@@ -15,10 +15,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import shelldeck_vt_screen as vt
 
 
+# QApplication muss waehrend des gesamten Testlaufs referenziert bleiben.
+# Ein nur lokales QApplication([]) kann sofort wieder freigegeben werden.
+_QT_APP = None
+
+
 def _qt_usable():
+    global _QT_APP
     try:
         from PySide6.QtWidgets import QApplication
-        QApplication.instance() or QApplication([])
+        _QT_APP = QApplication.instance()
+        if _QT_APP is None:
+            _QT_APP = QApplication([])
         return True
     except Exception:
         return False
@@ -35,6 +43,7 @@ class TerminalGridViewTests(unittest.TestCase):
         view = TerminalGridView(rows=rows, cols=cols)
         view.resize(int(cols * view.cell_size()[0]) + 4,
                     int(rows * view.cell_size()[1]) + 4)
+        self.addCleanup(view.close)
         return view
 
     def test_usable_with_pyte(self):
@@ -42,6 +51,7 @@ class TerminalGridViewTests(unittest.TestCase):
         self.assertTrue(view.is_usable())
 
     def test_feed_and_render_no_error(self):
+        from PySide6.QtCore import QPoint
         from PySide6.QtGui import QImage, QPainter
         view = self._make()
         view.feed(b"hallo\r\n")
@@ -49,8 +59,12 @@ class TerminalGridViewTests(unittest.TestCase):
         img = QImage(view.size(), QImage.Format.Format_RGB32)
         img.fill(0)
         painter = QPainter(img)
-        view.render(painter)
-        painter.end()
+        try:
+            view.render(painter, QPoint(0, 0))
+        finally:
+            # Auch bei einer Ausnahme in paintEvent muss der QPainter enden.
+            # Sonst kann Qt beim Aufraeumen einen nativen Crash ausloesen.
+            painter.end()
         # Irgendein Pixel muss vom (schwarzen) Ausgangsbild abweichen -> es
         # wurde tatsaechlich Text/Hintergrund gezeichnet.
         distinct = {img.pixel(x, y)
@@ -64,11 +78,17 @@ class TerminalGridViewTests(unittest.TestCase):
         self.assertTrue(view.model().display()[0].startswith("abc"))
 
     def test_resize_emits_size_and_updates_model(self):
+        from PySide6.QtWidgets import QApplication
         view = self._make(rows=6, cols=24)
+        # Ein noch nie angezeigtes QWidget darf resizeEvent bis zum ersten
+        # show() zurueckstellen. Hier pruefen wir die aktive Terminalansicht.
+        view.show()
+        QApplication.processEvents()
         seen = []
         view.sizeChanged.connect(lambda r, c: seen.append((r, c)))
         cw, chh = view.cell_size()
         view.resize(int(40 * cw) + 4, int(10 * chh) + 4)
+        QApplication.processEvents()
         self.assertEqual(view.model().cols, 40)
         self.assertEqual(view.model().rows, 10)
         self.assertTrue(seen and seen[-1] == (10, 40))

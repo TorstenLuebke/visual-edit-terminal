@@ -380,13 +380,20 @@ class TerminalGridView(QWidget):
     # --- Zeichnen ---------------------------------------------------------
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
+        try:
+            self._paint_terminal(painter, event)
+        finally:
+            # Ein Painter muss auch nach Python-Fehlern beendet werden,
+            # sonst kann Qt beim Aufraeumen nativ abstuerzen.
+            painter.end()
+
+    def _paint_terminal(self, painter: QPainter, event) -> None:
         painter.fillRect(event.rect(), self.default_bg)
         if self._model is None:
             painter.setPen(self.default_fg)
             painter.setFont(self._font)
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                              "pyte nicht installiert – klassische Ansicht aktiv")
-            painter.end()
             return
 
         cw, ch = self._cell_w, self._cell_h
@@ -432,7 +439,6 @@ class TerminalGridView(QWidget):
                     painter.setFont(glyph_font)
                     painter.setPen(fg)
                     painter.drawText(int(x_px), int(y_px + self._ascent), char)
-        painter.end()
 
 
 __all__ = ["TerminalGridView"]

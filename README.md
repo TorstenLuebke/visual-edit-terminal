@@ -103,3 +103,31 @@ Terminal" und „Echtes Terminal" schließen sich pro Tab gegenseitig aus. Fehlt
 Emulation ist plattformübergreifend (Windows/Linux/macOS), da `pyte` reines
 Python ist und die Prozess-Ebene weiterhin PTY (Linux/macOS) bzw.
 `pywinpty`/ConPTY (Windows) nutzt.
+
+## Prozessstabilitaet (Etappe 1)
+
+- PTY/ConPTY und QProcess bleiben als getrennte, pro Tab auswählbare Backends
+  erhalten. Jede Terminal-Registerkarte verwendet weiterhin ihren eigenen
+  Prozess und eigene Ausgabe.
+- Die PTY-Ausgabe wird beim Prozessende noch bis zum EOF ausgelesen; der
+  angezeigte Exit-Code kommt, soweit das Backend ihn bereitstellt, vom
+  Kindprozess.
+- Verspaetete Reader-Signale und Restore-Timer aus vorherigen Shell-Sitzungen
+  werden beim Wechsel oder Schliessen einer Sitzung ignoriert.
+- Automatische Tests: `PYTHONPATH=src python -m pytest -q src/test_shelldeck_pty_lifecycle.py`
+  (unter POSIX mit zusaetzlichem echtem PTY-Spawn-Test). Ein GUI- und
+  Mehr-Tab-Praxistest bleibt fuer die Zielsysteme erforderlich.
+
+### Sitzungsstatus und asynchrone Timer (Patches 008–009)
+
+- `TerminalTab.get_session_state()` liefert pro Tab einen unveränderlichen
+  Snapshot (`phase`, `shell_running`, `command_pending`, `interactive`,
+  `engine`, `generation`, `busy`). Die Phasen `stopped`, `starting`, `ready`,
+  `running` und `interactive` unterscheiden Shell-Prozess und Shell-Befehl.
+  Für QProcess und PTY wird derselbe Zustandsprüfer verwendet. Die Abfrage
+  verändert die laufende Shell nicht.
+- Verzögerte Eingabe- und Echo-Timer werden nur ausgeführt, wenn Prozess und
+  Generation unverändert sind und der Tab noch offen ist. Temporäre Echo-
+  und Antwortpuffer werden bei jedem Shell-Neustart gelöscht.
+- Regressionstests: `PYTHONPATH=src python -m pytest -q
+  src/test_shelldeck_session_state.py src/test_shelldeck_session_timer_guards.py`.

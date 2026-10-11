@@ -15,10 +15,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import shelldeck_vt_screen as vt
 
 
+# QApplication muss waehrend des gesamten Testlaufs referenziert bleiben.
+# Ein nur lokales QApplication([]) kann sofort wieder freigegeben werden.
+_QT_APP = None
+
+
 def _qt_usable():
+    global _QT_APP
     try:
         from PySide6.QtWidgets import QApplication
-        QApplication.instance() or QApplication([])
+        _QT_APP = QApplication.instance()
+        if _QT_APP is None:
+            _QT_APP = QApplication([])
         return True
     except Exception:
         return False
