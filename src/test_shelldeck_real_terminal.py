@@ -96,6 +96,111 @@ class RealTerminalModeTests(unittest.TestCase):
         self.assertGreaterEqual(layout.indexOf(w.output_area), 0)
         self.assertFalse(w.output_area.isHidden())
 
+    def test_auto_vt_for_direct_command_does_not_restart_shell(self):
+        w = self._make_widget()
+        process = w.process
+        self.assertFalse(w.real_terminal_active)
+        self.assertTrue(w._auto_vt_for_direct_command("vim /tmp/test.txt"))
+        self.assertTrue(w.real_terminal_active)
+        self.assertIs(process, w.process)
+        self.assertFalse(w.output_area.isVisible())
+        self.assertFalse(w._auto_vt_for_direct_command("vim /tmp/test.txt"))
+
+    def test_auto_vt_from_verified_foreground_is_tab_local(self):
+        first = self._make_widget()
+        second = self._make_widget()
+        first.process.foreground_guide = lambda: ("htop", 111)
+        second.process.foreground_guide = lambda: None
+        self.assertTrue(first._auto_vt_from_foreground())
+        self.assertTrue(first.real_terminal_active)
+        self.assertFalse(second.real_terminal_active)
+        self.assertFalse(second._auto_vt_from_foreground())
+
+    def test_auto_vt_process_output_goes_to_grid(self):
+        w = self._make_widget()
+        w.process.foreground_guide = lambda: ("vim", 222)
+        w.process.set_output(b"hello\r\n")
+        w.handle_stdout()
+        self.assertTrue(w.real_terminal_active)
+        self.assertTrue(w.terminal_grid.model().display()[0].startswith("hello"))
+        self.assertNotIn("hello", w.output_area.toPlainText())
+
+    def test_manual_opt_out_respected_until_foreground_changes(self):
+        w = self._make_widget()
+        w.process.foreground_guide = lambda: ("vim", 333)
+        self.assertTrue(w._auto_vt_from_foreground())
+        w.suppress_auto_vt_for_current_program()
+        self.assertTrue(w.set_real_terminal_mode(False))
+        self.assertFalse(w._auto_vt_from_foreground())
+        self.assertFalse(w.real_terminal_active)
+        w.process.foreground_guide = lambda: ("nano", 334)
+        self.assertTrue(w._auto_vt_from_foreground())
+        self.assertTrue(w.real_terminal_active)
+
+    def test_assist_and_auto_vt_use_separate_timers(self):
+        """Klassische Ansicht braucht die Erkennung, aber keinen Hilfe-Timer."""
+        w = self._make_widget()
+        self.assertTrue(w.set_real_terminal_mode(True))
+        self.assertTrue(w._assist_timer.isActive())
+        self.assertFalse(w._auto_vt_timer.isActive())
+        self.assertTrue(w.set_real_terminal_mode(False))
+        self.assertFalse(w._assist_timer.isActive())
+        self.assertTrue(w._auto_vt_timer.isActive())
+        self.assertTrue(w._assist_panel.isHidden())
+
+    def test_auto_vt_timer_recognizes_new_foreground_job(self):
+        """Die automatische Erkennung muss trotz gestopptem Hilfe-Timer laufen."""
+        w = self._make_widget()
+        w.process.foreground_guide = lambda: ("vim", 1234)
+        self.assertTrue(w.set_real_terminal_mode(True))
+        w.suppress_auto_vt_for_current_program()
+        self.assertTrue(w.set_real_terminal_mode(False))
+        w._auto_vt_timer.timeout.emit()
+        self.assertFalse(w.real_terminal_active)
+        w.process.foreground_guide = lambda: ("nano", 1235)
+        w._auto_vt_timer.timeout.emit()
+        self.assertTrue(w.real_terminal_active)
+        self.assertTrue(w._assist_timer.isActive())
+        self.assertFalse(w._auto_vt_timer.isActive())
+        self.assertEqual(w._assist_identity, ("nano", 1235))
+
+    def test_auto_vt_timer_does_not_monitor_qprocess(self):
+        w = self._make_widget()
+        w.process._shelldeck_engine = "qprocess"
+        w._update_auto_vt_timer()
+        self.assertFalse(w._assist_timer.isActive())
+        self.assertFalse(w._auto_vt_timer.isActive())
+
+    def test_auto_vt_timers_are_local_to_each_tab(self):
+        first = self._make_widget()
+        second = self._make_widget()
+        first._update_auto_vt_timer()
+        second._update_auto_vt_timer()
+        self.assertTrue(first._auto_vt_timer.isActive())
+        self.assertTrue(second._auto_vt_timer.isActive())
+        self.assertTrue(first.set_real_terminal_mode(True))
+        self.assertTrue(first._assist_timer.isActive())
+        self.assertFalse(first._auto_vt_timer.isActive())
+        self.assertTrue(second._auto_vt_timer.isActive())
+        self.assertFalse(second._assist_timer.isActive())
+
+    def test_auto_vt_timers_stop_when_session_is_cleaned_up(self):
+        w = self._make_widget()
+        w._update_auto_vt_timer()
+        self.assertTrue(w._auto_vt_timer.isActive())
+        w._terminal_cleaned_up = True
+        w._update_auto_vt_timer()
+        self.assertFalse(w._assist_timer.isActive())
+        self.assertFalse(w._auto_vt_timer.isActive())
+
+    def test_no_implicit_qprocess_restart(self):
+        w = self._make_widget()
+        w.process._shelldeck_engine = "qprocess"
+        w.process.foreground_guide = lambda: ("vim", 123)
+        self.assertFalse(w._auto_vt_for_direct_command("vim test.txt"))
+        self.assertFalse(w._auto_vt_from_foreground())
+        self.assertFalse(w.real_terminal_active)
+
     def test_enable_activates_grid(self):
         w = self._make_widget()
         self.assertTrue(w.real_terminal_available())

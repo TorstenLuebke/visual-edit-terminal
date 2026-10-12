@@ -2217,6 +2217,10 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab):
             return
+        if not checked and getattr(tab, "real_terminal_active", False):
+            # Der Benutzer will trotz aktivem Vordergrundjob wieder klassisch
+            # arbeiten. Automatik darf diese Entscheidung nicht ueberschreiben.
+            tab.suppress_auto_vt_for_current_program()
         ok = tab.set_real_terminal_mode(bool(checked))
         if not ok:
             self.show_status("Echtes Terminal benoetigt das Paket pyte (pip install pyte) und die PTY-Engine.")
@@ -4208,7 +4212,8 @@ Systemintegration (Einstellungen -> Systemintegration...)
 
 Echtes Terminal (VT)
 - Ansicht -> "Echtes Terminal (VT)" schaltet den aktuellen Tab auf echte VT/ANSI-Darstellung; Vollbild-Programme wie vim, htop, less oder nano funktionieren dann korrekt.
-- Bei erkanntem lokalem Vordergrundprogramm (Linux/macOS-PTY: vim/vi/nvim, nano, htop, top, less/more, man, watch, btop, micro, mc, tmux, screen) erscheint eine kleine Leiste mit Beenden bzw. Trennen und Kurzhilfe. Tmux/Screen werden ueber die Standard-Prefix-Tasten getrennt und nicht beendet. Vim wird ohne Datenverlustversuch beendet (:q); Verwerfen erfordert eine Bestaetigung. Ohne sichere Erkennung bleibt die Leiste verborgen (auch bei Windows/ConPTY).
+- Automatik: Im bestehenden PTY-Tab aktiviert ShellDeck fuer einen eindeutig gestarteten oder sicher erkannten lokalen Vordergrundjob (z.B. vim, nano, htop, btop, mc, tmux) selbststaendig den echten VT-Modus, ohne die Shell neu zu starten. Andere Tabs bleiben unveraendert. QProcess wird aus Sicherheitsgruenden nicht automatisch neu gestartet. Das Ausschalten per Hand bleibt fuer das aktuelle Vordergrundprogramm wirksam.
+- Bei erkanntem lokalem Vordergrundprogramm (Linux/macOS-PTY: vim/vi/nvim, nano, htop, top, less/more, man, watch, btop, micro, mc, tmux, screen) erscheint eine kleine Leiste mit Beenden bzw. Trennen und einer durchsuchbaren, thematisch geordneten Programmhilfe. Diese erlaeutert Navigation, Bearbeitung, Speicherung und sichere Beendigung, soweit vom Programm unterstuetzt; benutzerdefinierte Hilfen koennen optionale JSON-Kapitel haben. Tasten koennen je nach Version und Konfiguration abweichen. Tmux/Screen werden ueber die Standard-Prefix-Tasten getrennt und nicht beendet. Vim wird ohne Datenverlustversuch beendet (:q); Verwerfen erfordert eine Bestaetigung. Ohne sichere Erkennung bleibt die Leiste verborgen (auch bei Windows/ConPTY).
 - Diese Programme nicht in der klassischen Textansicht ausfuehren: Sie sendet zwar PTY-Eingaben, interpretiert aber keine vollstaendigen VT-Cursor- und Screen-Sequenzen.
 - Wiederholte interaktive Rueckfragen duerfen eingegebene Antworten nicht loeschen; im klassischen Modus werden Fenstergroessenwechsel gebuendelt an das PTY gemeldet.
 - Voraussetzung: das optionale Paket pyte (pip install pyte) und die PTY-Engine (wird bei Bedarf automatisch aktiviert). Fehlt pyte, bleibt die klassische Ansicht.

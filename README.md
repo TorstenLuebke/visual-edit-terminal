@@ -104,6 +104,23 @@ Emulation ist plattformübergreifend (Windows/Linux/macOS), da `pyte` reines
 Python ist und die Prozess-Ebene weiterhin PTY (Linux/macOS) bzw.
 `pywinpty`/ConPTY (Windows) nutzt.
 
+### Automatischer VT-Modus in PTY-Tabs (Patches 048–049)
+
+ShellDeck wechselt im **betroffenen Tab** automatisch ins echte VT-Gitter, wenn
+im klassischen PTY-Tab direkt `vim`, `nvim`, `nano`, `htop`, `btop`, `micro`, `mc`,
+`tmux`, `screen`, `less` oder ein anderes registriertes interaktives Programm
+aufgerufen wird. Ein lokal verifizierter Vordergrundjob (z. B. aus einem
+Skript) kann den Wechsel ebenfalls ausloesen. Die vorhandene Shell bleibt
+aktiv und wird nicht neu gestartet; andere Tabs oder Workspaces aendern sich
+nicht. Beim Beenden des Programms bleibt die gewaehlte VT-Ansicht bestehen.
+
+Ein manuell ausgeschalteter VT-Modus wird fuer denselben Vordergrundjob nicht
+sofort wieder aktiviert. **QProcess/ConPTY:** Eine sichere Erkennung der
+Vordergrund-Prozessgruppe steht nicht fuer alle Backends zur Verfuegung.
+Insbesondere wird eine laufende QProcess-Shell **nie** zum automatischen
+Moduswechsel beendet oder neu gestartet. Nicht eindeutig erkennbare
+Shell-Konstrukte werden nicht als automatischer Direktstart klassifiziert.
+
 ## Eigene Hilfen fuer weitere Vollbildprogramme
 
 Neue lokale POSIX-Vordergrundprogramme koennen ohne Aenderungen an der
@@ -121,7 +138,16 @@ Datei ausgefuehrt. Beispiel fuer ein eigenes lokal installiertes Terminalprogram
       "help_text": "Beenden: q. Suchen: /.",
       "keys": ["q"],
       "aliases": ["myviewer-cli"],
-      "button_label": "Beenden"
+      "button_label": "Beenden",
+      "help_sections": [
+        {"title": "Navigation", "entries": [
+          {"keys": "Pfeiltasten", "description": "In der Liste navigieren"},
+          {"keys": "/", "description": "Suche starten", "detail": "Mit Enter bestaetigen."}
+        ]},
+        {"title": "Beenden", "entries": [
+          {"keys": "q", "description": "Dateibetrachter schliessen"}
+        ]}
+      ]
     }
   ]
 }
@@ -129,7 +155,13 @@ Datei ausgefuehrt. Beispiel fuer ein eigenes lokal installiertes Terminalprogram
 
 Zulaessige Tastencodes: sichtbare ASCII-Einzelzeichen, `CTRL+A` bis `CTRL+Z`,
 `F1` bis `F12`, `ESC`, `ENTER`, `TAB`, `SPACE`, `BACKSPACE`.
-Das Feld `button_label` kann `Beenden` oder `Trennen` sein. Fuer neue Programme
+Das Feld `button_label` kann `Beenden` oder `Trennen` sein. `help_sections`
+ist optional und definiert 1–12 durchsuchbare Hilfekapitel mit jeweils
+1–25 Eintraegen (`keys`, `description`, optional `detail`). Ohne diese Daten
+zeigt ShellDeck weiterhin `help_text` an. Texte werden HTML-sicher angezeigt;
+die Hilfe fuehrt keine Tasten, Dateien, Weblinks oder Python-Code aus.
+Der Konfigurationsparser begrenzt Laengen und verwirft fehlerhafte Eintraege.
+Fuer neue Programme
 bitte nur eine **bekannte, normale** Tastenkombination verwenden. Die
 Anwendung erkennt weiterhin ausschliesslich vertrauenswuerdige lokale
 POSIX-Vordergrundprozesse; SSH, Shells und geschuetzte Programmkennungen
@@ -145,7 +177,15 @@ Im **echten VT-Modus** erkennt ShellDeck auf Linux/macOS bekannte lokale
 Vordergrundprogramme direkt ueber die aktive PTY-Prozessgruppe. Bei `vim`,
 `vi`, `nvim`, `nano`, `htop`, `top`, `less`, `more`, `man`, `watch`,
 `btop`, `micro`, `mc`, `tmux` und `screen` erscheint
-eine schmale Leiste mit **Beenden** und **Hilfe**. Der Button gibt lediglich
+eine schmale Leiste mit **Beenden** und **Hilfe**. Der Hilfe-Button oeffnet
+nun einen grossen, **durchsuchbaren Dialog** mit Themen links und Hinweisen,
+Tastenfolgen und Beispielen rechts. Er enthaelt mehrere Kapitel fuer alle 13
+integrierten Programme und zeigt bei eigenen Programmen wahlweise die neuen
+`help_sections` oder den bisherigen `help_text`. Die Texte sind bewusst
+selbst formuliert; tatsaechliche Bindings koennen durch Version, Betriebssystem
+oder Benutzerkonfiguration abweichen. Es erfolgt **keine** automatische
+Installation, Versionsabfrage oder Prozesssteuerung durch die Hilfe.
+Der Button gibt lediglich
 das programmspezifische Beenden-Kommando an denselben PTY-Job weiter; er
 beendet nicht die Shell und sendet keine systemweiten Kill-Signale.
 

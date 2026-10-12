@@ -58,6 +58,7 @@ from shelldeck_session_state import evaluate_session_state
 from shelldeck_output_buffer import TerminalOutputBuffer
 from shelldeck_scrollback import normalize_scrollback_blocks
 from shelldeck_program_assist import GUIDES, foreground_guide
+from shelldeck_auto_vt import direct_vt_program
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor,
     QSyntaxHighlighter, QAction, QTextOption
@@ -1454,6 +1455,8 @@ class ShellDeckTerminalWidget(QWidget):
         # Echter VT-Terminalmodus (optional, nur mit pyte + PTY-Engine).
         self.real_terminal_active = False
         self.terminal_grid = None
+        # Ein manuell deaktivierter VT-Modus bleibt fuer denselben Vordergrundjob aus.
+        self._auto_vt_suppressed_identity = None
         # Zuletzt an das PTY gemeldete Fenstergroesse (Zeilen, Spalten), um
         # unnoetige TIOCSWINSZ-Aufrufe/SIGWINCH bei jedem Resize zu vermeiden.
         self._last_pty_size = None
@@ -1495,7 +1498,7 @@ class ShellDeckTerminalWidget(QWidget):
         self._assist_exit.setToolTip("Versucht, nur das erkannte Vordergrundprogramm sicher zu beenden.")
         self._assist_exit.clicked.connect(self._exit_detected_program)
         self._assist_help = QPushButton("Hilfe")
-        self._assist_help.setToolTip("Kurzbefehle fuer das laufende Terminalprogramm anzeigen.")
+        self._assist_help.setToolTip("Durchsuchbare Hilfe mit Themen und Beispielen fuer das erkannte Programm anzeigen.")
         self._assist_help.clicked.connect(self._show_detected_program_help)
         self._assist_more = QPushButton("Weitere Aktionen")
         self._assist_more.clicked.connect(self._show_detected_program_actions)
@@ -1510,9 +1513,15 @@ class ShellDeckTerminalWidget(QWidget):
         layout.addWidget(self._assist_panel)
         self._assist_panel.hide()
         layout.addWidget(self.output_area)
+        # Zwei unabhaengige Aufgaben: Im echten VT-Modus die Bedienhilfe
+        # aktualisieren, in der klassischen PTY-Ansicht neue Vordergrundjobs
+        # erkennen. Die beiden Timer duerfen niemals gleichzeitig laufen.
         self._assist_timer = QTimer(self)
         self._assist_timer.setInterval(350)
         self._assist_timer.timeout.connect(self._refresh_detected_program)
+        self._auto_vt_timer = QTimer(self)
+        self._auto_vt_timer.setInterval(350)
+        self._auto_vt_timer.timeout.connect(self._auto_vt_from_foreground)
 
         self.command_tasks = []
         self.active_command_task = None
@@ -3988,6 +3997,8 @@ class ShellDeckTerminalWidget(QWidget):
                 "try { Remove-Module PSReadLine -ErrorAction SilentlyContinue } catch {}",
             ]
         self.process.start(shell_path, shell_args)
+        self._auto_vt_suppressed_identity = None
+        self._update_auto_vt_timer()
         # Neuer Kindprozess -> Groesse erneut melden (Cache zuruecksetzen).
         self._last_pty_size = None
         QTimer.singleShot(0, self.update_terminal_size)
@@ -4088,7 +4099,8 @@ class ShellDeckTerminalWidget(QWidget):
             return
         self._terminal_cleaned_up = True
         for timer_name in ("_prompt_label_refresh_timer", "_task_output_refresh_timer",
-                           "_qprocess_output_timer", "_terminal_resize_timer"):
+                           "_qprocess_output_timer", "_terminal_resize_timer", "_assist_timer",
+                           "_auto_vt_timer"):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 timer.stop()
@@ -5790,6 +5802,10 @@ class ShellDeckTerminalWidget(QWidget):
                     task_started = True
                 elif is_user_command:
                     self.append_active_command_task_sent_command(command)
+                if is_user_command and getattr(self.process, "_shelldeck_engine", "") == "pty":
+                    switch = getattr(self, "_auto_vt_for_direct_command", None)
+                    if callable(switch):
+                        switch(command)
                 self.write_shell_command(command)
                 prompt_text = self.extract_interactive_prompt_from_command(command)
                 if prompt_text:
@@ -6120,6 +6136,84 @@ class ShellDeckTerminalWidget(QWidget):
             self._schedule_pty_echo_carry_flush()
         return "".join(kept_lines)
 
+    # --- Automatischer VT-Wechsel (nur fuer vorhandene PTY-Sitzung) ----------
+    def _update_auto_vt_timer(self):
+        """Pro Tab ausschliesslich den Timer fuer die aktive Ansicht betreiben."""
+        assist_timer = getattr(self, "_assist_timer", None)
+        auto_timer = getattr(self, "_auto_vt_timer", None)
+        if assist_timer is None or auto_timer is None:
+            return
+        supported = (not getattr(self, "_terminal_cleaned_up", False)
+                     and self.process_uses_pty_engine()
+                     and self.real_terminal_available())
+        # Erst beide stoppen: Bei einem Ansichtswechsel darf kein veralteter
+        # Timeout mehr die inzwischen ausgeblendete Ansicht bearbeiten.
+        assist_timer.stop()
+        auto_timer.stop()
+        if supported:
+            if getattr(self, "real_terminal_active", False):
+                assist_timer.start()
+            else:
+                auto_timer.start()
+
+    def suppress_auto_vt_for_current_program(self):
+        """Nach manuellem Ausschalten nicht denselben Vordergrundjob reaktivieren."""
+        identity = None
+        process = getattr(self, "process", None)
+        if process is not None and self.process_uses_pty_engine():
+            probe = getattr(process, "foreground_guide", None)
+            try:
+                identity = probe() if callable(probe) else None
+            except (OSError, RuntimeError, ValueError):
+                pass
+        self._auto_vt_suppressed_identity = identity
+
+    def _auto_vt_from_foreground(self):
+        """Bekanntes tatsaechliches PTY-Vordergrundprogramm ohne Restart anzeigen."""
+        if (getattr(self, "real_terminal_active", False)
+                or getattr(self, "_terminal_cleaned_up", False)
+                or not self.real_terminal_available()
+                or not self.process_uses_pty_engine()):
+            return False
+        process = getattr(self, "process", None)
+        probe = getattr(process, "foreground_guide", None)
+        if not callable(probe):
+            return False
+        try:
+            identity = probe()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        blocked = getattr(self, "_auto_vt_suppressed_identity", None)
+        if blocked is not None:
+            if identity == blocked:
+                return False
+            # Ein anderes Vordergrundjob darf die Automatik wieder nutzen.
+            self._auto_vt_suppressed_identity = None
+        if identity is None or identity[0] not in GUIDES:
+            return False
+        if not self.set_real_terminal_mode(True):
+            return False
+        self._notify_view_mode_changed()
+        return True
+
+    def _auto_vt_for_direct_command(self, command):
+        """Vor Ausfuehrung von 'vim datei' den existierenden PTY-Tab umschalten."""
+        if (self.real_terminal_active or not self.process_uses_pty_engine()
+                or not self.real_terminal_available()
+                or not direct_vt_program(command)):
+            return False
+        # Explizites neues Kommando hebt die Sperre fuer den vorherigen Job auf.
+        self._auto_vt_suppressed_identity = None
+        if not self.set_real_terminal_mode(True):
+            return False
+        self._notify_view_mode_changed()
+        return True
+
+    def _notify_view_mode_changed(self):
+        update = getattr(self.window, "update_view_menu_state", None)
+        if callable(update):
+            update()
+
     # --- Programmspezifische VT-Bedienhilfe --------------------------------
     def _refresh_detected_program(self):
         """Sicherer, lesender PTY-Vordergrundcheck pro Tab, nie /proc-Scanning."""
@@ -6190,9 +6284,19 @@ class ShellDeckTerminalWidget(QWidget):
                 self.terminal_grid.setFocus()
 
     def _show_detected_program_help(self):
+        # Identitaet nur beim Oeffnen pruefen. Der Dialog ist rein lesend;
+        # eine inzwischen beendete Sitzung darf keine Eingaben erhalten.
         guide = self._checked_detected_program()
-        if guide is not None:
-            QMessageBox.information(self, f"{guide.label} – Kurzhilfe", guide.help_text)
+        if guide is None:
+            return
+        from shelldeck_program_help_dialog import ProgramHelpDialog
+        dialog = ProgramHelpDialog(guide, self)
+        dialog.exec()
+        try:
+            if self.real_terminal_active and self.terminal_grid is not None:
+                self.terminal_grid.setFocus()
+        except RuntimeError:
+            pass  # Tab kann waehrend des Dialogs geschlossen worden sein.
 
     def _show_detected_program_actions(self):
         guide = self._checked_detected_program()
@@ -6262,13 +6366,13 @@ class ShellDeckTerminalWidget(QWidget):
                 widget.hide()
             self.terminal_grid.show()
             self.real_terminal_active = True
-            self._assist_timer.start()
+            self._update_auto_vt_timer()
             self._refresh_detected_program()
             if focus:
                 self.terminal_grid.setFocus()
         else:
             self.real_terminal_active = False
-            self._assist_timer.stop()
+            self._update_auto_vt_timer()
             self._refresh_detected_program()
             if self.terminal_grid is not None:
                 self.terminal_grid.hide()
@@ -6408,6 +6512,11 @@ class ShellDeckTerminalWidget(QWidget):
         raw = self._take_shell_output_chunk("stdout")
         if not raw:
             return
+        if (not getattr(self, "real_terminal_active", False)
+                and getattr(self.process, "_shelldeck_engine", "") == "pty"):
+            switch = getattr(self, "_auto_vt_from_foreground", None)
+            if callable(switch):
+                switch()
         if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
             self.terminal_grid.feed(raw)
             self._schedule_qprocess_output_pump()
@@ -6432,6 +6541,11 @@ class ShellDeckTerminalWidget(QWidget):
         raw = self._take_shell_output_chunk("stderr")
         if not raw:
             return
+        if (not getattr(self, "real_terminal_active", False)
+                and getattr(self.process, "_shelldeck_engine", "") == "pty"):
+            switch = getattr(self, "_auto_vt_from_foreground", None)
+            if callable(switch):
+                switch()
         if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
             self.terminal_grid.feed(raw)
             self._schedule_qprocess_output_pump()

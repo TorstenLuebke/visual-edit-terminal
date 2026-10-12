@@ -22,6 +22,8 @@ class ProgramGuide:
     exit_bytes: bytes
     help_text: str
     primary_label: str = "Beenden"
+    # Optional: Kapitel fuer deklarativ hinzugefuegte Programme.
+    help_sections: tuple = ()
 
 
 GUIDES = {
@@ -177,6 +179,40 @@ def encode_guide_keys(keys):
     return b"".join(encoded)
 
 
+def _validate_custom_help_sections(value):
+    """Begrenztes Datenformat, keine freien Aktionen oder HTML-Markup.
+
+    Optional: maximal 12 Kapitel, je 25 Eintraege. Das JSON wird nur
+    angezeigt, niemals als Kommando, Link oder HTML interpretiert.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not 1 <= len(value) <= 12:
+        raise ValueError("help_sections: 1 bis 12 Kapitel erwartet")
+    result = []
+    for section in value:
+        if not isinstance(section, dict):
+            raise ValueError("help_sections: Kapitel muss ein Objekt sein")
+        title, entries = section.get("title"), section.get("entries")
+        if (not isinstance(title, str) or not 1 <= len(title) <= 100
+                or not isinstance(entries, list) or not 1 <= len(entries) <= 25):
+            raise ValueError("help_sections: ungueltiger Titel oder Eintraege")
+        rows = []
+        for row in entries:
+            if not isinstance(row, dict):
+                raise ValueError("help_sections: Eintrag muss ein Objekt sein")
+            keys = row.get("keys", "")
+            description = row.get("description")
+            detail = row.get("detail", "")
+            if (not isinstance(keys, str) or len(keys) > 100
+                    or not isinstance(description, str) or not 1 <= len(description) <= 500
+                    or not isinstance(detail, str) or len(detail) > 1000):
+                raise ValueError("help_sections: ungueltiger Eintrag")
+            rows.append((keys, description, detail))
+        result.append((title, tuple(rows)))
+    return tuple(result)
+
+
 def load_user_guides(path=None):
     """Liest ein optionales Programmregister (Guides, Aliase, Fehlermeldungen).
 
@@ -217,10 +253,11 @@ def load_user_guides(path=None):
                     for alias in names)):
                 raise ValueError("ungueltiger, geschuetzter oder doppelter Alias")
             raw = encode_guide_keys(item["keys"])
+            sections = _validate_custom_help_sections(item.get("help_sections"))
         except (ValueError, KeyError, TypeError) as exc:
             diagnostics.append(f"programs[{index}]: {exc}")
             continue
-        guides[name] = ProgramGuide(name, label, raw, hint, primary_label=title)
+        guides[name] = ProgramGuide(name, label, raw, hint, primary_label=title, help_sections=sections)
         aliases.update({alias: name for alias in names})
     return guides, aliases, diagnostics
 
