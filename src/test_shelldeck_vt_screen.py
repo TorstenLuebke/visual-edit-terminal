@@ -105,6 +105,98 @@ class VtScreenTests(unittest.TestCase):
         s.feed("\x1b[?1l")
         self.assertFalse(s.application_cursor_keys())
 
+    def test_sgr_mouse_reporting_requires_both_tracking_and_1006(self):
+        s = self.make()
+        self.assertEqual(s.sgr_mouse_tracking_level(), 0)
+        s.feed("\x1b[?1000h")
+        self.assertEqual(s.sgr_mouse_tracking_level(), 0)
+        s.feed("\x1b[?1006h")
+        self.assertEqual(s.sgr_mouse_tracking_level(), 1000)
+        s.feed("\x1b[?1002h")
+        self.assertEqual(s.sgr_mouse_tracking_level(), 1002)
+        s.feed("\x1b[?1003h")
+        self.assertEqual(s.sgr_mouse_tracking_level(), 1003)
+        s.feed("\x1b[?1003l")
+        self.assertEqual(s.sgr_mouse_tracking_level(), 1002)
+        s.feed("\x1b[?1006l")
+        self.assertEqual(s.sgr_mouse_tracking_level(), 0)
+
+    def test_alternate_screen_preserves_shell_and_has_no_history(self):
+        s = self.make(rows=5, cols=30, enable_history=True)
+        s.feed("SHELL-PROMPT")
+        s.feed("\x1b[?1049h")
+        self.assertTrue(s.in_alternate_screen())
+        self.assertTrue(s.has_history())  # Main history still exists.
+        self.assertNotIn("SHELL-PROMPT", "".join(s.display()))
+        s.feed("HTOP")
+        self.assertIn("HTOP", s.display()[0])
+        self.assertFalse(s.scroll_history("up"))
+        self.assertIn("HTOP", s.display()[0])
+        s.feed("\x1b[?1049l")
+        self.assertFalse(s.in_alternate_screen())
+        self.assertIn("SHELL-PROMPT", s.display()[0])
+        self.assertNotIn("HTOP", "".join(s.display()))
+
+    def test_alternate_screen_switch_sequences_can_be_split_across_reads(self):
+        s = self.make(rows=4, cols=20, enable_history=True)
+        s.feed(b"BEFORE")
+        s.feed(b"\x1b[?10")
+        s.feed(b"49hAFTER")
+        self.assertTrue(s.in_alternate_screen())
+        self.assertIn("AFTER", s.display()[0])
+        s.feed(b"\x1b[?1049")
+        s.feed(b"l")
+        self.assertFalse(s.in_alternate_screen())
+        self.assertTrue(s.display()[0].startswith("BEFORE"))
+
+    def test_alternate_screen_scrolling_region_keeps_header_footer_stable(self):
+        """DECSTBM scrolls only the process list, never header/footer."""
+        s = self.make(rows=6, cols=24, enable_history=True)
+        s.feed("SHELL\x1b[?1049h")
+        for row, label in enumerate(
+            ("HEADER", "PROCESS-A", "PROCESS-B", "PROCESS-C", "PROCESS-D", "FOOTER"), 1
+        ):
+            s.feed(f"\x1b[{row};1H{label}")
+        # Scroll region from row 2 through 5 inclusive, like a fullscreen TUI.
+        s.feed("\x1b[2;5r\x1b[5;1H\x1bD")
+        lines = s.display()
+        self.assertTrue(lines[0].startswith("HEADER"))
+        self.assertTrue(lines[1].startswith("PROCESS-B"))
+        self.assertTrue(lines[2].startswith("PROCESS-C"))
+        self.assertTrue(lines[3].startswith("PROCESS-D"))
+        self.assertEqual(lines[4].strip(), "")
+        self.assertTrue(lines[5].startswith("FOOTER"))
+        # Reverse-index must move the same region back, not a fixed half.
+        s.feed("\x1b[2;1H\x1bM")
+        lines = s.display()
+        self.assertTrue(lines[0].startswith("HEADER"))
+        self.assertEqual(lines[1].strip(), "")
+        self.assertTrue(lines[2].startswith("PROCESS-B"))
+        self.assertTrue(lines[5].startswith("FOOTER"))
+        s.feed("\x1b[?1049l")
+        self.assertTrue(s.display()[0].startswith("SHELL"))
+
+    def test_alternate_screen_does_not_change_other_terminal_tabs(self):
+        first = self.make(rows=4, cols=20, enable_history=True)
+        second = self.make(rows=4, cols=20, enable_history=True)
+        second.feed("OTHER")
+        first.feed("\x1b[?47h")
+        self.assertTrue(first.in_alternate_screen())
+        self.assertFalse(second.in_alternate_screen())
+        self.assertEqual(second.display()[0].strip(), "OTHER")
+        first.feed("\x1b[?47l")
+        self.assertFalse(first.in_alternate_screen())
+
+    def test_alternate_scroll_is_opt_in(self):
+        s = self.make()
+        self.assertFalse(s.alternate_scroll_mode())
+        s.feed("\x1b[?1049h")
+        self.assertFalse(s.alternate_scroll_mode())
+        s.feed("\x1b[?1007h")
+        self.assertTrue(s.alternate_scroll_mode())
+        s.feed("\x1b[?1007l")
+        self.assertFalse(s.alternate_scroll_mode())
+
     def test_bracketed_paste_mode(self):
         s = self.make()
         self.assertFalse(s.bracketed_paste())

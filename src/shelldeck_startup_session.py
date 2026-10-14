@@ -33,6 +33,42 @@ def has_controlling_terminal():
         os.close(fd)
 
 
+
+def _relaunch_executable(args):
+    """Find the actual program to relaunch, including Nuitka standalone.
+
+    Some Linux standalone builds expose a non-existent ``sys.executable``
+    (e.g. ``main.dist/python``).  Never attempt to spawn that phantom file.
+    A running ELF is available via /proc/self/exe even if started by a
+    desktop wrapper or through a symlink.
+    """
+    executable = sys.executable
+    if args and Path(args[0]).suffix.lower() in {".py", ".pyw"}:
+        return executable  # Source run: restart the Python interpreter.
+
+    # A usable absolute interpreter/application is always the first choice.
+    if os.path.isfile(executable) and os.access(executable, os.X_OK):
+        return executable
+
+    # When the executable path is broken, fall back to the running Linux ELF.
+    # The fallback is relevant only for a compiled executable; preserve the
+    # old behavior for callers that pass a synthetic, non-existent app path.
+    candidate = Path(args[0]) if args else None
+    actual_binary = bool(candidate and candidate.is_file() and os.access(candidate, os.X_OK))
+    compiled = bool(globals().get("__compiled__", False) or getattr(sys, "frozen", False))
+    if sys.platform.startswith("linux") and (compiled or actual_binary):
+        try:
+            running_binary = os.readlink("/proc/self/exe")
+            if os.path.isfile(running_binary) and os.access(running_binary, os.X_OK):
+                return running_binary
+        except OSError:
+            pass
+
+    if actual_binary:
+        return str(candidate.resolve())
+    return executable
+
+
 def relaunch_without_controlling_tty(argv=None):
     """Isolate GUI starts launched from a terminal, not normal desktop starts.
 
@@ -46,9 +82,8 @@ def relaunch_without_controlling_tty(argv=None):
         return None
 
     args = list(sys.argv if argv is None else argv)
-    executable = sys.executable
-    # Source run: python src/main.py. Nuitka standalone: sys.executable is
-    # the compiled application and must NOT be given its own path as a script.
+    executable = _relaunch_executable(args)
+    # Source runs take the script argument; compiled applications do not.
     if args and Path(args[0]).suffix.lower() in {".py", ".pyw"}:
         command = [executable, *args]
     else:

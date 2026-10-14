@@ -1,9 +1,8 @@
-"""Einheitliche ShellDeck-Versionsquelle, ohne Qt- oder Plattformabhängigkeiten.
+"""Zentrale ShellDeck-Versionsquelle für Quellstart und gepackte Programme.
 
-Die Datei ``versions.txt`` liegt im Projektverzeichnis bzw. neben einer
-paketierten Anwendung. Ihr Inhalt ist die alleinige wartbare Versionsangabe.
-Falls sie bei einer fehlerhaften Installation fehlt, wird der letzte bekannte
-Wert verwendet, damit ShellDeck weiter starten kann.
+``version.txt`` ist die maßgebliche Versionsdatei. Ältere Installationen,
+welche nur ``versions.txt`` enthalten, bleiben lesbar. Für Releases muss
+``version.txt`` als Datendatei neben dem kompilierten Programm liegen.
 """
 
 from __future__ import annotations
@@ -17,21 +16,32 @@ _VERSION_FORMAT = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z][0-9A-Za-
 
 
 def version_file_locations() -> tuple[Path, ...]:
-    """Moegliche Ressourcenorte für Source-Start und gepackte Programme."""
+    """Sucht zuerst die neue Datei, erst danach den alten Dateinamen.
+
+    Bei Nuitka-Standalone liegt ``sys.executable`` im ``.dist``-Ordner;
+    ``__file__`` kann dagegen auf ein Modul im Paket verweisen. Der
+    Programmordner hat deshalb bei gebauten Anwendungen Vorrang.
+    """
     module_dir = Path(__file__).resolve().parent
-    candidates = []
-    if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / "versions.txt")
+    roots: list[Path] = []
+
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        roots.append(Path(sys.executable).resolve().parent)
         bundle = getattr(sys, "_MEIPASS", None)
         if bundle:
-            candidates.append(Path(bundle) / "versions.txt")
-    # src/main.py kann unabhaengig vom aktuellen Arbeitsverzeichnis starten.
-    candidates.extend((module_dir.parent / "versions.txt", module_dir / "versions.txt"))
-    return tuple(dict.fromkeys(candidates))
+            roots.append(Path(bundle))
+
+    # Quellstart mit src/main.py, unabhängig vom Arbeitsverzeichnis.
+    roots.extend((module_dir.parent, module_dir))
+    roots = list(dict.fromkeys(roots))
+
+    # Auch wenn ein alter Dateiname an einem früheren Suchort liegt,
+    # gewinnt stets die neue version.txt aus einem späteren Suchort.
+    return tuple(root / name for name in ("version.txt", "versions.txt") for root in roots)
 
 
 def load_version(path: Path | None = None) -> str:
-    """Liest eine einzige SemVer-artige Zeile aus ``versions.txt``."""
+    """Liest eine einzelne SemVer-artige Zeile; fällt sonst sicher zurück."""
     candidates = (Path(path),) if path is not None else version_file_locations()
     for candidate in candidates:
         try:

@@ -10,6 +10,20 @@ Erstellt mit **Visual Edit** am 2026-05-10.
 
 Siehe Startdatei in `src/`.
 
+### Nuitka-Standalone-Start (Patch 060)
+
+Beim Start aus einer vorhandenen Konsole trennt ShellDeck seine GUI auf
+POSIX-Systemen vom steuernden Terminal (Schutz vor SIGTTIN). Im Python-Quelllauf
+wird weiterhin der Python-Interpreter gestartet. Bei einem Nuitka-Build kann
+`sys.executable` dagegen auf eine nicht vorhandene Datei `python` im `.dist`-
+Verzeichnis zeigen. Unter Linux wird in diesem Fall das tatsächlich laufende
+Programm über `/proc/self/exe` neu gestartet, ohne es als Python-Skript zu
+behandeln. Der normale Desktopstart und andere Tabs bleiben unverändert.
+
+Der Regressionstest ist in `src/test_shelldeck_startup_session.py` enthalten.
+Das behebt den fehlenden Relaunch-Pfad; ein davon unabhängiger Segmentation-Fault
+im kompilierten Programm muss separat untersucht werden.
+
 ## Kommandozeile
 
 ShellDeck versteht die von Terminal-Emulatoren üblichen Startargumente. Die
@@ -95,6 +109,30 @@ Terminal (VT)". Dann werden Vollbild-Programme wie `vim`, `htop`, `less` oder
 Im echten Terminalmodus rendert ShellDeck ein echtes Zellgitter (Farben,
 Cursor, Auswahl/Kopieren mit `Ctrl+Shift+C`, Einfügen mit `Ctrl+Shift+V` oder
 Mittelklick, Scrollback per Mausrad) und meldet die Fenstergröße an das PTY.
+
+### Maussteuerung fuer interaktive Programme (Patches 051–056)
+
+Wenn eine Anwendung per DECSET **SGR 1006** und einen Mausmodus **1000**
+(Klicks), **1002** (zusaetzlich Ziehen) oder **1003** (alle Bewegungen)
+aktiviert, sendet ShellDeck Mausereignisse direkt an **dieses** PTY. Dazu
+gehoeren Klicks, Loslassen, Ziehen, Bewegungen und das Mausrad (xterm-SGR,
+Zellkoordinaten ab 1). Die einzelnen Terminal-Tabs bleiben unabhaengig.
+
+Ohne explizit ausgehandeltes SGR-Mausprotokoll bleiben das normale Markieren,
+Kopieren und der lokale Scrollback unveraendert. **Umschalt + Ziehen** erzwingt
+die lokale Auswahl, **Umschalt + Rechtsklick** das Kontextmenue und
+**Umschalt + Mausrad** den lokalen Scrollback im normalen Shell-Bildschirm,
+auch wenn eine Anwendung Mausereignisse anfordert. **Ausnahme:** Bei einem
+aktiven Vollbildprogramm im alternativen Bildschirm bleibt der normale
+Shell-Verlauf grundsaetzlich unveraendert; das Mausrad darf ihn dort nicht
+verschieben. Mit 1000 ohne 1006 wird absichtlich kein falsches
+Mausprotokoll erzeugt. Ueberpruefbar mit Qt-Ereignis-Regressionstests, einem
+Qt-freien Protokolltest und einem echten Linux-PTY-Test.
+
+Die Ausbaustufe umfasst **SGR-Mausberichte**, aber noch nicht alle aelteren
+Mausprotokolle (X10, UTF-8 1005, urxvt 1015) oder plattformuebergreifende
+Funktionstests auf Windows/macOS. Diese Unterschiede werden gesondert
+geprueft. Es wurden keine neuen Laufzeitbibliotheken aufgenommen.
 
 Die zeilenbasierten Zusatzfunktionen (Befehls-Tabelle, Prompt-Leiste, KI-Prompt)
 gehören zum klassischen Modus und bleiben dort vollständig erhalten; „Reines
@@ -405,6 +443,23 @@ plattformgleiche Erweiterung ist vorgesehen, nicht bereits implementiert.
 - Tests: `PYTHONPATH=src QT_QPA_PLATFORM=offscreen python -m pytest -q
   src/test_shelldeck_terminal_grid.py` und anschliessend alle Tests.
 
+### Getrennter Haupt- und Vollbildschirm (Patch 061 ff.)
+
+VT-Programme wie `vim`, `htop`, `nano` und `less` koennen mit DECSET `?47`,
+`?1047` oder `?1049` einen **alternativen Bildschirm** aktivieren. ShellDeck
+verwendet dafuer jetzt einen eigenen, verlaufsfreien pyte-Screen. Verlassen
+sie ihn, wird der bisherige Shell-Bildschirm mitsamt Verlauf wieder sichtbar.
+Auch ueber mehrere PTY-Lesebloecke verteilte Steuersequenzen werden von
+**einem** fortlaufenden VT-Parser verarbeitet. Die Trennung gilt pro Tab.
+
+Im alternativen Bildschirm veraendert ein nicht ausgehandeltes Mausrad-Ereignis
+nicht den lokalen Verlauf. Wurde xterm-Modus **1007** explizit aktiviert, wird
+das Rad stattdessen in Auf-/Ab-Cursortasten umgesetzt. Bei aktiviertem
+SGR-Mausmodus werden Mausberichte unveraendert an die Anwendung gesendet.
+
+Regressionen: `test_shelldeck_vt_screen.py`,
+`test_shelldeck_alternate_router.py`, `test_shelldeck_terminal_grid.py`.
+
 ### Zwischenablage im echten VT-Modus
 
 Text mit der Maus markieren und per Rechtsklick kopieren oder einfuegen.
@@ -450,15 +505,21 @@ nur die ältesten Verlaufszeilen verloren. Der sichtbare Bildschirm, Cursor,
 VT-Parser und laufende Terminalprozesse werden dabei nicht zurückgesetzt.
 Die klassische Scrollback-Einstellung bleibt unabhängig.
 
-### Versionsangabe (Patch 037)
+### Versionsangabe (Patches 037 und 059)
 
-Die Datei **`versions.txt`** im ShellDeck-Projektverzeichnis enthält die
+Die Datei **`version.txt`** im ShellDeck-Projektverzeichnis enthält die
 aktuelle Version (eine Zeile, z. B. `2.16.0`). Sie wird beim Start eingelesen;
 **Fenstertitel**, F1-Hilfe, interne Versionsangaben und **Hilfe → Über**
 verwenden denselben Wert. Nach einer Änderung ShellDeck neu starten.
-Bei Auslieferung von gepackten Anwendungen muss `versions.txt` als Ressource
-mitgeliefert werden (neben der Programmdatei oder im Bundle). Fehlt die Datei,
-startet ShellDeck mit dem zuletzt im Code hinterlegten Rückfallwert.
+Bei Auslieferung von gepackten Anwendungen muss `version.txt` als Ressource
+**neben der ausführbaren Datei** (z. B. `ShellDeck.dist/version.txt`) liegen.
+Unter Kompiler Pro **Versionsdatei → Auswählen → version.txt** verwenden und
+„Version bei jedem Erstellen aus dieser Datei übernehmen“ aktivieren, wenn
+auch die Paketversion synchronisiert werden soll. Diese Einstellung allein
+garantiert nicht, dass die Datei im Laufzeit-Bundle landet; das ist nach dem
+Build gesondert zu prüfen. Ältere Installationen mit ausschließlich
+`versions.txt` werden weiterhin gelesen. Fehlen beide Dateien,
+startet ShellDeck mit dem im Code hinterlegten Rückfallwert.
 
 ### Private VT/ANSI-Farbsequenzen (Patch 038–039)
 

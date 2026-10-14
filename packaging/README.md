@@ -72,3 +72,22 @@ separates Projekt.
 Dieselbe Integration ist auch direkt aus ShellDeck heraus über
 **Einstellungen → Systemintegration…** verfügbar (installieren/entfernen,
 Statusanzeige). Die Logik liegt in `src/shelldeck_system_integration.py`.
+
+## Gemeinsame Versionsdatei für Kompiler Pro und ShellDeck
+
+Im Projektstamm liegt **`version.txt`**, genau eine Zeile (z. B. `2.16.0`).
+In **Setup konfigurieren → Versionsdatei → Auswählen** diese Datei wählen
+und optional die automatische Übernahme der Paketversion einschalten.
+Die Versionsanzeige in **Hilfe → Über**, F1 und dem Fenstertitel wird von
+ShellDeck aus derselben Datei geladen.
+
+**Nuitka-Standalone:** `version.txt` muss zusätzlich als Datendatei neben
+dem erzeugten `ShellDeck`-Programm im `.dist`-Ordner enthalten sein, damit
+die installierte Anwendung sie zur Laufzeit findet. Prüfen, ob Kompiler Pro
+die ausgewählte Versionsdatei tatsächlich mitliefert. Andernfalls die
+Datendatei im Buildprozess ergänzen, beispielsweise mit der Nuitka-Option
+`--include-data-files=version.txt=version.txt`.
+
+Version in der Datei vor dem Build festlegen und die Anzeigen im installierten
+Programm sowie die Paketversion separat kontrollieren. Keine Anpassungen am
+System-Python erforderlich.

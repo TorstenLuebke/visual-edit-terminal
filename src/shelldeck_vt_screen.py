@@ -64,11 +64,151 @@ class _PrivateSgrCompatibility:
 
 
 if pyte is not None:
-    class _CompatibleHistoryScreen(_PrivateSgrCompatibility, pyte.HistoryScreen):
-        """pyte-HistoryScreen mit kompatibler Behandlung privater SGR-Codes."""
+    class _RegionScrollCompatibility:
+        """Move actual cell rows for SU/SD inside DECSTBM (zero-based margins).
 
-    class _CompatibleScreen(_PrivateSgrCompatibility, pyte.Screen):
-        """pyte-Screen ohne History mit derselben SGR-Absicherung."""
+        The default pyte scrolling behavior differs from the VT reference for
+        a partially populated scrolling region. Keep this workaround local to
+        ShellDeck's alternate screen; the history-enabled shell is unchanged.
+        Scrolls move *row buffers*, including styling, not rendered strings.
+        """
+
+        def _region_bounds(self):
+            margins = self.margins
+            if margins is None:
+                return 0, self.lines - 1
+            top = max(0, int(margins.top))
+            bottom = min(self.lines - 1, int(margins.bottom))
+            return top, bottom
+
+        @staticmethod
+        def _scroll_count(count, height):
+            # CSI 0 S / CSI 0 T mean one line, just as omitted parameters do.
+            amount = 1 if not count else int(count)
+            return min(max(1, amount), height)
+
+        def scroll_up(self, count=None):
+            top, bottom = self._region_bounds()
+            if bottom < top:
+                return
+            count = self._scroll_count(count, bottom - top + 1)
+            old = {y: self.buffer.get(y) for y in range(top, bottom + 1)}
+            for y in range(top, bottom + 1):
+                source = y + count
+                if source <= bottom and old[source] is not None:
+                    self.buffer[y] = old[source]
+                else:
+                    self.buffer.pop(y, None)
+            self.dirty.update(range(top, bottom + 1))
+
+        def scroll_down(self, count=None):
+            top, bottom = self._region_bounds()
+            if bottom < top:
+                return
+            count = self._scroll_count(count, bottom - top + 1)
+            old = {y: self.buffer.get(y) for y in range(top, bottom + 1)}
+            for y in range(top, bottom + 1):
+                source = y - count
+                if source >= top and old[source] is not None:
+                    self.buffer[y] = old[source]
+                else:
+                    self.buffer.pop(y, None)
+            self.dirty.update(range(top, bottom + 1))
+
+    class _CompatibleHistoryScreen(_RegionScrollCompatibility, _PrivateSgrCompatibility, pyte.HistoryScreen):
+        """Normal VT screen with history and explicit SU/SD support."""
+
+    class _CompatibleScreen(_RegionScrollCompatibility, _PrivateSgrCompatibility, pyte.Screen):
+        """Alternate VT screen with isolated scroll-region and SGR fixes."""
+
+    class _CompatibleStream(pyte.Stream):
+        """Recognize SU/SD CSI commands absent from pyte's default CSI table.
+
+        Use a subclass-local dispatch table; never mutate pyte.Stream.csi
+        globally, because other applications can use pyte in this process.
+        """
+        csi = dict(pyte.Stream.csi, S="scroll_up", T="scroll_down")
+
+
+class _ScreenBuffers:
+    """Stable pyte event receiver for main and alternate VT screens.
+
+    A single Stream must parse CSI commands across PTY read boundaries.  It
+    therefore keeps one listener for its entire lifetime; changing that
+    listener when receiving CSI ?1049h would reset the parser mid-stream.
+    Stream binds event callables at construction time, so __getattr__ supplies
+    late-dispatching methods that always target the currently active screen.
+    """
+
+    _ALT_CODES = frozenset((47, 1047, 1049))
+
+    def __init__(self, normal, alternate):
+        self.normal = normal
+        self.alternate = alternate
+        self._active = normal
+        self._alt_modes = set()
+        self._alt_was_used = False
+
+    @property
+    def alternate_active(self) -> bool:
+        return self._active is self.alternate
+
+    @property
+    def history(self):
+        # All saved history belongs to the normal screen, never the TUI.
+        return getattr(self.normal, "history")
+
+    @history.setter
+    def history(self, value):
+        self.normal.history = value
+
+    def __getattr__(self, name):
+        value = getattr(self._active, name)
+        if not callable(value):
+            return value
+
+        def dispatch(*args, **kwargs):
+            return getattr(self._active, name)(*args, **kwargs)
+        return dispatch
+
+    def set_mode(self, *modes, **kwargs):
+        requested = self._ALT_CODES.intersection(modes) if kwargs.get("private") else set()
+        if requested and not self.alternate_active:
+            # DECSET 47 retains the old alternate contents; 1047 and 1049
+            # start with an empty alternate viewport. A newly created buffer
+            # is empty in either case.
+            if not self._alt_was_used or requested.intersection((1047, 1049)):
+                self.alternate.reset()
+            self._alt_was_used = True
+            # Keep global modes (e.g. DECCKM) active on entry, but isolate
+            # subsequent changes from the normal shell's saved screen.
+            self.alternate.mode.update(self.normal.mode)
+            self._active = self.alternate
+            self.alternate.dirty.update(range(self.alternate.lines))
+        self._alt_modes.update(requested)
+        self._active.set_mode(*modes, **kwargs)
+
+    def reset_mode(self, *modes, **kwargs):
+        requested = self._ALT_CODES.intersection(modes) if kwargs.get("private") else set()
+        self._active.reset_mode(*modes, **kwargs)
+        if requested:
+            self._alt_modes.difference_update(requested)
+            if not self._alt_modes and self.alternate_active:
+                self._active = self.normal
+                self.normal.dirty.update(range(self.normal.lines))
+
+    def reset(self):
+        self.normal.reset()
+        self.alternate.reset()
+        self._active = self.normal
+        self._alt_modes.clear()
+        self._alt_was_used = False
+
+    def resize(self, lines, columns):
+        # Even a hidden screen needs the new geometry before it is restored.
+        self.normal.resize(lines, columns)
+        self.alternate.resize(lines, columns)
+        self._active.dirty.update(range(lines))
 
 
 class VtScreen:
@@ -87,15 +227,18 @@ class VtScreen:
         self._cols = max(1, int(cols))
         self._history_limit = normalize_vt_scrollback_lines(history)
         if enable_history:
-            # ratio bestimmt, wie viele Zeilen pro Seitenwechsel gescrollt
-            # werden; history die Gesamttiefe des Scrollback-Puffers.
-            self.screen = _CompatibleHistoryScreen(
+            # Verlauf ausschliesslich auf dem normalen Bildschirm speichern.
+            main_screen = _CompatibleHistoryScreen(
                 self._cols, self._rows,
                 history=max(self._rows, self._history_limit), ratio=0.5,
             )
         else:
-            self.screen = _CompatibleScreen(self._cols, self._rows)
-        self.stream = pyte.Stream(self.screen)
+            main_screen = _CompatibleScreen(self._cols, self._rows)
+        self.screen = _ScreenBuffers(
+            normal=main_screen,
+            alternate=_CompatibleScreen(self._cols, self._rows),
+        )
+        self.stream = _CompatibleStream(self.screen)
         # Inkrementeller UTF-8-Dekoder: Mehrbyte-Zeichen dürfen über PTY-Lese-
         # grenzen hinweg zerteilt ankommen, ohne dass Ersatzzeichen entstehen.
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -232,12 +375,41 @@ class VtScreen:
         mode = getattr(self.screen, "mode", set())
         return (2004 << 5) in mode or 2004 in mode
 
+    def sgr_mouse_tracking_level(self) -> int:
+        """Aktiven xterm-Mausmodus zurueckgeben, oder 0 (normale Auswahl).
+
+        ShellDeck sendet nur SGR-1006-Mausberichte: traditionelle X10- und
+        UTF-8-Koordinatenformate sind absichtlich nicht stillschweigend
+        mit einem unpassenden Byteformat vermischt. Fuer 1000 gelten Klicks,
+        fuer 1002 zusaetzlich Ziehen und fuer 1003 jede Mausbewegung.
+        """
+        modes = getattr(self.screen, "mode", set())
+        def enabled(code):
+            return (code << 5) in modes or code in modes
+        if not enabled(1006):
+            return 0
+        for code in (1003, 1002, 1000):
+            if enabled(code):
+                return code
+        return 0
+
     # --- Scrollback (optional, nur bei HistoryScreen) ---------------------
     def has_history(self) -> bool:
         return hasattr(self.screen, "history")
 
+    def in_alternate_screen(self) -> bool:
+        """True, while a full-screen TUI owns the separate VT viewport."""
+        return bool(getattr(self.screen, "alternate_active", False))
+
+    def alternate_scroll_mode(self) -> bool:
+        """Xterm 1007 explicitly asks for wheel-to-cursor-key conversion."""
+        modes = getattr(self.screen, "mode", set())
+        return (1007 << 5) in modes or 1007 in modes
+
     def scroll_history(self, direction: str) -> bool:
-        """Blättert im Scrollback (nur HistoryScreen). direction: 'up'|'down'."""
+        """Blättert im normalen Scrollback, niemals durch eine aktive TUI."""
+        if self.in_alternate_screen():
+            return False
         if direction == "up" and hasattr(self.screen, "prev_page"):
             self.screen.prev_page()
             return True

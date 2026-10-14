@@ -84,7 +84,7 @@ class RealTerminalModeTests(unittest.TestCase):
         """Die optionale Hilfsleiste darf die klassische Ansicht nicht ersetzen."""
         w = self._make_widget()
         layout = w.layout()
-        assist_index = layout.indexOf(w._assist_panel)
+        assist_index = layout.indexOf(w._assist_slot)
         output_index = layout.indexOf(w.output_area)
         self.assertGreaterEqual(assist_index, 0)
         self.assertEqual(output_index, assist_index + 1)
@@ -95,6 +95,42 @@ class RealTerminalModeTests(unittest.TestCase):
         self.assertTrue(w.set_real_terminal_mode(False))
         self.assertGreaterEqual(layout.indexOf(w.output_area), 0)
         self.assertFalse(w.output_area.isHidden())
+
+    def test_assist_visibility_preserves_terminal_geometry(self):
+        """Einblendung darf keinerlei Resize des VT-Gitters ausloesen."""
+        from PySide6.QtWidgets import QApplication
+        w = self._make_widget()
+        self.assertTrue(w.set_real_terminal_mode(True))
+        w.resize(1100, 700)
+        w.show()
+        QApplication.processEvents()
+        before = (w.terminal_grid.size(), w.terminal_grid.model().screen.lines,
+                  w.terminal_grid.model().screen.columns)
+        process = w.process
+        w.process.foreground_guide = lambda: ("htop", 321)
+        w._refresh_detected_program()
+        QApplication.processEvents()
+        self.assertFalse(w._assist_panel.isHidden())
+        after_show = (w.terminal_grid.size(), w.terminal_grid.model().screen.lines,
+                      w.terminal_grid.model().screen.columns)
+        self.assertEqual(before, after_show)
+        w.process.foreground_guide = lambda: None
+        w._refresh_detected_program()
+        QApplication.processEvents()
+        self.assertTrue(w._assist_panel.isHidden())
+        after_hide = (w.terminal_grid.size(), w.terminal_grid.model().screen.lines,
+                      w.terminal_grid.model().screen.columns)
+        self.assertEqual(before, after_hide)
+        w.close()
+
+    def test_each_tab_has_own_reserved_assist_area(self):
+        w1 = self._make_widget()
+        w2 = self._make_widget()
+        self.assertIsNot(w1._assist_slot, w2._assist_slot)
+        self.assertGreater(w1._assist_slot.height(), 0)
+        self.assertEqual(w1._assist_slot.height(), w2._assist_slot.height())
+        w1.close()
+        w2.close()
 
     def test_auto_vt_for_direct_command_does_not_restart_shell(self):
         w = self._make_widget()

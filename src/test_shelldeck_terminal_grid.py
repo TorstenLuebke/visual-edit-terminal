@@ -133,6 +133,41 @@ class TerminalGridViewTests(unittest.TestCase):
         view._repaint_dirty()
         self.assertEqual(view.updated_rects, [])
 
+    def test_fullscreen_repaint_is_whole_widget_after_scrolling_updates(self):
+        """TUI frames must not leave stale rows even with sparse dirty marks."""
+        from shelldeck_terminal_grid import TerminalGridView
+
+        class RecordingView(TerminalGridView):
+            def __init__(self):
+                self.repaints = []
+                super().__init__(rows=8, cols=30)
+
+            def update(self, *args):
+                self.repaints.append(args)
+
+        view = RecordingView()
+        self.addCleanup(view.close)
+        view.feed("SHELL\x1b[?1049h")
+        self.assertTrue(view.model().in_alternate_screen())
+        view.repaints.clear()
+        view.model().clear_dirty()
+        # Simulate a fullscreen program changing several rows while pyte
+        # reports only a partial region (or even no dirty rows at all).
+        view.feed("\x1b[4;1Hnew process")
+        self.assertEqual(view.repaints, [()])
+        view.repaints.clear()
+        view.model().clear_dirty()
+        view._repaint_dirty()
+        self.assertEqual(view.repaints, [()])
+        # Leaving the TUI restores the normal screen and its fast sparse path.
+        view.feed("\x1b[?1049l")
+        self.assertFalse(view.model().in_alternate_screen())
+        view.model().clear_dirty()
+        view.repaints.clear()
+        view.feed("SHELL-READY")
+        self.assertTrue(view.repaints)
+        self.assertTrue(all(len(args) == 4 for args in view.repaints))
+
     def test_model_reflects_feed(self):
         view = self._make()
         view.feed("abc")
@@ -199,7 +234,9 @@ class TerminalGridViewTests(unittest.TestCase):
         QApplication.clipboard().setText("vorher")
         menu = view._create_context_menu()
         actions = [a for a in menu.actions() if not a.isSeparator()]
-        self.assertEqual(len(actions), 4)
+        self.assertEqual(len(actions), 6)
+        self.assertEqual(actions[4].text(), "VT-Diagnose: Modell und Ansicht speichern …")
+        self.assertTrue(actions[4].isEnabled())
         self.assertFalse(actions[0].isEnabled())
         self.assertTrue(actions[1].isEnabled())
         view._sel_anchor, view._sel_head = (0, 0), (0, 4)
@@ -254,6 +291,123 @@ class TerminalGridViewTests(unittest.TestCase):
         # Ctrl+V wird weiterhin an vim und andere interaktive Tools gesendet.
         self.assertEqual(self._key(view, Qt.Key.Key_V, "\x16", Qt.KeyboardModifier.ControlModifier), b"\x16")
 
+    def test_sgr_mouse_events_are_isolated_per_tab(self):
+        from PySide6.QtCore import QPoint, QPointF, Qt
+
+        class MouseEvent:
+            def __init__(self, row, col, view, button=Qt.MouseButton.LeftButton,
+                         buttons=None, mods=Qt.KeyboardModifier.NoModifier, delta=120):
+                self._pos = QPointF((col + 0.5) * view._cell_w,
+                                    (row + 0.5) * view._cell_h)
+                self._button = button
+                self._buttons = button if buttons is None else buttons
+                self._mods = mods
+                self._delta = delta
+                self.accepted = False
+
+            def position(self): return self._pos
+            def button(self): return self._button
+            def buttons(self): return self._buttons
+            def modifiers(self): return self._mods
+            def angleDelta(self): return QPoint(0, self._delta)
+            def accept(self): self.accepted = True
+
+        tracked = self._make()
+        normal = self._make()
+        sent_tracked, sent_normal = [], []
+        tracked.dataReady.connect(lambda data: sent_tracked.append(bytes(data)))
+        normal.dataReady.connect(lambda data: sent_normal.append(bytes(data)))
+        # Verhandelte SGR-Berichte nur in einem Tab.
+        tracked.model().screen.mode.update({1000 << 5, 1002 << 5, 1006 << 5})
+        event = MouseEvent(3, 5, tracked)
+        tracked.mousePressEvent(event)
+        self.assertTrue(event.accepted)
+        self.assertEqual(sent_tracked[-1], b"\x1b[<0;6;4M")
+        tracked.mouseMoveEvent(MouseEvent(3, 6, tracked))
+        self.assertEqual(sent_tracked[-1], b"\x1b[<32;7;4M")
+        tracked.mouseReleaseEvent(MouseEvent(3, 6, tracked))
+        self.assertEqual(sent_tracked[-1], b"\x1b[<0;7;4m")
+        tracked.wheelEvent(MouseEvent(2, 2, tracked, delta=-120))
+        self.assertEqual(sent_tracked[-1], b"\x1b[<65;3;3M")
+
+        normal.mousePressEvent(MouseEvent(0, 0, normal))
+        normal.mouseMoveEvent(MouseEvent(0, 2, normal))
+        normal.mouseReleaseEvent(MouseEvent(0, 2, normal))
+        self.assertEqual(sent_normal, [])
+        self.assertTrue(normal.has_selection())
+        # Auch im Mausmodus erzwingt Shift die lokale Markierung.
+        count = len(sent_tracked)
+        shift = Qt.KeyboardModifier.ShiftModifier
+        tracked.mousePressEvent(MouseEvent(1, 1, tracked, mods=shift))
+        tracked.mouseMoveEvent(MouseEvent(1, 3, tracked, mods=shift))
+        tracked.mouseReleaseEvent(MouseEvent(1, 3, tracked, mods=shift))
+        self.assertEqual(len(sent_tracked), count)
+        self.assertTrue(tracked.has_selection())
+        # Ohne SGR 1006 duerfen wir niemals ein inkompatibles Format senden.
+        tracked.model().screen.mode.discard(1006 << 5)
+        tracked.mousePressEvent(MouseEvent(0, 0, tracked))
+        self.assertEqual(len(sent_tracked), count)
+
+    def test_mouse_motion_requires_tracking_level(self):
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+
+        # Echte Qt-Ereignisse verwenden: Bei nicht gemeldeten Bewegungen
+        # reicht das Widget den QMouseEvent an QWidget.mouseMoveEvent weiter.
+        # Ein selbstgebautes Test-Double wird von PySide6 dort abgelehnt.
+        def move_without_buttons():
+            return QMouseEvent(
+                QEvent.Type.MouseMove,
+                QPointF(3, 3),  # Position im Widget
+                QPointF(3, 3),  # Position im Fenster
+                QPointF(3, 3),  # Globale Position (offscreen-Test)
+                Qt.MouseButton.NoButton,
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+
+        view = self._make()
+        got = []
+        view.dataReady.connect(lambda data: got.append(bytes(data)))
+        view.model().screen.mode.update({1002 << 5, 1006 << 5})
+        view.mouseMoveEvent(move_without_buttons())
+        self.assertFalse(got)
+        view.model().screen.mode.add(1003 << 5)
+        view.mouseMoveEvent(move_without_buttons())
+        self.assertEqual(got, [b"\x1b[<35;1;1M"])
+
+    def test_alternate_screen_wheel_never_moves_normal_scrollback(self):
+        from PySide6.QtCore import QPoint, Qt
+
+        class Wheel:
+            def __init__(self, delta=120, mods=Qt.KeyboardModifier.NoModifier):
+                self.delta, self.mods, self.accepted = delta, mods, False
+            def angleDelta(self): return QPoint(0, self.delta)
+            def modifiers(self): return self.mods
+            def accept(self): self.accepted = True
+
+        view = self._make()
+        view.feed("SHELL\x1b[?1049hHTOP")
+        self.assertTrue(view.model().in_alternate_screen())
+        sent = []
+        view.dataReady.connect(lambda data: sent.append(bytes(data)))
+        before = list(view.model().display())
+        wheel = Wheel()
+        view.wheelEvent(wheel)
+        self.assertTrue(wheel.accepted)
+        self.assertEqual(view.model().display(), before)
+        self.assertEqual(sent, [])
+
+        # With xterm 1007 enabled the application, not history, scrolls.
+        view.feed("\x1b[?1007h")
+        view.wheelEvent(Wheel(-120))
+        self.assertEqual(sent[-1], b"\x1b[B")
+        sent.clear()
+        view.wheelEvent(Wheel(120, Qt.KeyboardModifier.ShiftModifier))
+        self.assertEqual(sent, [])
+        view.feed("\x1b[?1049l")
+        self.assertTrue(view.model().display()[0].startswith("SHELL"))
+
     def test_paste_emits_data(self):
         from PySide6.QtWidgets import QApplication
         view = self._make()
@@ -266,3 +420,65 @@ class TerminalGridViewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+@unittest.skipUnless(QT_OK and vt.is_available(), "Qt/pyte needed")
+class VtCellPaintIsolationTests(unittest.TestCase):
+    def test_extended_glyph_does_not_overwrite_neighbour_cells(self):
+        """A malformed/combined pyte cell cannot paint over adjacent columns."""
+        from PySide6.QtGui import QImage, QPainter
+        from PySide6.QtCore import QPoint
+        from shelldeck_terminal_grid import TerminalGridView
+
+        view = TerminalGridView(rows=3, cols=12)
+        self.addCleanup(view.close)
+        cw, ch = view.cell_size()
+        view.resize(int(12 * cw) + 3, int(3 * ch) + 3)
+        old = view.model().row_cells
+
+        def with_content(content):
+            def cells(y):
+                result = old(y)
+                if y == 0:
+                    result[0] = dict(result[0], char=content)
+                return result
+            view.model().row_cells = cells
+            image = QImage(view.size(), QImage.Format.Format_RGB32)
+            image.fill(0)
+            painter = QPainter(image)
+            try:
+                view.render(painter, QPoint(0, 0))
+            finally:
+                painter.end()
+            return image
+
+        base = with_content(" ")
+        oversized = with_content("MMMMMMMMMMMMMMMM")
+        # All pixels beyond the first cell, and below the first row, must
+        # remain exactly as before the oversized glyph was drawn.
+        x_start = int(cw) + 2
+        for y in range(oversized.height()):
+            for x in range(oversized.width()):
+                if x >= x_start or y >= int(ch) + 2:
+                    self.assertEqual(oversized.pixel(x, y), base.pixel(x, y),
+                                     (x, y))
+
+
+class VtTraceInitialSnapshotTests(unittest.TestCase):
+    """Startzustand muss bei spaeterem Rohdatenexport erhalten bleiben."""
+
+    def test_trace_keeps_start_model_without_writing_files(self):
+        from shelldeck_vt_trace import VtRawTrace
+        from shelldeck_vt_diagnostic import model_snapshot
+        from shelldeck_vt_screen import VtScreen
+        model = VtScreen(rows=4, cols=20)
+        model.feed(b"Anfang")
+        trace = VtRawTrace()
+        trace.start()
+        initial = model_snapshot(model)
+        first_geometry = (model.rows, model.cols)
+        model.feed(b"-spaeter")
+        trace.append(b"-spaeter")
+        self.assertEqual(first_geometry, (4, 20))
+        self.assertIn("Anfang", initial)
+        self.assertNotIn("spaeter", initial)
+        self.assertEqual(trace.stop(), b"-spaeter")

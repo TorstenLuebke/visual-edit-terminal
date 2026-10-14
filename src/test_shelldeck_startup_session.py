@@ -55,6 +55,44 @@ class StartupSessionTests(unittest.TestCase):
             self.assertEqual(startup.relaunch_without_controlling_tty(["/opt/ShellDeck", "--new-tab"]), 0)
         self.assertEqual(spawn.call_args.args[0], ["/opt/ShellDeck", "--new-tab"])
 
+    def test_compiled_nuitka_uses_running_elf_if_python_path_is_missing(self):
+        """Nuitka may report main.dist/python instead of main.dist/ShellDeck."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "ShellDeck"
+            binary.write_bytes(b"placeholder")
+            binary.chmod(0o755)
+            proc = Mock()
+            proc.wait.return_value = 0
+            with patch.object(startup.os, "name", "posix"), \
+                 patch.object(startup.sys, "platform", "linux"), \
+                 patch.object(startup, "has_controlling_terminal", return_value=True), \
+                 patch.object(startup.sys, "executable", str(binary.parent / "python")), \
+                 patch.object(startup.os, "readlink", return_value=str(binary)) as readlink, \
+                 patch.object(startup.subprocess, "Popen", return_value=proc) as spawn:
+                result = startup.relaunch_without_controlling_tty([str(binary), "--new-tab"])
+            self.assertEqual(result, 0)
+            readlink.assert_called_once_with("/proc/self/exe")
+            self.assertEqual(spawn.call_args.args[0], [str(binary), "--new-tab"])
+            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+
+    def test_normal_source_start_does_not_use_proc_self_exe(self):
+        with patch.object(startup.sys, "executable", "/missing/python"), \
+             patch.object(startup.os, "readlink") as readlink:
+            self.assertEqual(startup._relaunch_executable(["src/main.py"]), "/missing/python")
+        readlink.assert_not_called()
+
+    def test_standalone_without_proc_link_uses_real_argv_executable(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "ShellDeck"
+            binary.write_bytes(b"placeholder")
+            binary.chmod(0o755)
+            with patch.object(startup.sys, "platform", "linux"), \
+                 patch.object(startup.sys, "executable", str(binary.parent / "python")), \
+                 patch.object(startup.os, "readlink", side_effect=OSError("proc unavailable")):
+                self.assertEqual(startup._relaunch_executable([str(binary)]), str(binary))
+
     def test_child_signal_is_reported_as_shell_exit_code(self):
         proc = Mock()
         proc.wait.return_value = -11

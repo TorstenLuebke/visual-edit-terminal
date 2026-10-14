@@ -1489,7 +1489,14 @@ class ShellDeckTerminalWidget(QWidget):
         # Heuristiken; die Leiste erscheint nur fuer das gepruefte Vordergrundjob.
         self._assist_identity = None
         self._assist_process = None
-        self._assist_panel = QWidget(self)
+        # Der Platz fuer die Hilfsleiste ist dauerhaft reserviert. Das
+        # Einblenden eines Vordergrundprogramms darf weder Terminalzeilen
+        # noch die PTY-Fenstergroesse aendern.
+        self._assist_slot = QWidget(self)
+        slot_layout = QVBoxLayout(self._assist_slot)
+        slot_layout.setContentsMargins(0, 0, 0, 0)
+        slot_layout.setSpacing(0)
+        self._assist_panel = QWidget(self._assist_slot)
         assist_layout = QHBoxLayout(self._assist_panel)
         assist_layout.setContentsMargins(4, 2, 4, 2)
         assist_layout.setSpacing(6)
@@ -1510,8 +1517,12 @@ class ShellDeckTerminalWidget(QWidget):
         # Die Bedienhilfe ist nur ein zusaetzliches, anfangs verborgenes Widget.
         # output_area MUSS als eigenes Widget im Layout bleiben: Ohne diese
         # Zeile verschwindet die klassische Terminalanzeige vollstaendig.
-        layout.addWidget(self._assist_panel)
+        slot_layout.addWidget(self._assist_panel)
+        # Ein leerer Slot bleibt im Layout, auch wenn das innere Panel
+        # ausgeblendet ist. Keine dynamischen Spacer- oder Resize-Wechsel.
+        self._assist_slot.setFixedHeight(max(36, self._assist_panel.sizeHint().height()))
         self._assist_panel.hide()
+        layout.addWidget(self._assist_slot)
         layout.addWidget(self.output_area)
         # Zwei unabhaengige Aufgaben: Im echten VT-Modus die Bedienhilfe
         # aktualisieren, in der klassischen PTY-Ansicht neue Vordergrundjobs
@@ -3869,7 +3880,15 @@ class ShellDeckTerminalWidget(QWidget):
             self.schedule_restore_command(restore_command)
         return True
 
+    def _vt_trace_event(self, event, **fields):
+        grid = getattr(self, "terminal_grid", None)
+        if grid is not None:
+            recorder = getattr(grid, "trace_event", None)
+            if callable(recorder):
+                recorder(event, **fields)
+
     def resizeEvent(self, event):
+        getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("terminal_host_resize", width=self.width(), height=self.height())
         # Groessenaenderungen zusammenfassen: bei Ziehen des Fensterrands
         # darf keine unbeschraenkte Folge von 0-ms-Timern/SIGWINCH entstehen.
         super().resizeEvent(event)
@@ -3933,8 +3952,9 @@ class ShellDeckTerminalWidget(QWidget):
         rows, cols = size
         try:
             setter(rows, cols)
+            getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("pty_resize", rows=rows, cols=cols, success=True)
         except Exception:
-            pass
+            getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("pty_resize", rows=rows, cols=cols, success=False)
 
     def _reset_shell_transient_state(self):
         """Alte Echo-/Interaktionspuffer niemals in eine neue Shell übernehmen."""
@@ -6248,8 +6268,10 @@ class ShellDeckTerminalWidget(QWidget):
             )
             self._assist_more.setVisible(identity[0] == "vim")
             self._assist_panel.show()
+            getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("assist_panel", visible=True)
         else:
             self._assist_panel.hide()
+            getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("assist_panel", visible=False)
 
     def _checked_detected_program(self):
         """Unmittelbar vor der Aktion sicherstellen, dass der Job noch derselbe ist."""
@@ -6410,8 +6432,11 @@ class ShellDeckTerminalWidget(QWidget):
         if callable(setter):
             try:
                 setter(rows, cols)
+                getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("pty_resize_from_grid", rows=int(rows), cols=int(cols),
+                                     success=True)
             except Exception:
-                pass
+                getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("pty_resize_from_grid", rows=int(rows), cols=int(cols),
+                                     success=False)
         self._last_pty_size = (int(rows), int(cols))
 
     @staticmethod

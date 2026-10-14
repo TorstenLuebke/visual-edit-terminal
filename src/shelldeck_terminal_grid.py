@@ -20,13 +20,14 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Dict, Optional
 
-from PySide6.QtCore import Qt, QRect, QSize, QTimer, Signal
+from PySide6.QtCore import Qt, QRect, QRectF, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QMenu, QWidget
 
 from shelldeck_scrollback import normalize_vt_scrollback_lines
 
 import shelldeck_key_encoding as keyenc
+from shelldeck_mouse_protocol import encode_sgr_mouse
 import shelldeck_vt_screen as vt
 
 
@@ -126,12 +127,17 @@ class TerminalGridView(QWidget):
         # Auswahlzustand (Zeile, Spalte), jeweils inklusive.
         self._sel_anchor = None
         self._sel_head = None
+        self._local_mouse_selection = False
 
         self._cell_w = 1.0
         self._cell_h = 1.0
         self._ascent = 0.0
         self._last_cursor = None
 
+        from shelldeck_vt_trace import VtRawTrace
+        self._vt_raw_trace = VtRawTrace()
+        self._vt_trace_start_snapshot = None
+        self._vt_trace_start_geometry = None
         self._cursor_visible_phase = True
         self.cursor_blink = True
         self._blink_timer = QTimer(self)
@@ -184,6 +190,7 @@ class TerminalGridView(QWidget):
         """Rohbytes/Text in das Modell geben und betroffene Zeilen neu zeichnen."""
         if self._model is None:
             return
+        self._vt_raw_trace.append(data)
         self._model.feed(data)
         self._repaint_dirty()
 
@@ -207,6 +214,17 @@ class TerminalGridView(QWidget):
                 dirty.add(self._last_cursor[1])
         self._last_cursor = cursor_state
         self._model.clear_dirty()
+        if self._model.in_alternate_screen():
+            # Vollbildprogramme (htop/vim/mc) zeichnen viele getrennte Bereiche
+            # eines Frames gleichzeitig um, teils mit DECSTBM-Scrollregionen.
+            # pytes Dirty-Zeilen beschreiben nicht in allen Faellen den ganzen
+            # sichtbaren Veraenderungsbereich. Ein unvollstaendiger Qt-Repaint
+            # laesst sonst alte Glyphen mitten in der Prozessliste stehen.
+            # QWidget.update() fasst Aufrufe bis zum naechsten Paint-Event
+            # zusammen. Der schnelle partielle Pfad fuer Shell/Scrollback
+            # bleibt unten unveraendert.
+            self.update()
+            return
         spans = _coalesce_dirty_rows(dirty, self._model.rows)
         if not spans:
             return
@@ -228,7 +246,10 @@ class TerminalGridView(QWidget):
         if self._model is None:
             return
         rows, cols = self._grid_size_for(self.width(), self.height())
+        old_rows, old_cols = self._model.rows, self._model.cols
         if self._model.resize(rows, cols):
+            self.trace_event("grid_cells_changed", old_rows=old_rows, old_cols=old_cols,
+                             rows=rows, cols=cols)
             # Bei einer veraenderten Zellgeometrie sind alle Zeilen neu zu
             # zeichnen, nicht nur die von Qt neu freigelegte Fensterregion.
             self._last_cursor = None
@@ -236,6 +257,7 @@ class TerminalGridView(QWidget):
             self.sizeChanged.emit(rows, cols)
 
     def resizeEvent(self, event) -> None:
+        self.trace_event("grid_widget_resize", width=self.width(), height=self.height())
         super().resizeEvent(event)
         self._apply_grid_from_size()
 
@@ -247,6 +269,7 @@ class TerminalGridView(QWidget):
 
     # --- Fokus/Cursor-Blinken --------------------------------------------
     def focusInEvent(self, event) -> None:
+        self.trace_event("grid_focus_in")
         super().focusInEvent(event)
         if self.cursor_blink:
             self._cursor_visible_phase = True
@@ -254,6 +277,7 @@ class TerminalGridView(QWidget):
         self.update()
 
     def focusOutEvent(self, event) -> None:
+        self.trace_event("grid_focus_out")
         super().focusOutEvent(event)
         self._blink_timer.stop()
         self._cursor_visible_phase = True
@@ -270,10 +294,34 @@ class TerminalGridView(QWidget):
 
     # --- Scrollback (Mausrad) --------------------------------------------
     def wheelEvent(self, event) -> None:
+        # In einem TUI mit aktivierter xterm-Maussteuerung gehoert das Rad
+        # dem Programm, nicht dem pyte-Verlauf. Umschalt erzwingt Scrollback.
+        delta = event.angleDelta().y()
+        if self._mouse_tracking_level() and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            if delta:
+                count = min(8, max(1, abs(delta) // 120))
+                kind = "wheel_up" if delta > 0 else "wheel_down"
+                for _ in range(count):
+                    self._send_sgr_mouse(kind, event)
+            event.accept()
+            return
+        if self._model is not None and self._model.in_alternate_screen():
+            # A TUI renders its own viewport. Paging pyte.HistoryScreen here
+            # would mix saved shell lines with htop/vim's live screen.
+            # Xterm 1007 may instead request cursor keys for wheel events.
+            if delta and self._model.alternate_scroll_mode() and not (
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            ):
+                key = b"\x1b[A" if delta > 0 else b"\x1b[B"
+                steps = min(8, max(1, abs(delta) // 120))
+                self.dataReady.emit(key * steps)
+            event.accept()
+            return
         if self._model is None or not self._model.has_history():
             super().wheelEvent(event)
             return
-        delta = event.angleDelta().y()
         if delta > 0:
             self._model.scroll_history("up")
         elif delta < 0:
@@ -357,6 +405,41 @@ class TerminalGridView(QWidget):
         else:
             super().keyPressEvent(event)
 
+    # --- xterm-SGR-Mausereignisse (nur nach ausdruecklicher Anforderung) --
+    def _mouse_tracking_level(self) -> int:
+        if self._model is None:
+            return 0
+        return self._model.sgr_mouse_tracking_level()
+
+    @staticmethod
+    def _button_name(button):
+        if button == Qt.MouseButton.LeftButton:
+            return "left"
+        if button == Qt.MouseButton.MiddleButton:
+            return "middle"
+        if button == Qt.MouseButton.RightButton:
+            return "right"
+        return None
+
+    @staticmethod
+    def _drag_button(buttons):
+        for qt_button, name in ((Qt.MouseButton.LeftButton, "left"),
+                                (Qt.MouseButton.MiddleButton, "middle"),
+                                (Qt.MouseButton.RightButton, "right")):
+            if buttons & qt_button:
+                return name
+        return None
+
+    def _send_sgr_mouse(self, kind, event, button="left") -> None:
+        row, col = self._cell_at(event.position().toPoint())
+        mods = event.modifiers()
+        self.dataReady.emit(encode_sgr_mouse(
+            kind, row, col, button=button,
+            shift=bool(mods & Qt.KeyboardModifier.ShiftModifier),
+            alt=bool(mods & Qt.KeyboardModifier.AltModifier),
+            ctrl=bool(mods & Qt.KeyboardModifier.ControlModifier),
+        ))
+
     # --- Mausauswahl / Zwischenablage ------------------------------------
     def _cell_at(self, pos):
         col = int(pos.x() // self._cell_w)
@@ -369,7 +452,19 @@ class TerminalGridView(QWidget):
 
     def mousePressEvent(self, event) -> None:
         self.setFocus()
+        # Shift behält die lokale Auswahl, selbst wenn die TUI Mausberichte
+        # aktiviert hat; ein Rechtsklick mit Shift oeffnet das Kontextmenue.
+        button = self._button_name(event.button())
+        if button and self._mouse_tracking_level() and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            self.clear_selection()
+            self._local_mouse_selection = False
+            self._send_sgr_mouse("press", event, button)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._model is not None:
+            self._local_mouse_selection = True
             self._sel_anchor = self._cell_at(event.position().toPoint())
             self._sel_head = self._sel_anchor
             self.update()
@@ -382,6 +477,16 @@ class TerminalGridView(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        level = self._mouse_tracking_level()
+        if level and not self._local_mouse_selection and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            pressed = self._drag_button(event.buttons())
+            if level == 1003 or (level == 1002 and pressed):
+                self._send_sgr_mouse("drag" if pressed else "move", event,
+                                     pressed or "left")
+                event.accept()
+                return
         if self._sel_anchor is not None and (event.buttons() & Qt.MouseButton.LeftButton):
             self._sel_head = self._cell_at(event.position().toPoint())
             self.update()
@@ -390,7 +495,15 @@ class TerminalGridView(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        button = self._button_name(event.button())
+        if button and self._mouse_tracking_level() and not self._local_mouse_selection and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            self._send_sgr_mouse("release", event, button)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._sel_anchor is not None:
+            self._local_mouse_selection = False
             # Reiner Klick ohne Ziehen hebt die Auswahl auf.
             if self._sel_head == self._sel_anchor:
                 self.clear_selection()
@@ -414,9 +527,139 @@ class TerminalGridView(QWidget):
         clear_action = menu.addAction("Markierung aufheben")
         clear_action.setEnabled(self.has_selection())
         clear_action.triggered.connect(self.clear_selection)
+        menu.addSeparator()
+        diagnostic = menu.addAction("VT-Diagnose: Modell und Ansicht speichern …")
+        diagnostic.setEnabled(self._model is not None)
+        diagnostic.triggered.connect(self.save_vt_diagnostic)
+        trace_action = menu.addAction(
+            "VT-Rohdatenaufzeichnung beenden …" if self._vt_raw_trace.active
+            else "VT-Rohdatenaufzeichnung starten …"
+        )
+        trace_action.setEnabled(self._model is not None)
+        trace_action.triggered.connect(self.toggle_vt_raw_trace)
         return menu
 
+    def trace_event(self, event, **fields):
+        trace = getattr(self, "_vt_raw_trace", None)
+        if trace is not None:
+            trace.event(event, **fields)
+
+    def toggle_vt_raw_trace(self) -> None:
+        """Record incoming PTY bytes only after an explicit privacy warning.
+
+        Start recording before launching htop, so the trace contains its entire
+        alternate-screen setup. Stop/export via Shift+right click. Raw data
+        may contain secrets and must be inspected before sharing.
+        """
+        trace = self._vt_raw_trace
+        if not trace.active and not trace.size:
+            answer = QMessageBox.warning(
+                self, "VT-Rohdaten – Datenschutz",
+                "Es werden die unveraenderten Terminal-Ausgabebytes inklusive "
+                "moeglicher vertraulicher Daten im Arbeitsspeicher aufgezeichnet "
+                "(maximal 4 MiB). Start bitte VOR dem Start von htop ausfuehren. "
+                "Die Aufzeichnung endet am Limit automatisch. Aufzeichnen?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                from shelldeck_vt_diagnostic import model_snapshot
+                trace.start()
+                self._vt_trace_start_snapshot = model_snapshot(self._model)
+                self._vt_trace_start_geometry = (self._model.rows, self._model.cols)
+                trace.event("trace_started", rows=self._model.rows, cols=self._model.cols,
+                            width=self.width(), height=self.height(),
+                            alternate=self._model.in_alternate_screen())
+            return
+        trace.event("trace_stopped", rows=self._model.rows, cols=self._model.cols,
+                    alternate=self._model.in_alternate_screen())
+        data = trace.stop()
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "VT-Rohdaten speichern", "ShellDeck_VT_Rohdaten.bin",
+            "Binaerdaten (*.bin)",
+        )
+        if not filename:
+            # Keep the stopped trace in memory for an explicit later export.
+            return
+        from pathlib import Path
+        path = Path(filename)
+        try:
+            path.write_bytes(data)
+            start_geometry = self._vt_trace_start_geometry
+            info = (f"bytes={len(data)}\ntruncated={trace.truncated}\n"
+                    f"rows={self._model.rows}\ncols={self._model.cols}\n"
+                    f"start_rows={start_geometry[0] if start_geometry else 'unknown'}\n"
+                    f"start_cols={start_geometry[1] if start_geometry else 'unknown'}\n")
+            path.with_suffix('.meta.txt').write_text(info, encoding='utf-8')
+            path.with_name(path.stem + '_Ereignisse.jsonl').write_text(
+                trace.events_jsonl(), encoding='utf-8'
+            )
+            if self._vt_trace_start_snapshot is not None:
+                path.with_name(path.stem + '_Startmodell.txt').write_text(
+                    self._vt_trace_start_snapshot, encoding='utf-8'
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, "VT-Rohdaten", f"Speichern fehlgeschlagen: {exc}")
+            return
+        trace._chunks.clear()
+        trace._size = 0
+        self._vt_trace_start_snapshot = None
+        self._vt_trace_start_geometry = None
+        QMessageBox.information(
+            self, "VT-Rohdaten gespeichert",
+            "Rohbytes und Startmodell wurden gespeichert. Bitte vor dem Weitergeben "
+            "auf vertrauliche Informationen pruefen. Ergaenzend die VT-Diagnose "
+            "(Modell und Ansicht) speichern.",
+        )
+
+    def save_vt_diagnostic(self) -> None:
+        """Explicit one-shot capture; never write terminal contents implicitly."""
+        if self._model is None:
+            return
+        reply = QMessageBox.warning(
+            self, "VT-Diagnose – vertrauliche Inhalte",
+            "Die Diagnose speichert den sichtbaren Terminalinhalt als Text "
+            "und Bildschirmfoto. Darin koennen Pfade, Prozessnamen, "
+            "Eingaben oder Zugangsdaten stehen. Dateien vor dem Teilen "
+            "bitte pruefen. Jetzt speichern?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "VT-Diagnose speichern", "ShellDeck_VT_Diagnose.txt",
+            "Textdateien (*.txt)",
+        )
+        if not filename:
+            return
+        from pathlib import Path
+        from shelldeck_vt_diagnostic import model_snapshot
+        path = Path(filename)
+        try:
+            # Snapshot is taken before rendering/grabbing to compare the same frame.
+            snapshot = model_snapshot(self._model)
+            screenshot = self.grab()
+            if screenshot.isNull() or not screenshot.save(str(path.with_suffix(".png")), "PNG"):
+                raise OSError("PNG konnte nicht gespeichert werden")
+            path.write_text(snapshot, encoding="utf-8")
+        except Exception as exc:
+            QMessageBox.warning(self, "VT-Diagnose", f"Speichern fehlgeschlagen: {exc}")
+            return
+        QMessageBox.information(
+            self, "VT-Diagnose gespeichert",
+            f"Gespeichert: {path.name} und {path.with_suffix('.png').name}\n"
+            "Bitte beide Dateien vor dem Weitergeben auf vertrauliche Inhalte pruefen.",
+        )
+
     def contextMenuEvent(self, event) -> None:
+        # Rechtsklick ist im Mausmodus eine Eingabe an die Anwendung.
+        # Shift+Rechtsklick bietet weiterhin das ShellDeck-Kontextmenue.
+        if self._mouse_tracking_level() and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            event.accept()
+            return
         if self._model is None:
             super().contextMenuEvent(event)
             return
@@ -532,33 +775,61 @@ class TerminalGridView(QWidget):
         for y in range(first, last + 1):
             cells = self._model.row_cells(y)
             y_px = y * ch
-            for x in range(cols):
-                cell = cells[x]
-                fg = self._resolve_color(cell["fg"], self.default_fg)
-                bg = self._resolve_color(cell["bg"], self.default_bg)
-                if cell["reverse"]:
-                    fg, bg = bg, fg
-                if self._is_selected(x, y):
-                    bg = self.selection_bg
-                is_cursor_cell = show_cursor and x == cur_x and y == cur_y
-                if is_cursor_cell:
-                    fg, bg = bg, fg  # Blockcursor: Zelle invertieren
+            # Glyphs must never paint into another terminal row. This is
+            # especially relevant for italic fonts and extended graphemes.
+            painter.save()
+            painter.setClipRect(QRectF(0, y_px, cols * cw, ch),
+                                Qt.ClipOperation.IntersectClip)
+            try:
+                self._paint_cells_in_row(painter, cells, y, cols, cw, ch,
+                                         y_px, show_cursor, cur_x, cur_y,
+                                         last_font, last_pen)
+            finally:
+                painter.restore()
 
-                x_px = x * cw
-                rect = QRect(int(x_px), int(y_px), int(cw) + 1, int(ch) + 1)
-                if bg != self.default_bg or is_cursor_cell:
-                    painter.fillRect(rect, bg)
+    def _paint_cells_in_row(self, painter, cells, y, cols, cw, ch, y_px,
+                            show_cursor, cur_x, cur_y, last_font, last_pen):
+        """Paint one terminal row, clipping oversized glyphs to their cell."""
+        for x in range(cols):
+            cell = cells[x]
+            fg = self._resolve_color(cell["fg"], self.default_fg)
+            bg = self._resolve_color(cell["bg"], self.default_bg)
+            if cell["reverse"]:
+                fg, bg = bg, fg
+            if self._is_selected(x, y):
+                bg = self.selection_bg
+            is_cursor_cell = show_cursor and x == cur_x and y == cur_y
+            if is_cursor_cell:
+                fg, bg = bg, fg  # Blockcursor: Zelle invertieren
 
-                char = cell["char"]
-                if char and char != " ":
-                    glyph_font = self._font_for_cell(cell)
-                    if glyph_font is not last_font:
-                        painter.setFont(glyph_font)
-                        last_font = glyph_font
-                    if fg != last_pen:
-                        painter.setPen(fg)
-                        last_pen = fg
-                    painter.drawText(int(x_px), int(y_px + self._ascent), char)
+            x_px = x * cw
+            rect = QRect(int(x_px), int(y_px), int(cw) + 1, int(ch) + 1)
+            if bg != self.default_bg or is_cursor_cell:
+                painter.fillRect(rect, bg)
 
+            char = cell["char"]
+            if char and char != " ":
+                glyph_font = self._font_for_cell(cell)
+                if glyph_font is not last_font:
+                    painter.setFont(glyph_font)
+                    last_font = glyph_font
+                if fg != last_pen:
+                    painter.setPen(fg)
+                    last_pen = fg
+                # pyte normally stores one character per cell, but combining
+                # sequences or a wider glyph can reach the next cell. Do not
+                # allow a stale fragment to be painted over another column.
+                # Keep the common ASCII path fast (htop can redraw thousands
+                # of cells per frame). Non-ASCII, combined and italic glyphs
+                # may extend beyond a cell and need an explicit boundary.
+                needs_clip = (len(char) != 1 or ord(char) > 127 or
+                              cell["italics"])
+                if needs_clip:
+                    painter.save()
+                    painter.setClipRect(QRectF(x_px, y_px, cw, ch),
+                                        Qt.ClipOperation.IntersectClip)
+                painter.drawText(int(x_px), int(y_px + self._ascent), char)
+                if needs_clip:
+                    painter.restore()
 
 __all__ = ["TerminalGridView"]
