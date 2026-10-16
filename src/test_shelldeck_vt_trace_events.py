@@ -40,3 +40,39 @@ def test_events_not_collected_after_stop():
     trace.stop()
     trace.event("pty_resize", rows=20, cols=80)
     assert trace.events_jsonl() == ""
+
+
+def test_assist_panel_events_report_transitions_only():
+    trace = VtRawTrace()
+    trace.start()
+    trace.event("assist_panel", visible=False)
+    trace.append(b"abc")
+    trace.event("assist_panel", visible=False)
+    trace.event("grid_focus_in")
+    trace.event("assist_panel", visible=True)
+    trace.event("assist_panel", visible=True)
+    trace.event("assist_panel", visible=False)
+    events = [json.loads(row) for row in trace.events_jsonl().splitlines()]
+    assert [row["event"] for row in events] == [
+        "assist_panel", "grid_focus_in", "assist_panel", "assist_panel"]
+    assert [row["visible"] for row in events if row["event"] == "assist_panel"] == [False, True, False]
+    assert [row["byte_offset"] for row in events] == [0, 3, 3, 3]
+    assert trace.stop() == b"abc"
+
+
+def test_assist_dedup_resets_when_trace_restarted():
+    trace = VtRawTrace()
+    trace.start()
+    trace.event("assist_panel", visible=False)
+    trace.stop()
+    trace.start()
+    trace.event("assist_panel", visible=False)
+    assert len(trace.events) == 1
+
+
+def test_assist_event_dedup_does_not_filter_other_events():
+    trace = VtRawTrace()
+    trace.start()
+    trace.event("pty_resize", rows=58, cols=235)
+    trace.event("pty_resize", rows=58, cols=235)
+    assert len(trace.events) == 2

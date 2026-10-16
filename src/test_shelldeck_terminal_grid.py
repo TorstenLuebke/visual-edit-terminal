@@ -50,6 +50,28 @@ class TerminalGridViewTests(unittest.TestCase):
         view = self._make()
         self.assertTrue(view.is_usable())
 
+    def test_normal_shell_repaints_full_grid_after_history_redraw(self):
+        """Readline redraw must not rely on incomplete dirty-row reports."""
+        from shelldeck_terminal_grid import TerminalGridView
+
+        class RecordingGrid(TerminalGridView):
+            def update(self, *args):
+                if hasattr(self, "repaint_requests"):
+                    self.repaint_requests.append(args)
+                return super().update(*args)
+
+        view = RecordingGrid(rows=4, cols=60)
+        self.addCleanup(view.close)
+        view.repaint_requests = []
+        view.feed(b"user$ echo a-very-long-command")
+        self.assertTrue(view.repaint_requests)
+        self.assertTrue(all(len(args) == 4 for args in view.repaint_requests))
+        view.repaint_requests.clear()
+        view.feed(b"\r\x1b[2Kuser$ ls")
+        self.assertIn((), view.repaint_requests)
+        self.assertIn("user$ ls", view.model().display()[0])
+        self.assertNotIn("very-long-command", view.model().display()[0])
+
     def test_feed_and_render_no_error(self):
         from PySide6.QtCore import QPoint
         from PySide6.QtGui import QImage, QPainter

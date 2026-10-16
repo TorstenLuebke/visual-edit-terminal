@@ -53,10 +53,10 @@ _KEY_NAMES = _build_key_name_map()
 # "brightred"; 256-/Truecolor kommt als 6-stelliger Hex-String an.
 _ANSI_PALETTE = {
     "black": "#000000", "red": "#cd0000", "green": "#00cd00",
-    "brown": "#cdcd00", "yellow": "#cdcd00", "blue": "#0000ee",
+    "brown": "#cdcd00", "yellow": "#cdcd00", "blue": "#6c9fff",
     "magenta": "#cd00cd", "cyan": "#00cdcd", "white": "#e5e5e5",
     "brightblack": "#7f7f7f", "brightred": "#ff0000", "brightgreen": "#00ff00",
-    "brightbrown": "#ffff00", "brightyellow": "#ffff00", "brightblue": "#5c5cff",
+    "brightbrown": "#ffff00", "brightyellow": "#ffff00", "brightblue": "#9fc2ff",
     "brightmagenta": "#ff00ff", "brightcyan": "#00ffff", "brightwhite": "#ffffff",
 }
 _HEXDIGITS = set("0123456789abcdefABCDEF")
@@ -185,6 +185,27 @@ class TerminalGridView(QWidget):
     def cell_size(self):
         return self._cell_w, self._cell_h
 
+    def cursor_diagnostic(self):
+        """Content-free cursor geometry snapshot for VT/UI debugging.
+
+        Never record surrounding terminal text or user input. This reports
+        only the parser coordinates and pixel location used by the painter.
+        """
+        if self._model is None:
+            return None
+        state = self._model.cursor
+        x, y = int(state["x"]), int(state["y"])
+        return {
+            "x": x, "y": y,
+            "rows": int(self._model.rows), "cols": int(self._model.cols),
+            "cell_width": float(self._cell_w),
+            "cell_height": float(self._cell_h),
+            "paint_x": int(x * self._cell_w),
+            "paint_y": int(y * self._cell_h),
+            "focus": bool(self.hasFocus()),
+            "hidden": bool(state.get("hidden", False)),
+        }
+
     # --- Datenzufuhr ------------------------------------------------------
     def feed(self, data) -> None:
         """Rohbytes/Text in das Modell geben und betroffene Zeilen neu zeichnen."""
@@ -192,14 +213,21 @@ class TerminalGridView(QWidget):
             return
         self._vt_raw_trace.append(data)
         self._model.feed(data)
-        self._repaint_dirty()
+        # Readline may erase a longer command with CSI K after moving the
+        # cursor. Repaint the whole shell grid for erasure sequences only;
+        # ordinary output keeps the fast, sparse dirty-row updates.
+        raw = data if isinstance(data, bytes) else str(data).encode("utf-8", "replace")
+        redraw_with_erase = b"\x1b[K" in raw or any(
+            b"\x1b[" + n + b"K" in raw for n in (b"0", b"1", b"2")
+        )
+        self._repaint_dirty(force_shell_full=redraw_with_erase)
 
     def reset(self) -> None:
         if self._model is not None:
             self._model.reset()
         self.update()
 
-    def _repaint_dirty(self) -> None:
+    def _repaint_dirty(self, *, force_shell_full: bool = False) -> None:
         if self._model is None:
             return
         dirty = set(self._model.dirty_lines())
@@ -214,6 +242,11 @@ class TerminalGridView(QWidget):
                 dirty.add(self._last_cursor[1])
         self._last_cursor = cursor_state
         self._model.clear_dirty()
+        if force_shell_full and not self._model.in_alternate_screen():
+            # Erasing a long Readline entry must not leave old glyphs in
+            # regions missed by sparse Qt updates. Keep this exceptional.
+            self.update()
+            return
         if self._model.in_alternate_screen():
             # Vollbildprogramme (htop/vim/mc) zeichnen viele getrennte Bereiche
             # eines Frames gleichzeitig um, teils mit DECSTBM-Scrollregionen.

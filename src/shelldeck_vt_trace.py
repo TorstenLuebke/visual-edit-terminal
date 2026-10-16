@@ -17,12 +17,14 @@ class VtRawTrace:
         self._size = 0
         self.events = []
         self._started = None
+        self._last_assist_visible = None
 
     def start(self):
         self._chunks.clear()
         self._size = 0
         self.truncated = False
         self.events = []
+        self._last_assist_visible = None
         self._started = time.monotonic()
         self.active = True
 
@@ -48,6 +50,13 @@ class VtRawTrace:
                    "visible", "alternate", "top", "bottom", "success"}
         safe = {key: value for key, value in fields.items()
                 if key in allowed and type(value) in (int, bool)}
+        # Record assist visibility changes, not polling ticks. Keep the first
+        # sample after each start() even when the panel is initially hidden.
+        if name == "assist_panel" and type(safe.get("visible")) is bool:
+            visible = safe["visible"]
+            if visible == self._last_assist_visible:
+                return
+            self._last_assist_visible = visible
         self.events.append({"ms": round((time.monotonic() - self._started) * 1000),
                             "byte_offset": self._size, "event": str(name), **safe})
 

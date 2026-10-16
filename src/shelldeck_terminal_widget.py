@@ -872,7 +872,9 @@ class PosixPtyChild:
     def write(self, text):
         if self._closed or self.fd < 0 or not self.isalive():
             raise OSError("PTY-Prozess läuft nicht.")
-        raw = str(text or "").encode("utf-8", errors="replace")
+        # POSIX-PTY ist ein Bytekanal. Escape-Sequenzen und UTF-8-Fragmente
+        # duerfen nicht durch str(bytes) oder einen Zeichensatz-Fallback gehen.
+        raw = bytes(text) if isinstance(text, (bytes, bytearray, memoryview)) else str(text or "").encode("utf-8")
         return os.write(self.fd, raw)
 
     def terminate(self):
@@ -1133,6 +1135,15 @@ class PtyTerminalProcess(QThread):
             self._error_string = "PTY/ConPTY-Prozess läuft nicht."
             return -1
         raw = bytes(data or b"")
+        if isinstance(self._pty, PosixPtyChild):
+            # Rohbytes direkt uebergeben: insbesondere CSI, OSC, UTF-8 und
+            # abgeschnittene Mehrbytefolgen muessen exakt erhalten bleiben.
+            try:
+                return self._pty.write(raw)
+            except Exception as exc:
+                self._error_string = str(exc)
+                self.errorOccurred.emit(QProcess.ProcessError.WriteError)
+                return -1
         for encoding in ("utf-8", "cp1252", "cp850", "latin-1"):
             try:
                 text = raw.decode(encoding)
@@ -6415,15 +6426,32 @@ class ShellDeckTerminalWidget(QWidget):
         return self.set_real_terminal_mode(not getattr(self, "real_terminal_active", False))
 
     def _write_terminal_grid_input(self, data):
-        """Eingabebytes des Grids in den Terminal-Prozess schreiben."""
+        """Grid-Eingaben senden; opt-in Diagnose speichert niemals Nutzdaten.
+
+        SHELLDECK_INPUT_TRACE_PATH aktiviert einen JSONL-Bericht. Jeder
+        Aufruf dieser Slot-Methode erhaelt eine laufende Nummer. Mehrere
+        Aufrufe fuer eine Eingabe koennen damit untersucht werden, ohne
+        Tastaturinhalt oder eingegebene Befehle aufzuzeichnen.
+        """
+        from shelldeck_input_audit_085 import InputWriteAudit
+
+        audit = getattr(self, "_input_write_audit_085", None)
+        if audit is None:
+            audit = InputWriteAudit.from_environment()
+            self._input_write_audit_085 = audit
         process = getattr(self, "process", None)
         writer = getattr(process, "write", None)
         if not callable(writer):
+            audit.record(bytes_count=len(bytes(data)), status="no_writer")
             return
+        payload = bytes(data)
         try:
-            writer(bytes(data))
+            written = writer(payload)
         except Exception:
-            pass
+            audit.record(bytes_count=len(payload), status="exception")
+            return
+        audit.record(bytes_count=len(payload), status="written",
+                     result=written if isinstance(written, int) else None)
 
     def _on_terminal_grid_size(self, rows, cols):
         """Vom Grid gemeldete Größe an das PTY weiterreichen (TIOCSWINSZ)."""
