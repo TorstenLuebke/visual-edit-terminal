@@ -1657,6 +1657,10 @@ class ShellDeckTerminalWidget(QWidget):
         self.connect_shell_process(self.process)
 
         self.apply_theme()
+        # Explizit gewaehltes PTY/ConPTY startet direkt in der bedienbaren
+        # VT-Ansicht. Nur das Ausblenden der unteren Eingabe wuerde sonst
+        # jede Tastatureingabe blockieren (QTextEdit ist read-only).
+        self._sync_explicit_pty_view()
         self.start_shell()
 
         if self.window.default_command and self.process.waitForStarted(2000):
@@ -3840,6 +3844,39 @@ class ShellDeckTerminalWidget(QWidget):
             return process_engine
         return self.window.normalize_terminal_engine(getattr(self, "terminal_engine", "auto"))
 
+    def _sync_explicit_pty_view(self):
+        """Fuer die explizite PTY-Wahl die direkte Eingabe im VT-Gitter nutzen.
+
+        Bei fehlendem VT-Backend bleiben die klassischen Bedienelemente
+        erhalten: Eine versteckte Eingabe ohne Ersatz waere unbedienbar.
+        Die Einstellung 'auto' behaelt ihre bisherige Ansicht.
+        """
+        if (self.terminal_engine == "pty" and self.process_uses_pty_engine()
+                and self.real_terminal_available()):
+            return self.set_real_terminal_mode(True, focus=False)
+        return False
+
+    def _posix_shell_owns_pty_foreground(self):
+        """True only if the shell itself currently owns its controlling PTY.
+
+        An idle interactive shell keeps running, but is not a foreground
+        *command*. If job control transfers the terminal to e.g. htop, ping,
+        or vim, tcgetpgrp differs from the shell's process group. Fail closed
+        on unsupported backends and on any probe error.
+        """
+        if os.name != "posix" or not self.process_uses_pty_engine():
+            return False
+        process = getattr(self, "process", None)
+        child = getattr(process, "_pty", None)
+        try:
+            pid = int(getattr(child, "pid", 0))
+            fd = int(getattr(child, "fd", -1))
+            if pid <= 0 or fd < 0 or not self.process_is_running(process):
+                return False
+            return os.tcgetpgrp(fd) == os.getpgid(pid)
+        except (AttributeError, OSError, ValueError, TypeError):
+            return False
+
     def set_terminal_engine(self, engine, *, restart=True):
         new_engine = self.window.normalize_terminal_engine(engine)
         old_engine = self.actual_terminal_engine()
@@ -3848,12 +3885,31 @@ class ShellDeckTerminalWidget(QWidget):
             # foreground command (e.g. ping) this is destructive and previously
             # raced the PTY reader's callbacks, occasionally crashing the app.
             # Require the user to interrupt the command and wait for its prompt.
+            # In der direkten VT-Ansicht kann das alte QTextEdit einen
+            # veralteten Prompt enthalten. POSIX-Job-Control liefert hier
+            # den verlässlicheren Befund: nur die Shell selbst im Vordergrund
+            # bedeutet, dass kein externer Vordergrundprozess läuft.
+            active_posix_pty = (
+                os.name == "posix"
+                and getattr(self, "real_terminal_active", False)
+                and self.process_uses_pty_engine()
+                and self.process_is_running(getattr(self, "process", None))
+            )
+            shell_ready = (active_posix_pty and self._posix_shell_owns_pty_foreground())
+            # Ist das PTY aktiv, muss die Bash selbst im Vordergrund stehen.
+            # Bei einem externen Vordergrundprozess (oder unsicherem Befund)
+            # darf ein veraltetes _awaiting_command_completion=False nicht
+            # zur Freigabe des Engine-Wechsels fuehren.
+            foreground_command_or_unknown = active_posix_pty and not shell_ready
             if (
-                self.command_appears_to_be_running()
+                foreground_command_or_unknown
                 or getattr(self, "client_mode_active", False)
                 or getattr(self, "password_prompt_active", False)
-                or (getattr(self, "interaction_prompt_active", False)
-                    and not self.output_ends_with_shell_prompt(self.terminal_output_text_for_state_checks()))
+                or (not shell_ready and (
+                    self.command_appears_to_be_running()
+                    or (getattr(self, "interaction_prompt_active", False)
+                        and not self.output_ends_with_shell_prompt(
+                            self.terminal_output_text_for_state_checks()))))
             ):
                 self.window.show_status(
                     "Engine-Wechsel abgelehnt: Zuerst den laufenden Befehl mit Strg+C beenden"
@@ -3865,6 +3921,7 @@ class ShellDeckTerminalWidget(QWidget):
         if getattr(self, "real_terminal_active", False) and str(new_engine).lower() != "pty":
             self.set_real_terminal_mode(False, focus=False)
         if not restart or new_engine == old_engine:
+            self._sync_explicit_pty_view()
             self.display_shell_status()
             return True
 
@@ -3885,6 +3942,7 @@ class ShellDeckTerminalWidget(QWidget):
         self.start_directory = current_dir or self.start_directory
         self.process = self.create_shell_process()
         self.connect_shell_process(self.process)
+        self._sync_explicit_pty_view()
         self.start_shell()
         if restore_command:
             self.restore_command = restore_command

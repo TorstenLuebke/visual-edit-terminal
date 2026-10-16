@@ -4044,6 +4044,7 @@ Vorbefehl-Leiste oben rechts
 - Ansicht → Vorbefehl-Leiste anzeigen blendet die Leiste ein oder aus.
 - Ansicht → Letzte Befehle anzeigen blendet die Befehlstabelle des aktuellen Tabs komplett ein oder aus.
 - Ansicht → Reines Terminal schaltet den aktuellen Tab ohne Kontextmenü zwischen klassischer Eingabe und direkter Terminaleingabe um.
+- Bei expliziter Wahl von „PTY/ConPTY – interaktiv“ zeigt ShellDeck mit verfuegbarem VT-Backend (pyte) automatisch das echte Terminalgitter. Die untere klassische Befehlseingabe, der Ausfuehren-Button und „Letzte Befehle“ werden in dieser Ansicht ausgeblendet; Tastatureingaben gehen direkt ans PTY. Beim Wechsel zur QProcess-Engine erscheint die klassische Eingabe wieder. Ohne verfuegbares VT-Backend bleibt die klassische Eingabe als sicherer Rueckfall sichtbar.
 
 Datei-Menü
 - Neuer Tab: öffnet einen neuen Terminal-Tab mit dem aktuell gewählten Standard-Backend.

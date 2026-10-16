@@ -355,3 +355,108 @@ class RealTerminalModeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+@unittest.skipUnless(QT_OK and vt.is_available(), "Qt oder pyte nicht nutzbar")
+class ExplicitPtyViewTests(unittest.TestCase):
+    def test_explicit_pty_hides_classic_controls_and_restores_them(self):
+        from shelldeck_terminal_widget import ShellDeckTerminalWidget
+        widget = ShellDeckTerminalWidget()
+        self.addCleanup(widget.close)
+        widget.stop_process(fast=True)
+        widget.process = _FakeProcess()
+        widget.terminal_engine = "pty"
+        self.assertTrue(widget._sync_explicit_pty_view())
+        self.assertTrue(widget.real_terminal_active)
+        for control in (widget.command_task_header, widget.command_task_list,
+                        widget.input_prompt_label, widget.input_line,
+                        widget.execute_button):
+            self.assertTrue(control.isHidden())
+        self.assertIsNotNone(widget.terminal_grid)
+        self.assertFalse(widget.terminal_grid.isHidden())
+        self.assertTrue(widget.set_real_terminal_mode(False, focus=False))
+        for control in (widget.input_prompt_label, widget.input_line,
+                        widget.execute_button):
+            self.assertFalse(control.isHidden())
+
+    def test_auto_engine_does_not_force_vt_mode(self):
+        from shelldeck_terminal_widget import ShellDeckTerminalWidget
+        widget = ShellDeckTerminalWidget()
+        self.addCleanup(widget.close)
+        widget.stop_process(fast=True)
+        widget.process = _FakeProcess()
+        widget.terminal_engine = "auto"
+        self.assertFalse(widget._sync_explicit_pty_view())
+        self.assertFalse(widget.real_terminal_active)
+
+
+@unittest.skipUnless(QT_OK and os.name == "posix", "POSIX und Qt erforderlich")
+class PtyForegroundEngineSwitchTests(unittest.TestCase):
+    def test_idle_shell_owns_foreground(self):
+        from unittest.mock import Mock, patch
+        from shelldeck_terminal_widget import ShellDeckTerminalWidget
+        child = Mock(pid=72341, fd=57)
+        process = Mock(_pty=child)
+        widget = Mock(process=process)
+        widget.process_uses_pty_engine.return_value = True
+        widget.process_is_running.return_value = True
+        with patch("os.tcgetpgrp", return_value=72341), patch("os.getpgid", return_value=72341):
+            self.assertTrue(ShellDeckTerminalWidget._posix_shell_owns_pty_foreground(widget))
+
+    def test_external_foreground_command_is_not_ready(self):
+        from unittest.mock import Mock, patch
+        from shelldeck_terminal_widget import ShellDeckTerminalWidget
+        widget = Mock(process=Mock(_pty=Mock(pid=72341, fd=57)))
+        widget.process_uses_pty_engine.return_value = True
+        widget.process_is_running.return_value = True
+        with patch("os.tcgetpgrp", return_value=72342), patch("os.getpgid", return_value=72341):
+            self.assertFalse(ShellDeckTerminalWidget._posix_shell_owns_pty_foreground(widget))
+
+    def test_probe_failure_remains_protected(self):
+        from unittest.mock import Mock, patch
+        from shelldeck_terminal_widget import ShellDeckTerminalWidget
+        widget = Mock(process=Mock(_pty=Mock(pid=72341, fd=57)))
+        widget.process_uses_pty_engine.return_value = True
+        widget.process_is_running.return_value = True
+        with patch("os.tcgetpgrp", side_effect=OSError("PTY closed")):
+            self.assertFalse(ShellDeckTerminalWidget._posix_shell_owns_pty_foreground(widget))
+
+
+@unittest.skipUnless(QT_OK and os.name == "posix", "POSIX und Qt erforderlich")
+class PtyForegroundSwitchGuardTests(unittest.TestCase):
+    def test_external_foreground_blocks_even_when_old_flags_are_false(self):
+        from unittest.mock import Mock
+        from shelldeck_terminal_widget import ShellDeckTerminalWidget
+
+        widget = Mock()
+        widget.window.normalize_terminal_engine.return_value = "qprocess"
+        widget.actual_terminal_engine.return_value = "pty"
+        widget.real_terminal_active = True
+        widget.client_mode_active = False
+        widget.password_prompt_active = False
+        widget.interaction_prompt_active = False
+        widget.process_uses_pty_engine.return_value = True
+        widget.process_is_running.return_value = True
+        widget._posix_shell_owns_pty_foreground.return_value = False
+        widget.command_appears_to_be_running.return_value = False
+        self.assertFalse(ShellDeckTerminalWidget.set_terminal_engine(widget, "qprocess"))
+        widget.window.show_status.assert_called_once()
+        widget.stop_process.assert_not_called()
+
+    def test_idle_pty_does_not_trigger_guard(self):
+        from unittest.mock import Mock
+        from shelldeck_terminal_widget import ShellDeckTerminalWidget
+
+        widget = Mock()
+        widget.window.normalize_terminal_engine.return_value = "pty"
+        widget.actual_terminal_engine.return_value = "pty"
+        widget.real_terminal_active = True
+        widget.terminal_engine = "pty"
+        widget.client_mode_active = False
+        widget.password_prompt_active = False
+        widget.interaction_prompt_active = False
+        widget.process_uses_pty_engine.return_value = True
+        widget.process_is_running.return_value = True
+        widget._posix_shell_owns_pty_foreground.return_value = True
+        widget._sync_explicit_pty_view.return_value = True
+        self.assertTrue(ShellDeckTerminalWidget.set_terminal_engine(widget, "pty"))
+        widget.window.show_status.assert_not_called()
