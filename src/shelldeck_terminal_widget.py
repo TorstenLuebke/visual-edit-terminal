@@ -3798,6 +3798,16 @@ class ShellDeckTerminalWidget(QWidget):
         # es bisher nicht, weil sie unter Linux faktisch nie lief.
         try:
             environment = QProcessEnvironment.systemEnvironment()
+            # A QProcess Bash inherits the launcher's environment, including
+            # VIRTUAL_ENV and potentially a PS1 already prefixed by activate.
+            # Activating that same environment again must not prefix PS1 a
+            # second time. This flag is honored by Python's venv activate
+            # scripts; it changes no terminal output and no PTY environment.
+            if (str(self.shell_type or "").lower() == "bash"
+                    and environment.contains("VIRTUAL_ENV")
+                    and environment.value("VIRTUAL_ENV").strip()
+                    and not environment.contains("VIRTUAL_ENV_DISABLE_PROMPT")):
+                environment.insert("VIRTUAL_ENV_DISABLE_PROMPT", "1")
             if not environment.contains("TERM") or not environment.value("TERM").strip():
                 environment.insert("TERM", "xterm-256color")
             # Feste Prompt-Vorgabe fuer sudo. Ueber die Umgebung statt ueber "-p",
@@ -5730,6 +5740,26 @@ class ShellDeckTerminalWidget(QWidget):
         injected = f"{words[0]} -S {remainder}".rstrip()
         return part.replace(stripped, prefix + injected, 1)
 
+    def separate_qprocess_bash_prompt_before_command(self):
+        """Separate QProcess Bash prompts in the text view, not in the shell.
+
+        A pipe-backed interactive Bash emits PS1 without a terminating newline.
+        Unlike a PTY, QTextEdit cannot repaint that line on the next command:
+        a later PS1 may otherwise appear directly after the previous one.
+        Do not alter actual process input or any PTY/ConPTY output.
+        """
+        if (not isinstance(getattr(self, "process", None), QProcess)
+                or str(getattr(self, "shell_type", "")).lower() != "bash"
+                or getattr(self, "real_terminal_active", False)):
+            return False
+        tail = self.terminal_output_text_for_state_checks()
+        if not tail or tail.endswith(("\n", "\r")):
+            return False
+        if not self.output_ends_with_shell_prompt(tail):
+            return False
+        self.queue_terminal_output("\n")
+        return True
+
     def write_shell_command(self, command):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
         if not text:
@@ -5766,6 +5796,9 @@ class ShellDeckTerminalWidget(QWidget):
             text += "\n"
         self._last_sent_shell_command = str(command or "")
         self._awaiting_command_completion = True
+        # In QProcess Bash, close the previous unterminated PS1 display line.
+        # This affects only the GUI transcript, never stdin sent to Bash.
+        self.separate_qprocess_bash_prompt_before_command()
         self.process.write(self.encode_process_input(text))
         self.process.waitForBytesWritten(1000)
         self._schedule_shell_callback(300, self.refresh_process_input_mode_hint)
