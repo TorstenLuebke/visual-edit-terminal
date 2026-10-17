@@ -157,7 +157,8 @@ class TerminalWindow(QMainWindow):
         self.theme_config = self.default_theme_config()
         self.shell_type = self.default_shell_type()
         self.terminal_engine = "auto"
-        self.qprocess_bash_mode = "classic"
+        from shelldeck_qprocess_bash_batch import default_batch_mode
+        self.qprocess_bash_mode = default_batch_mode()
         # True, sobald der Benutzer die Engine bewusst ausgewaehlt hat (Liste,
         # Menue oder gespeicherte Einstellung). Nur solange das False ist, darf
         # create_shell_process() unter Linux/macOS automatisch auf PTY anheben.
@@ -474,7 +475,7 @@ class TerminalWindow(QMainWindow):
 
         self.qprocess_bash_combo = QComboBox(self.pre_command_bar)
         self.qprocess_bash_combo.addItem("Bash: kompatibel", "classic")
-        self.qprocess_bash_combo.addItem("Bash: ohne Jobsteuerung (Test)", "batch")
+        self.qprocess_bash_combo.addItem("Bash: ohne Jobsteuerung", "batch")
         self.qprocess_bash_combo.setToolTip(
             "Nur für QProcess-Bash. Ein Wechsel startet den aktuellen Bash-Tab neu; "
             "interaktive Programme benötigen weiterhin PTY/ConPTY."
@@ -3114,8 +3115,8 @@ class TerminalWindow(QMainWindow):
             self.workspaces = self.merge_workspaces_by_name(self.workspaces, self.load_persistent_workspaces())
             return
 
-        from shelldeck_qprocess_bash_batch import normalized_batch_mode
-        self.qprocess_bash_mode = normalized_batch_mode(settings.get("qprocess_bash_mode"))
+        from shelldeck_qprocess_bash_batch import batch_mode_from_settings
+        self.qprocess_bash_mode = batch_mode_from_settings(settings)
         font_text = str(settings.get("font", "")).strip()
         if font_text:
             font = QFont()

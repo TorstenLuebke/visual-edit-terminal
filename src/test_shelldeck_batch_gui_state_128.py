@@ -43,7 +43,40 @@ class BatchGuiStateTests(unittest.TestCase):
         self.assertLess(guard.lineno, running_state.lineno)
 
     def test_process_exit_clears_batch_wait_flag(self):
-        self.assertIn('self._awaiting_command_completion = False\n        self._finalize_shell_process_finished(code)', self.source)
+        """A lost batch shell clears its pending state before finalization."""
+        cls = next(c for c in self.tree.body if isinstance(c, ast.ClassDef) and any(
+            isinstance(n, ast.FunctionDef)
+            and n.name == "_complete_qprocess_finish_if_drained" for n in c.body))
+        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "_complete_qprocess_finish_if_drained")
+        batch_guard = next(
+            node for node in method.body
+            if isinstance(node, ast.If) and "_qprocess_bash_batch" in ast.unparse(node.test)
+        )
+        cleared = next(
+            node for node in batch_guard.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute)
+                    and target.attr == "_awaiting_command_completion"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Constant) and node.value.value is False
+        )
+        lost_state = next(
+            node for node in batch_guard.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute)
+                    and target.attr == "_batch_shell_lost_state"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Constant) and node.value.value is True
+        )
+        finalized = next(
+            node for node in method.body
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "_finalize_shell_process_finished"
+        )
+        self.assertLess(cleared.lineno, finalized.lineno)
+        self.assertLess(lost_state.lineno, finalized.lineno)
 
     def test_interactive_input_blocked_while_batch_pending(self):
         self.assertIn('A batch command reads from /dev/null', self.source)

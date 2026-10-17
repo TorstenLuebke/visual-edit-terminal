@@ -16,15 +16,44 @@ def wrap_batch_command(command, token):
     from shelldeck_qprocess_bash_protocol import BashCompletionDecoder
     BashCompletionDecoder(token)
     quoted = shlex.quote(command)
-    return ("(exit \"${__shelldeck_batch_rc:-0}\")\n"
-            f"eval {quoted} </dev/null\n"
-            "__shelldeck_batch_rc=$?\n"
-            f"printf '\\036SHELLDECK_DONE_{token}:%s\\037' \"$__shelldeck_batch_rc\"\n")
+    # Guard both the previous status and eval from `errexit`, while leaving
+    # Bash's actual previous $? visible inside the user's evaluated command.
+    # In an `if` test Bash does not terminate the persistent interpreter for
+    # a nonzero status, so the completion frame can always be emitted.
+    evaluation = (f"if eval {quoted} </dev/null; then\n"
+                  "    __shelldeck_batch_rc=0\n"
+                  "else\n"
+                  "    __shelldeck_batch_rc=$?\n"
+                  "fi\n")
+    return ("if (exit \"${__shelldeck_batch_rc:-0}\"); then\n"
+            + evaluation
+            + "else\n"
+            + evaluation
+            + "fi\n"
+            + f"printf '\\036SHELLDECK_DONE_{token}:%s\\037' \"$__shelldeck_batch_rc\"\n")
+
 
 
 def batch_supports_interactive_stdin():
     """Interactive stdin cannot share the command transport pipe."""
     return False
+
+
+def default_batch_mode(platform=None):
+    """Default for *new* installs; never used to override stored choices."""
+    import sys
+    platform = sys.platform if platform is None else platform
+    return "classic" if platform == "win32" else "batch"
+
+
+def batch_mode_from_settings(settings, platform=None):
+    """A persisted choice wins; missing/invalid settings use the platform default.
+
+    Passing a mapping rather than its .get() value distinguishes a fresh
+    installation from the explicitly saved legacy selection.
+    """
+    value = settings.get("qprocess_bash_mode") if isinstance(settings, dict) else None
+    return value if value in ("batch", "classic") else default_batch_mode(platform)
 
 
 def normalized_batch_mode(value):

@@ -2938,6 +2938,13 @@ class ShellDeckTerminalWidget(QWidget):
             stop_client_action.triggered.connect(self.exit_client_mode)
             menu.addAction(stop_client_action)
 
+        # Only offer a recovery action when the QProcess batch shell has died.
+        if getattr(self, "_batch_shell_lost_state", False):
+            recovery_action = QAction("Beendete Bash neu starten…", self)
+            recovery_action.setToolTip("Startet eine neue Bash; lokale Variablen und Funktionen gehen verloren.")
+            recovery_action.triggered.connect(self.restart_lost_batch_shell)
+            menu.addAction(recovery_action)
+
         close_tab_action = QAction("Aktuellen Tab schließen", self)
         close_tab_action.triggered.connect(self.window.close_current_tab)
         menu.addAction(close_tab_action)
@@ -4059,6 +4066,9 @@ class ShellDeckTerminalWidget(QWidget):
             timer.stop()
         self._qprocess_output_paused = False
         self._qprocess_deferred_finish = None
+        self._bash_completion_pending = False
+        self._bash_completion_decoder = None
+        self._batch_shell_lost_state = False
         decoder_factory = getattr(self, "_new_qprocess_decoders", None)
         if callable(decoder_factory):
             self._qprocess_decoders = decoder_factory()
@@ -4124,6 +4134,28 @@ class ShellDeckTerminalWidget(QWidget):
         self._last_pty_size = None
         QTimer.singleShot(0, self.update_terminal_size)
         self.display_shell_status(shell_path)
+
+    def restart_lost_batch_shell(self):
+        """Recover an unexpectedly terminated QProcess Bash with consent."""
+        if not getattr(self, "_batch_shell_lost_state", False):
+            return False
+        if self.process_is_running(getattr(self, "process", None)):
+            self.window.show_status("Neustart abgelehnt: Bash läuft bereits")
+            return False
+        answer = QMessageBox.question(
+            self, "Bash neu starten?",
+            "Die vorherige Bash ist beendet. Nicht gespeicherte Variablen, "
+            "Funktionen und Shell-Optionen sind verloren.\n\n"
+            "Eine neue Bash im aktuellen Tab starten?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.restart_shell()
+        self.queue_terminal_output("[ShellDeck] Neue Bash-Sitzung gestartet; bisherige Shell-Variablen und Funktionen sind nicht mehr vorhanden.\n")
+        self.window.show_status("Neue Bash gestartet – vorheriger Shell-Zustand verloren")
+        return True
 
     def restart_shell(self):
         if self.process.state() == QProcess.ProcessState.Running:
@@ -5803,6 +5835,12 @@ class ShellDeckTerminalWidget(QWidget):
         return True
 
     def write_shell_command(self, command):
+        if (getattr(self, "_qprocess_bash_batch", False)
+                and getattr(self, "_batch_shell_lost_state", False)):
+            self.queue_terminal_output(
+                "\n[ShellDeck] Die Batch-Sitzung ist beendet. "
+                "Zum Fortfahren die Shell ausdrücklich neu starten.\n")
+            return
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
         if not text:
             return
@@ -6759,6 +6797,14 @@ class ShellDeckTerminalWidget(QWidget):
         # leave the GUI stuck in a waiting-for-command state.
         if getattr(self, "_qprocess_bash_batch", False):
             self._awaiting_command_completion = False
+            self.interaction_prompt_active = False
+            # A dead permanent Bash cannot preserve exports, functions or cwd.
+            # Do not pretend its state survived; restart is explicitly requested.
+            self._batch_shell_lost_state = True
+            self.queue_terminal_output(
+                "\n[ShellDeck] Die Batch-Bash wurde beendet. "
+                "Ungespeicherte Shell-Variablen und Funktionen sind verloren. "
+                "Bitte den Tab/die Shell ausdrücklich neu starten.\n")
         self._finalize_shell_process_finished(code)
 
     def _finalize_shell_process_finished(self, exit_code):

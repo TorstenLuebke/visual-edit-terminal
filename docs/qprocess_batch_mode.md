@@ -45,3 +45,18 @@ persistiert. Die konservative Variante ist bei neuen Installationen Standard.
 PTY/ConPTY und andere Shelltypen bleiben unverändert. Der Batch-Modus
 unterstützt keine interaktive Standardeingabe. Ohne GUI-Einstellung bleibt der
 frühere Umgebungsvariablen-Teststart für ältere Aufrufer verfügbar.
+
+## Pipelines und Shell-Fehleroptionen
+
+Pipelines werden als ein Bash-Auftrag ausgefuehrt. Bash-Optionen wie
+`set -o pipefail` bleiben in der dauerhaften Sitzung erhalten. Das
+Abschlussprotokoll gibt den Bash-Exit-Code der Pipeline zurueck.
+
+**Bekannte Grenze:** Bei `set -u` kann ein nicht gesetzter Variablenname
+die nichtinteraktive Bash sofort beenden, ohne einen Abschlussmarker zu
+liefern. Dieser Fall ist ein Shell-Abbruch und keine erfolgreiche
+Befehlsbeendigung. ShellDeck muss den beendeten QProcess erkennen und
+darf den Auftrag nicht als erfolgreich markieren.
+
+Der Batch-Modus ist weiterhin nicht fuer Programme geeignet, die
+interaktive Eingaben von stdin benoetigen. Dafuer PTY/ConPTY verwenden.
