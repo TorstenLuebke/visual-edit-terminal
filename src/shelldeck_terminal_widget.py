@@ -56,6 +56,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QEvent, QThread, Signal, QTimer
 from shelldeck_session_state import evaluate_session_state
 from shelldeck_output_buffer import TerminalOutputBuffer
+from shelldeck_qprocess_bash_policy import command_allows_completion_marker
+from shelldeck_qprocess_bash_batch import batch_requested, batch_for_session, wrap_batch_command
+from shelldeck_qprocess_bash_protocol import (
+    BashCompletionDecoder, new_completion_token, wrap_bash_command,
+)
 from shelldeck_scrollback import normalize_scrollback_blocks
 from shelldeck_program_assist import GUIDES, foreground_guide
 from shelldeck_auto_vt import direct_vt_program
@@ -1453,6 +1458,8 @@ class ShellDeckTerminalWidget(QWidget):
         self._interaction_prompt_tail = ""
         self._interaction_prompt_text = ""
         self._awaiting_command_completion = False
+        self._bash_completion_decoder = None
+        self._bash_completion_pending = False
         self._last_sent_shell_command = ""
 
         # Selbst-Cleanup: den Terminal-Prozess und den PTY-Reader auch dann
@@ -3375,8 +3382,12 @@ class ShellDeckTerminalWidget(QWidget):
             callback(self, task)
 
     def finish_active_command_task_if_prompt_returned(self):
+        if getattr(self, "_qprocess_bash_batch", False):
+            return
         task = self.active_command_task
         if task is None or task.get("status") != "läuft":
+            return
+        if getattr(self, "_bash_completion_pending", False):
             return
         if self.output_ends_with_shell_prompt(self.terminal_output_text_for_state_checks()):
             self.finish_active_command_task()
@@ -3887,10 +3898,10 @@ class ShellDeckTerminalWidget(QWidget):
         except (AttributeError, OSError, ValueError, TypeError):
             return False
 
-    def set_terminal_engine(self, engine, *, restart=True):
+    def set_terminal_engine(self, engine, *, restart=True, force_restart=False):
         new_engine = self.window.normalize_terminal_engine(engine)
         old_engine = self.actual_terminal_engine()
-        if restart and new_engine != old_engine:
+        if restart and (new_engine != old_engine or force_restart):
             # Changing the engine closes and replaces the shell. With a
             # foreground command (e.g. ping) this is destructive and previously
             # raced the PTY reader's callbacks, occasionally crashing the app.
@@ -3930,7 +3941,7 @@ class ShellDeckTerminalWidget(QWidget):
         # Engine gewechselt, den echten Modus vorher sauber verlassen.
         if getattr(self, "real_terminal_active", False) and str(new_engine).lower() != "pty":
             self.set_real_terminal_mode(False, focus=False)
-        if not restart or new_engine == old_engine:
+        if not restart or (new_engine == old_engine and not force_restart):
             self._sync_explicit_pty_view()
             self.display_shell_status()
             return True
@@ -4080,6 +4091,17 @@ class ShellDeckTerminalWidget(QWidget):
             except Exception:
                 pass
         shell_args = self.window.shell_start_args(self.shell_type)
+        # Opt-in: QProcess can use a permanent noninteractive Bash. The
+        # default stays unchanged until this path is confirmed in the GUI.
+        self._qprocess_bash_batch = bool(
+            sys.platform != "win32" and batch_for_session(
+                getattr(self.window, "qprocess_bash_mode", None))
+            and isinstance(self.process, QProcess)
+            and not self.process_uses_pty_engine()
+            and str(self.shell_type or "").lower() == "bash"
+        )
+        if self._qprocess_bash_batch:
+            shell_args = ["--noprofile", "--norc"]
         if self.process_uses_pty_engine() and str(self.shell_type or "").lower() in {"powershell", "pwsh"}:
             # PSReadLine repaints long input lines in a real terminal using
             # carriage-return redraws. QTextEdit is not a terminal emulator and
@@ -4450,6 +4472,14 @@ class ShellDeckTerminalWidget(QWidget):
         if explicit:
             normalizer = getattr(self.window, "normalize_restore_command_for_shell", None)
             normalized = normalizer(explicit, self.shell_type) if callable(normalizer) else explicit
+            # A saved relative activate command belongs to the original venv,
+            # not to the shell's current directory (which may now be /tmp).
+            # Prefer the validated saved venv path, if one is available.
+            saved_venv = self.normalize_venv_path(getattr(self, "venv_path", ""))
+            if saved_venv and self.command_looks_like_venv_activation(normalized):
+                absolute = self.restore_command_for_venv(saved_venv)
+                if absolute:
+                    normalized = absolute
             if normalized != explicit:
                 self.restore_command = normalized
             return normalized
@@ -4508,6 +4538,11 @@ class ShellDeckTerminalWidget(QWidget):
         normalizer = getattr(self.window, "normalize_restore_command_for_shell", None)
         if callable(normalizer):
             text = normalizer(text, self.shell_type)
+        saved_venv = self.normalize_venv_path(getattr(self, "venv_path", ""))
+        if saved_venv and self.command_looks_like_venv_activation(text):
+            absolute = self.restore_command_for_venv(saved_venv)
+            if absolute:
+                text = absolute
         if not self.is_safe_restore_command(text):
             self.output_area.append(
                 f"\n[Gespeicherter Befehl wird beim Start nicht automatisch ausgeführt: {text}]\n"
@@ -5363,7 +5398,9 @@ class ShellDeckTerminalWidget(QWidget):
             self._awaiting_command_completion = False
             return False
         output = self.terminal_output_text_for_state_checks()
-        if self.output_ends_with_shell_prompt(output):
+        if getattr(self, "_qprocess_bash_batch", False):
+            return bool(getattr(self, "_bash_completion_pending", False))
+        if self.output_ends_with_shell_prompt(output) and not getattr(self, "_bash_completion_pending", False):
             self._awaiting_command_completion = False
             self.finish_active_command_task_if_prompt_returned()
             return False
@@ -5374,8 +5411,10 @@ class ShellDeckTerminalWidget(QWidget):
         return True
 
     def update_command_completion_state_from_output(self):
+        if getattr(self, "_qprocess_bash_batch", False):
+            return
         output = self.terminal_output_text_for_state_checks()
-        if self.output_ends_with_shell_prompt(output):
+        if self.output_ends_with_shell_prompt(output) and not getattr(self, "_bash_completion_pending", False):
             self._awaiting_command_completion = False
             if getattr(self, "interaction_prompt_active", False):
                 self.reset_interaction_prompt_mode()
@@ -5617,6 +5656,9 @@ class ShellDeckTerminalWidget(QWidget):
             return
         if getattr(self, "interaction_prompt_active", False):
             return
+        if getattr(self, "_qprocess_bash_batch", False):
+            # Batch jobs cannot accept interactive replies on Bash stdin.
+            return
         if self.command_appears_to_be_running():
             self.activate_interaction_prompt_mode(
                 self.extract_interactive_prompt_from_command(getattr(self, "_last_sent_shell_command", "")) or "laufender Prozess nimmt Eingaben an",
@@ -5764,6 +5806,10 @@ class ShellDeckTerminalWidget(QWidget):
         text = str(command or "").replace("\r\n", "\n").replace("\r", "\n")
         if not text:
             return
+        # Rejected batch commands must not mutate the tab working context.
+        if (getattr(self, "_qprocess_bash_batch", False)
+                and getattr(self, "_bash_completion_pending", False)):
+            return
         self.update_working_context_from_shell_command(text)
         text = self.prepare_sudo_command_for_pipe(text)
 
@@ -5771,7 +5817,8 @@ class ShellDeckTerminalWidget(QWidget):
         # Arbeitsordner nur bei Shell-State-Befehlen direkt ab. Ein pauschaler
         # Probe-Befehl nach jeder Eingabe könnte sonst als Antwort in
         # interaktiven Programmen landen.
-        text = self.append_shell_context_probe(text)
+        if not getattr(self, "_qprocess_bash_batch", False):
+            text = self.append_shell_context_probe(text)
 
         # In PTY/ConPTY PowerShell the shell is started without PSReadLine.
         # That avoids the redraw storm that produced duplicated command
@@ -5783,7 +5830,6 @@ class ShellDeckTerminalWidget(QWidget):
         if self.process_uses_pty_engine():
             self.remember_pending_pty_command_echo(text)
 
-        self.update_working_context_from_shell_command(text)
         shell = str(self.shell_type or "").lower()
         is_powershell = shell in {"powershell", "pwsh"}
         is_multiline = "\n" in text
@@ -5796,6 +5842,42 @@ class ShellDeckTerminalWidget(QWidget):
             text += "\n"
         self._last_sent_shell_command = str(command or "")
         self._awaiting_command_completion = True
+        # Nur ein einzelner, nichtinteraktiver Builtin-Befehl ohne durch
+        # ShellDeck angehaengte Kontext-Probe darf den Marker verwenden.
+        # Insbesondere source/., Pipes und fremde Programme bleiben unangetastet.
+        # A previous decoder must not be silently replaced while a command
+        # still awaits its completion marker.  The command can be reading
+        # stdin: new input then belongs to that foreground command.
+        if getattr(self, "_bash_completion_pending", False):
+            # A running batch command never receives stdin. Refuse to queue
+            # another command blindly: the UI must wait for the exit frame.
+            if getattr(self, "_qprocess_bash_batch", False):
+                return
+            self.process.write(self.encode_process_input(text))
+            self.process.waitForBytesWritten(1000)
+            return
+        marker_ok = (
+            isinstance(self.process, QProcess)
+            and str(self.shell_type or "").lower() == "bash"
+            and not getattr(self, "real_terminal_active", False)
+            and not getattr(self, "_bash_completion_pending", False)
+            and text.rstrip("\n") == str(command or "").rstrip("\n")
+            and command_allows_completion_marker(command)
+        )
+        if getattr(self, "_qprocess_bash_batch", False):
+            # The permanent noninteractive shell must not use the QProcess
+            # transcript's stale prompt or interactive-input status.
+            token = new_completion_token()
+            self._bash_completion_decoder = BashCompletionDecoder(token)
+            self._bash_completion_pending = True
+            self.interaction_prompt_active = False
+            self._awaiting_command_completion = True
+            text = wrap_batch_command(str(command), token)
+        elif marker_ok:
+            token = new_completion_token()
+            self._bash_completion_decoder = BashCompletionDecoder(token)
+            self._bash_completion_pending = True
+            text = wrap_bash_command(command, token)
         # In QProcess Bash, close the previous unterminated PS1 display line.
         # This affects only the GUI transcript, never stdin sent to Bash.
         self.separate_qprocess_bash_prompt_before_command()
@@ -5812,6 +5894,10 @@ class ShellDeckTerminalWidget(QWidget):
         # because resetting the stale mode clears the input widget.
         if not getattr(self, "client_mode_active", False) and not getattr(self, "password_prompt_active", False):
             self.update_command_completion_state_from_output()
+        if (getattr(self, "_qprocess_bash_batch", False)
+                and getattr(self, "_bash_completion_pending", False)):
+            # Even empty Enter must not be passed to a child or command pipe.
+            return
         if not command_text:
             # Leere Eingaben sind im Antwort-Modus gültig: Sie schließen z.B.
             # eine PowerShell-Continuation (">>") ab oder bestätigen
@@ -5828,6 +5914,13 @@ class ShellDeckTerminalWidget(QWidget):
                 or self.command_appears_to_be_running()
             ):
                 self.send_interactive_input("")
+            return
+
+        # A batch command reads from /dev/null. Sending anything as an
+        # interactive reply cannot reach the child and risks corrupting the
+        # command protocol; leave the input intact until completion.
+        if (getattr(self, "_qprocess_bash_batch", False)
+                and getattr(self, "_bash_completion_pending", False)):
             return
 
         if self.password_prompt_active or self.visible_output_waits_for_password():
@@ -5850,6 +5943,9 @@ class ShellDeckTerminalWidget(QWidget):
                 self.reset_password_prompt_mode("Veraltete Passworteingabe ignoriert")
             return
 
+        if getattr(self, "_qprocess_bash_batch", False) and getattr(self, "_bash_completion_pending", False):
+            # Batch commands never accept stdin from the lower input editor.
+            return
         if self.interaction_prompt_active or self.visible_output_waits_for_interaction() or self.command_appears_to_be_running():
             # Laufender Prozess/Continuation/Confirm: Eingabe roh senden. Keine
             # Historie, kein Vorbefehl und keine Kontext-Probe. So können auch
@@ -5876,7 +5972,13 @@ class ShellDeckTerminalWidget(QWidget):
                 self.window.remember_pre_command_text(prefix_text)
                 prefix_commands = self.command_sequence_from_text(prefix_text, include_prefix=False)
 
-        user_commands = self.command_sequence_from_text(command_text, include_prefix=False)
+        # Noninteractive Bash wraps an entire submitted input in one completion
+        # frame. Splitting at semicolons would dispatch the second fragment
+        # while the first still owns the pending frame, silently losing it.
+        if getattr(self, "_qprocess_bash_batch", False):
+            user_commands = [command_text]
+        else:
+            user_commands = self.command_sequence_from_text(command_text, include_prefix=False)
         commands_with_origin = [(command, False) for command in prefix_commands] + [(command, True) for command in user_commands]
         if not commands_with_origin:
             return
@@ -5976,10 +6078,12 @@ class ShellDeckTerminalWidget(QWidget):
                     continue
         return value.encode("utf-8", errors="replace")
 
-    def decoded_terminal_output(self, raw, *, qprocess_stream=None):
+    def decoded_terminal_output(self, raw, *, qprocess_stream=None, predecoded_text=None):
         # POSIX-QProcess gibt jetzt begrenzte Byte-Pakete aus. UTF-8 kann an
         # deren Grenze getrennt sein: daher pro Kanal inkrementell dekodieren.
-        if qprocess_stream is not None and sys.platform != "win32":
+        if predecoded_text is not None:
+            text = predecoded_text
+        elif qprocess_stream is not None and sys.platform != "win32":
             text = self._qprocess_decoders[qprocess_stream].decode(bytes(raw), final=False)
         else:
             text = self._decode_process_output(raw)
@@ -6638,10 +6742,23 @@ class ShellDeckTerminalWidget(QWidget):
             return
         self._qprocess_deferred_finish = None
         # Bei einer unvollstaendigen UTF-8-Sequenz zum Ende kein Byte verlieren.
+        decoder = getattr(self, "_bash_completion_decoder", None)
         for stream in ("stdout", "stderr"):
             tail = self._qprocess_decoders[stream].decode(b"", final=True)
             if tail:
+                if stream == "stdout" and decoder is not None:
+                    visible, _codes = decoder.feed(tail)
+                    tail = visible
                 self.queue_terminal_output(tail, self.terminal_stderr_color() if stream == "stderr" else None)
+        if decoder is not None:
+            self.queue_terminal_output(decoder.finish())
+            self._bash_completion_decoder = None
+            self._bash_completion_pending = False
+        # A shell exit does not necessarily emit a completion frame (for
+        # example `exit`, SIGTERM or a failed shell initialisation). Do not
+        # leave the GUI stuck in a waiting-for-command state.
+        if getattr(self, "_qprocess_bash_batch", False):
+            self._awaiting_command_completion = False
         self._finalize_shell_process_finished(code)
 
     def _finalize_shell_process_finished(self, exit_code):
@@ -6665,15 +6782,49 @@ class ShellDeckTerminalWidget(QWidget):
             self.terminal_grid.feed(raw)
             self._schedule_qprocess_output_pump()
             return
-        data = self.decoded_terminal_output(
-            raw, qprocess_stream="stdout" if isinstance(self.process, QProcess) else None)
-        self.queue_terminal_output(data)
-        self.append_command_task_output("stdout", data)
-        self.handle_possible_password_prompt(data)
-        self.handle_possible_interactive_prompt(data)
-        self.refresh_password_prompt_state_after_output()
-        self.refresh_interaction_prompt_state_after_output()
-        self.finish_active_command_task_if_prompt_returned()
+        completed_codes = []
+        decoder = getattr(self, "_bash_completion_decoder", None)
+        if decoder is not None and isinstance(self.process, QProcess):
+            # The marker is framed by RS/US control bytes. ANSI/control
+            # cleaning removes these bytes, so decode the frame BEFORE
+            # preparing the remaining visible output for the transcript.
+            if sys.platform != "win32":
+                decoded = self._qprocess_decoders["stdout"].decode(bytes(raw), final=False)
+            else:
+                decoded = self._decode_process_output(raw)
+            visible, completed_codes = decoder.feed(decoded)
+            data = self.decoded_terminal_output(b"", predecoded_text=visible)
+            if completed_codes:
+                # Danach wieder die normale Bash-Prompt-Erkennung verwenden.
+                self._bash_completion_pending = False
+                self._bash_completion_decoder = None
+                self._awaiting_command_completion = False
+                if getattr(self, "_qprocess_bash_batch", False):
+                    # A successful completion frame is authoritative.  The
+                    # QProcess itself remains alive between commands.
+                    self.reset_interaction_prompt_mode()
+        else:
+            # Legacy QProcess output and non-QProcess backends still need
+            # the normal decode path when no completion decoder is active.
+            data = self.decoded_terminal_output(
+                raw, qprocess_stream="stdout" if isinstance(self.process, QProcess) else None)
+        if data:
+            self.queue_terminal_output(data)
+            self.append_command_task_output("stdout", data)
+        # One completion marker closes exactly one command task. Any
+        # output following that marker stays visible without reopening the
+        # prompt-driven completion path in batch mode.
+        for exit_code in completed_codes:
+            self.finish_active_command_task(
+                status="erfolgreich" if exit_code == 0 else "Fehler",
+                exit_code=exit_code,
+            )
+        if not getattr(self, "_qprocess_bash_batch", False):
+            self.handle_possible_password_prompt(data)
+            self.handle_possible_interactive_prompt(data)
+            self.refresh_password_prompt_state_after_output()
+            self.refresh_interaction_prompt_state_after_output()
+            self.finish_active_command_task_if_prompt_returned()
         if not self._prompt_label_refresh_timer.isActive():
             self._prompt_label_refresh_timer.start()
         self._schedule_qprocess_output_pump()

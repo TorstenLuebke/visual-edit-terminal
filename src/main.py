@@ -157,6 +157,7 @@ class TerminalWindow(QMainWindow):
         self.theme_config = self.default_theme_config()
         self.shell_type = self.default_shell_type()
         self.terminal_engine = "auto"
+        self.qprocess_bash_mode = "classic"
         # True, sobald der Benutzer die Engine bewusst ausgewaehlt hat (Liste,
         # Menue oder gespeicherte Einstellung). Nur solange das False ist, darf
         # create_shell_process() unter Linux/macOS automatisch auf PTY anheben.
@@ -471,6 +472,17 @@ class TerminalWindow(QMainWindow):
         self.terminal_engine_combo.currentIndexChanged.connect(self.set_terminal_engine_from_combo)
         pre_command_layout.addWidget(self.terminal_engine_combo)
 
+        self.qprocess_bash_combo = QComboBox(self.pre_command_bar)
+        self.qprocess_bash_combo.addItem("Bash: kompatibel", "classic")
+        self.qprocess_bash_combo.addItem("Bash: ohne Jobsteuerung (Test)", "batch")
+        self.qprocess_bash_combo.setToolTip(
+            "Nur für QProcess-Bash. Ein Wechsel startet den aktuellen Bash-Tab neu; "
+            "interaktive Programme benötigen weiterhin PTY/ConPTY."
+        )
+        self.qprocess_bash_combo.setMinimumWidth(230)
+        self.qprocess_bash_combo.currentIndexChanged.connect(self.set_qprocess_bash_from_combo)
+        pre_command_layout.addWidget(self.qprocess_bash_combo)
+
         self.pre_command_enabled_checkbox = QCheckBox("Vorbefehl aktiv", self.pre_command_bar)
         self.pre_command_enabled_checkbox.setToolTip(
             "Führt den Vorbefehl vor normalen Eingaben aus dem unteren Eingabefeld aus."
@@ -510,6 +522,7 @@ class TerminalWindow(QMainWindow):
         layout.addWidget(self.view_container)
 
         self.load_settings()
+        self.update_qprocess_bash_ui()
         self.update_terminal_engine_ui()
         self.update_pre_command_ui()
         self.apply_view_layout(move_tabs=False)
@@ -519,6 +532,9 @@ class TerminalWindow(QMainWindow):
         self.rebuild_workspaces_menu()
         self.apply_color_scheme()
         self.restore_tabs_from_settings()
+        # Die wiederhergestellten Tabs bestimmen erst jetzt die aktive Engine.
+        self.update_terminal_engine_ui()
+        self.update_qprocess_bash_ui()
 
         self.shortcut_stop = QShortcut("Ctrl+C", self)
         self.shortcut_stop.activated.connect(self.interrupt_current_command)
@@ -730,6 +746,7 @@ class TerminalWindow(QMainWindow):
                 self.update_terminal_engine_ui()
                 return False
         self.update_terminal_engine_ui()
+        self.update_qprocess_bash_ui()
         if save:
             self.save_terminal_engine_persistent_settings()
             self.save_settings()
@@ -738,6 +755,44 @@ class TerminalWindow(QMainWindow):
             suffix = "Der aktuelle Tab wurde mit dieser Engine neu gestartet." if isinstance(current_tab, TerminalTab) else "Die Änderung gilt für neu gestartete Tabs."
             if changed or save:
                 self.show_status(f"Terminal-Engine: {self.terminal_engine_label(new_engine)}. {suffix}")
+
+    def update_qprocess_bash_ui(self):
+        combo = getattr(self, "qprocess_bash_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        index = combo.findData(self.qprocess_bash_mode)
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+        # Die GUI-Auswahl kann vor dem Wiederherstellen des Tabs erscheinen.
+        # Nur die explizit ausgewaehlte Engine bestimmt ihre Bedienbarkeit.
+        # Die sichere Tab-Neustart-Pruefung bleibt im Umschalthandler.
+        applicable = (sys.platform != "win32"
+                      and self.terminal_engine_combo_value() == "qprocess")
+        combo.setEnabled(applicable)
+
+    def set_qprocess_bash_from_combo(self, index=0):
+        combo = self.qprocess_bash_combo
+        requested = str(combo.currentData() or "classic")
+        previous = self.qprocess_bash_mode
+        if requested == previous:
+            return
+        tab = self.current_terminal()
+        if (sys.platform == "win32" or not isinstance(tab, TerminalTab)
+                or str(getattr(tab, "shell_type", "")).lower() != "bash"
+                or self.terminal_engine_combo_value() != "qprocess"):
+            self.update_qprocess_bash_ui()
+            return
+        self.qprocess_bash_mode = requested
+        # Reuse the engine's guarded stop/restart path, even for the same engine.
+        if not tab.set_terminal_engine("qprocess",
+                                       restart=True, force_restart=True):
+            self.qprocess_bash_mode = previous
+            self.update_qprocess_bash_ui()
+            return
+        self.save_settings()
+        self.show_status("QProcess-Bash umgestellt; der aktuelle Tab wurde neu gestartet.")
+        self.update_qprocess_bash_ui()
 
     def set_terminal_engine_from_combo(self, index=0):
         selected = self.terminal_engine_combo_value()
@@ -1442,6 +1497,8 @@ class TerminalWindow(QMainWindow):
         index = target.addTab(tab, tab.title or f"Terminal {self.total_terminal_tab_count() + 1}")
         target.setCurrentIndex(index)
         self.active_tab_widget = target
+        self.update_terminal_engine_ui()
+        self.update_qprocess_bash_ui()
         self.apply_color_scheme()
         return tab
 
@@ -2155,6 +2212,7 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if tab is not None:
             self.update_terminal_engine_ui()
+            self.update_qprocess_bash_ui()
             engine_label = self.terminal_engine_label_for_tab(tab)
             self.statusBar().showMessage(f"Shell-Backend: {self.shell_backend_label(tab.shell_type)} | Engine: {engine_label}")
 
@@ -3056,6 +3114,8 @@ class TerminalWindow(QMainWindow):
             self.workspaces = self.merge_workspaces_by_name(self.workspaces, self.load_persistent_workspaces())
             return
 
+        from shelldeck_qprocess_bash_batch import normalized_batch_mode
+        self.qprocess_bash_mode = normalized_batch_mode(settings.get("qprocess_bash_mode"))
         font_text = str(settings.get("font", "")).strip()
         if font_text:
             font = QFont()
@@ -3156,6 +3216,7 @@ class TerminalWindow(QMainWindow):
             "scrollback_blocks": normalize_scrollback_blocks(self.scrollback_blocks),
             "vt_scrollback_lines": normalize_vt_scrollback_lines(self.vt_scrollback_lines),
             "shell_type": self.shell_type,
+            "qprocess_bash_mode": self.qprocess_bash_mode,
             "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
             **terminal_engine_settings,
             "tabs": self.collect_tab_settings(),
