@@ -1,0 +1,11 @@
+set pagination off
+set confirm off
+set print thread-events off
+set logging file /home/torsten/Programme/visual-edit-terminal/gdb-shelldeck-native.log
+set logging overwrite on
+set logging enabled on
+handle SIGPIPE nostop noprint pass
+run
+thread apply all bt 40
+info sharedlibrary
+quit

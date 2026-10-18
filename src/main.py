@@ -4639,6 +4639,9 @@ def main(argv=None) -> int:
     install_crash_logging()
     launch_options = parse_launch_arguments(list(argv[1:]))
     app = QApplication(sys.argv)
+    # Optional Qt-Wayland focus diagnostics; disabled unless explicitly requested.
+    from shelldeck_wayland_focus_trace import install_focus_trace
+    install_focus_trace(app)
     try:
         app.setStyle("Fusion")
     except Exception:

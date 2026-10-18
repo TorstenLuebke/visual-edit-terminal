@@ -29,6 +29,7 @@ from shelldeck_scrollback import normalize_vt_scrollback_lines
 import shelldeck_key_encoding as keyenc
 from shelldeck_mouse_protocol import encode_sgr_mouse
 import shelldeck_vt_screen as vt
+from shelldeck_vt_feed_control import FeedCounters, terminal_feed_chunks
 
 
 def _build_key_name_map():
@@ -212,7 +213,18 @@ class TerminalGridView(QWidget):
         if self._model is None:
             return
         self._vt_raw_trace.append(data)
-        self._model.feed(data)
+        # Die bereits vorhandene Reader-ACK-Sperre bleibt unverändert.
+        # Einzelne GUI-Slots übergeben dem VT-Modell kleinere Teilstücke,
+        # ohne Bytes wegzulassen, Terminalsequenzen zu interpretieren oder
+        # zwischenzeitlich die Bildschirmdarstellung zu verändern.
+        counters = getattr(self, "_vt_feed_counters", None)
+        if counters is None:
+            counters = self._vt_feed_counters = FeedCounters()
+        piece_count = 0
+        for part in terminal_feed_chunks(data):
+            self._model.feed(part)
+            piece_count += 1
+        counters.record(len(data), piece_count)
         # Readline may erase a longer command with CSI K after moving the
         # cursor. Repaint the whole shell grid for erasure sequences only;
         # ordinary output keeps the fast, sparse dirty-row updates.
