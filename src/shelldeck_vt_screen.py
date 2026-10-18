@@ -204,10 +204,60 @@ class _ScreenBuffers:
         self._alt_modes.clear()
         self._alt_was_used = False
 
+    @staticmethod
+    def _resize_screen_with_tabs(screen, lines, columns):
+        """Extend default tab stops after a terminal grows horizontally.
+
+        pyte can keep the stops from an earlier, narrower geometry. With a
+        missing stop, HT jumps to the last column and splits the following
+        word across the right edge (observed with GNU ls column output).
+        Preserve existing/custom stops; only populate newly exposed columns.
+        """
+        old_columns = int(screen.columns)
+        # pyte drops cells beyond the new right margin permanently. Keep a
+        # bounded, screen-local backup of those cells for simple resize replay.
+        # This is NOT reflow: if terminal output arrives while narrowed, the
+        # backup is invalidated rather than risking resurrection of stale text.
+        tails = getattr(screen, "_shelldeck_resize_tails", None)
+        if tails is None:
+            tails = {}
+        if columns < old_columns:
+            for y, row in list(screen.buffer.items()):
+                if not 0 <= y < min(int(lines), int(screen.lines)):
+                    continue
+                discarded = {x: cell for x, cell in row.items()
+                             if isinstance(x, int) and columns <= x < old_columns}
+                if discarded:
+                    tails.setdefault(y, {}).update(discarded)
+        screen.resize(lines, columns)
+        if columns > old_columns and tails:
+            for y, cells in list(tails.items()):
+                if not 0 <= y < int(lines):
+                    tails.pop(y, None)
+                    continue
+                visible = {x: cell for x, cell in cells.items() if x < columns}
+                if visible:
+                    screen.buffer[y].update(visible)
+                    screen.dirty.add(y)
+                    for x in visible:
+                        cells.pop(x, None)
+                if not cells:
+                    tails.pop(y, None)
+        screen._shelldeck_resize_tails = tails
+        if columns > old_columns:
+            stops = getattr(screen, "tabstops", None)
+            if stops is not None:
+                first = ((old_columns // 8) + 1) * 8
+                # Include a newly exposed stop exactly at old_columns when
+                # the old geometry ended on an 8-column boundary.
+                if old_columns % 8 == 0:
+                    first = old_columns
+                stops.update(range(first, columns, 8))
+
     def resize(self, lines, columns):
         # Even a hidden screen needs the new geometry before it is restored.
-        self.normal.resize(lines, columns)
-        self.alternate.resize(lines, columns)
+        self._resize_screen_with_tabs(self.normal, lines, columns)
+        self._resize_screen_with_tabs(self.alternate, lines, columns)
         self._active.dirty.update(range(lines))
 
 
@@ -251,6 +301,10 @@ class VtScreen:
         else:
             text = str(data or "")
         if text:
+            # Any PTY output may modify cells or scroll rows. Never restore a
+            # saved horizontal tail after content may have changed.
+            self.screen.normal._shelldeck_resize_tails = {}
+            self.screen.alternate._shelldeck_resize_tails = {}
             self.stream.feed(text)
 
     # --- Geometrie --------------------------------------------------------
@@ -327,6 +381,32 @@ class VtScreen:
     def display(self) -> List[str]:
         """Sichtbarer Bildschirm als Liste von Zeilen-Strings."""
         return list(self.screen.display)
+
+    @staticmethod
+    def _snapshot_line(row, columns: int) -> str:
+        """Read pyte cells without advancing scrollback or touching screen state."""
+        return "".join(
+            getattr(row.get(x), "data", " ") or " " for x in range(columns)
+        ).rstrip()
+
+    def transcript_lines(self) -> List[str]:
+        """Bounded normal-screen history plus viewport (no alternate TUI capture).
+
+        pyte history.top is chronological. The active viewport may already be
+        scrolled upwards, in which case history.bottom contains newer rows.
+        These are copied, never consumed via prev_page/next_page.
+        """
+        normal = self.screen.normal
+        history = getattr(normal, "history", None)
+        top = list(history.top) if history is not None else []
+        bottom = list(history.bottom) if history is not None else []
+        visible = [normal.buffer[y] for y in range(self._rows)]
+        return [self._snapshot_line(row, self._cols)
+                for row in top + visible + bottom]
+
+    def transcript_text(self) -> str:
+        """Return the retained normal PTY scrollback and screen as plain text."""
+        return "\n".join(self.transcript_lines()).rstrip("\n")
 
     def dirty_lines(self) -> List[int]:
         """Seit dem letzten clear_dirty() veränderte Zeilenindizes."""

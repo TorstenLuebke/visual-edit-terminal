@@ -1,0 +1,8 @@
+[package]
+name = "shelldeck-core-experiment"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+# No dependencies: an isolated logical-line experiment, NOT a VT terminal.

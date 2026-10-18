@@ -1,0 +1,9 @@
+[package]
+name = "shelldeck-rust-transport-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+# Intentionally no dependencies. This is NOT a VT engine and does not
+# include WezTerm; licensing and API integration are separate gates.

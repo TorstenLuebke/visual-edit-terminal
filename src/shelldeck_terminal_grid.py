@@ -16,7 +16,10 @@ zeigt an, ob echte Terminaldarstellung möglich ist.
 """
 
 from __future__ import annotations
+import re
 
+from collections import deque
+from time import monotonic
 from functools import lru_cache
 from typing import Dict, Optional
 
@@ -25,6 +28,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QMenu, QWidget
 
 from shelldeck_scrollback import normalize_vt_scrollback_lines
+from shelldeck_prompt import PROMPT_ROLE_RGB, ENVIRONMENT_ROLE_RGB
 
 import shelldeck_key_encoding as keyenc
 from shelldeck_mouse_protocol import encode_sgr_mouse
@@ -124,16 +128,25 @@ class TerminalGridView(QWidget):
         self.default_fg = QColor("#d0d0d0")
         self.default_bg = QColor("#1e1e1e")
         self.selection_bg = QColor("#264f78")
+        self.prompt_role_colors = {
+            PROMPT_ROLE_RGB[1:].lower(): QColor("#86EFAC"),
+            ENVIRONMENT_ROLE_RGB[1:].lower(): QColor("#67E8F9"),
+        }
 
         # Auswahlzustand (Zeile, Spalte), jeweils inklusive.
         self._sel_anchor = None
         self._sel_head = None
         self._local_mouse_selection = False
+        # VT escape sequences can straddle PTY reader chunks.
+        self._selection_control_tail = b""
 
         self._cell_w = 1.0
         self._cell_h = 1.0
         self._ascent = 0.0
         self._last_cursor = None
+        # Bounded, content-free startup cursor transitions for VT diagnostics.
+        self._cursor_diagnostics = deque(maxlen=80)
+        self._cursor_diagnostics_start = monotonic()
 
         from shelldeck_vt_trace import VtRawTrace
         self._vt_raw_trace = VtRawTrace()
@@ -207,12 +220,31 @@ class TerminalGridView(QWidget):
             "hidden": bool(state.get("hidden", False)),
         }
 
+    def _record_cursor_transition(self, reason: str, before=None, **details):
+        """Record only coordinates/geometry, never terminal input or output."""
+        if self._model is None:
+            return
+        cursor = self._model.cursor
+        after = (int(cursor.get("x", 0)), int(cursor.get("y", 0)))
+        stamp = round(monotonic() - self._cursor_diagnostics_start, 3)
+        self._cursor_diagnostics.append((stamp, str(reason), before, after,
+                                         int(self._model.rows), int(self._model.cols),
+                                         tuple(sorted(details.items()))))
+
+    def _cursor_diagnostic_text(self):
+        lines = ["Cursor transitions (seconds since grid creation; no input or screen contents):"]
+        for stamp, reason, before, after, rows, cols, details in self._cursor_diagnostics:
+            lines.append(f"{stamp:.3f}s {reason}: {before} -> {after} "
+                         f"grid={rows}x{cols} {dict(details)}")
+        return "\n".join(lines) + "\n"
+
     # --- Datenzufuhr ------------------------------------------------------
     def feed(self, data) -> None:
         """Rohbytes/Text in das Modell geben und betroffene Zeilen neu zeichnen."""
         if self._model is None:
             return
         self._vt_raw_trace.append(data)
+        self._invalidate_selection_on_screen_erase(data)
         # Die bereits vorhandene Reader-ACK-Sperre bleibt unverändert.
         # Einzelne GUI-Slots übergeben dem VT-Modell kleinere Teilstücke,
         # ohne Bytes wegzulassen, Terminalsequenzen zu interpretieren oder
@@ -220,11 +252,18 @@ class TerminalGridView(QWidget):
         counters = getattr(self, "_vt_feed_counters", None)
         if counters is None:
             counters = self._vt_feed_counters = FeedCounters()
+        before_cursor = self._model.cursor
+        before_position = (int(before_cursor.get("x", 0)), int(before_cursor.get("y", 0)))
         piece_count = 0
         for part in terminal_feed_chunks(data):
             self._model.feed(part)
             piece_count += 1
         counters.record(len(data), piece_count)
+        after_cursor = self._model.cursor
+        after_position = (int(after_cursor.get("x", 0)), int(after_cursor.get("y", 0)))
+        if before_position != after_position or len(self._cursor_diagnostics) < 5:
+            self._record_cursor_transition("pty_feed", before_position, bytes=len(data),
+                                           controls=self._control_sequence_summary(data))
         # Readline may erase a longer command with CSI K after moving the
         # cursor. Repaint the whole shell grid for erasure sequences only;
         # ordinary output keeps the fast, sparse dirty-row updates.
@@ -234,10 +273,43 @@ class TerminalGridView(QWidget):
         )
         self._repaint_dirty(force_shell_full=redraw_with_erase)
 
+    def _invalidate_selection_on_screen_erase(self, data) -> None:
+        """Drop stale highlights only for explicit whole-screen erasures.
+
+        Detect CSI 2J/3J (including private parameter variants with optional
+        preceding zeros) and RIS. A small tail handles an escape split between
+        PTY reads; normal scroll or line erase CSI K retains the selection.
+        """
+        raw = bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8", "replace")
+        combined = self._selection_control_tail + raw
+        # A minimal bounded detector, not a second VT terminal parser.
+        erase = bool(re.search(rb"\x1b\[[0;]*[23]J|\x1bc", combined))
+        self._selection_control_tail = combined[-16:]
+        if erase and self.has_selection():
+            self.clear_selection()
+
     def reset(self) -> None:
+        self.clear_selection()
+        self._selection_control_tail = b""
         if self._model is not None:
             self._model.reset()
         self.update()
+
+    @staticmethod
+    def _control_sequence_summary(data) -> str:
+        """Nur VT-Steuerklassen protokollieren, niemals Terminalinhalt."""
+        raw = data if isinstance(data, bytes) else str(data).encode("utf-8", "replace")
+        names = []
+        for match in re.finditer(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\r\n\b]", raw):
+            token = match.group()
+            if token.startswith(b"\x1b["):
+                # Parameterwerte vermeiden: nur CSI-Endkennung und Privatmodus.
+                names.append("CSI:" + chr(token[-1]) + ("?" if b"?" in token[:4] else ""))
+            elif token.startswith(b"\x1b]"):
+                names.append("OSC")
+            else:
+                names.append({13: "CR", 10: "LF", 8: "BS"}.get(token[0], "CTRL"))
+        return ",".join(names[:48]) + (",..." if len(names) > 48 else "")
 
     def _repaint_dirty(self, *, force_shell_full: bool = False) -> None:
         if self._model is None:
@@ -292,7 +364,11 @@ class TerminalGridView(QWidget):
             return
         rows, cols = self._grid_size_for(self.width(), self.height())
         old_rows, old_cols = self._model.rows, self._model.cols
+        old_cursor = self._model.cursor
+        before_position = (int(old_cursor.get("x", 0)), int(old_cursor.get("y", 0)))
         if self._model.resize(rows, cols):
+            self._record_cursor_transition("grid_resize", before_position,
+                                           old_rows=old_rows, old_cols=old_cols)
             self.trace_event("grid_cells_changed", old_rows=old_rows, old_cols=old_cols,
                              rows=rows, cols=cols)
             # Bei einer veraenderten Zellgeometrie sind alle Zeilen neu zu
@@ -374,10 +450,21 @@ class TerminalGridView(QWidget):
         self.update()
         event.accept()
 
+    def set_prompt_role_colors(self, colors):
+        """Nur ShellDeck-eigene SGR-Rollen neu zeichnen; VT bleibt unverändert."""
+        self.prompt_role_colors = {
+            PROMPT_ROLE_RGB[1:].lower(): QColor(colors.get("prompt", "#86EFAC")),
+            ENVIRONMENT_ROLE_RGB[1:].lower(): QColor(colors.get("environment", "#67E8F9")),
+        }
+        self.update()
+
     # --- Farbauflösung ----------------------------------------------------
     def _resolve_color(self, value, default: QColor) -> QColor:
         if not value or value == "default":
             return default
+        role = self.prompt_role_colors.get(str(value).lstrip("#").lower())
+        if role is not None and role.isValid():
+            return role
         color = _cached_terminal_color(str(value))
         return color if color.isValid() else default
 
@@ -512,6 +599,9 @@ class TerminalGridView(QWidget):
             self._local_mouse_selection = True
             self._sel_anchor = self._cell_at(event.position().toPoint())
             self._sel_head = self._sel_anchor
+            self._sel_anchor_row_id = self._selection_row_id(self._sel_anchor[0])
+            self._sel_head_row_id = self._sel_anchor_row_id
+            self._selection_frozen_text = None
             self.update()
             event.accept()
             return
@@ -534,6 +624,8 @@ class TerminalGridView(QWidget):
                 return
         if self._sel_anchor is not None and (event.buttons() & Qt.MouseButton.LeftButton):
             self._sel_head = self._cell_at(event.position().toPoint())
+            self._sel_head_row_id = self._selection_row_id(self._sel_head[0])
+            self._selection_frozen_text = None
             self.update()
             event.accept()
             return
@@ -549,6 +641,10 @@ class TerminalGridView(QWidget):
             return
         if event.button() == Qt.MouseButton.LeftButton and self._sel_anchor is not None:
             self._local_mouse_selection = False
+            # Text unmittelbar festhalten: spätere Scroll-/PTY-Ausgaben ändern
+            # niemals rückwirkend den Inhalt der abgeschlossenen Auswahl.
+            if self.has_selection():
+                self._selection_frozen_text = self._selection_text_visible()
             # Reiner Klick ohne Ziehen hebt die Auswahl auf.
             if self._sel_head == self._sel_anchor:
                 self.clear_selection()
@@ -572,6 +668,9 @@ class TerminalGridView(QWidget):
         clear_action = menu.addAction("Markierung aufheben")
         clear_action.setEnabled(self.has_selection())
         clear_action.triggered.connect(self.clear_selection)
+        host = self.parentWidget()
+        if host is not None and hasattr(host, "populate_vt_context_menu"):
+            host.populate_vt_context_menu(menu)
         menu.addSeparator()
         diagnostic = menu.addAction("VT-Diagnose: Modell und Ansicht speichern …")
         diagnostic.setEnabled(self._model is not None)
@@ -687,7 +786,8 @@ class TerminalGridView(QWidget):
             screenshot = self.grab()
             if screenshot.isNull() or not screenshot.save(str(path.with_suffix(".png")), "PNG"):
                 raise OSError("PNG konnte nicht gespeichert werden")
-            path.write_text(snapshot, encoding="utf-8")
+            path.write_text(snapshot + "\n" + self._cursor_diagnostic_text(),
+                            encoding="utf-8")
         except Exception as exc:
             QMessageBox.warning(self, "VT-Diagnose", f"Speichern fehlgeschlagen: {exc}")
             return
@@ -721,38 +821,72 @@ class TerminalGridView(QWidget):
             return
         self._sel_anchor = (0, 0)
         self._sel_head = (self._model.rows - 1, self._model.cols - 1)
+        self._sel_anchor_row_id = self._selection_row_id(0)
+        self._sel_head_row_id = self._selection_row_id(self._model.rows - 1)
+        self._selection_frozen_text = self._selection_text_visible()
         self.update()
 
     def clear_selection(self) -> None:
         if self._sel_anchor is not None or self._sel_head is not None:
             self._sel_anchor = None
             self._sel_head = None
+            self._sel_anchor_row_id = None
+            self._sel_head_row_id = None
+            self._selection_frozen_text = None
             self.update()
 
     def has_selection(self) -> bool:
         return self._sel_anchor is not None and self._sel_head is not None \
             and self._sel_anchor != self._sel_head
 
+    def _selection_row_id(self, row):
+        """Identität der pyte-Verlaufszeile, nicht ihrer Viewport-Position."""
+        if self._model is None:
+            return None
+        try:
+            return id(self._model.screen.buffer[int(row)])
+        except (IndexError, KeyError, TypeError):
+            return None
+
+    def _selection_viewport_rows(self):
+        """Anker nach Scrollen an die ursprüngliche Verlaufszeile binden."""
+        if not self.has_selection() or self._model is None:
+            return None
+        a = getattr(self, "_sel_anchor_row_id", None)
+        b = getattr(self, "_sel_head_row_id", None)
+        if a is None or b is None:
+            return None
+        visible = {self._selection_row_id(y): y for y in range(self._model.rows)}
+        if a not in visible or b not in visible:
+            return None
+        return (visible[a], self._sel_anchor[1]), (visible[b], self._sel_head[1])
+
     def _normalized_selection(self):
         if not self.has_selection():
             return None
-        a, b = self._sel_anchor, self._sel_head
+        endpoints = self._selection_viewport_rows()
+        if endpoints is None:
+            return None
+        a, b = endpoints
         return (a, b) if a <= b else (b, a)
 
+    @staticmethod
+    def _cell_inside_selection(x: int, y: int, selection) -> bool:
+        if selection is None:
+            return False
+        (r0, c0), (r1, c1) = selection
+        return r0 <= y <= r1 and (y != r0 or x >= c0) and (y != r1 or x <= c1)
+
     def _is_selected(self, x: int, y: int) -> bool:
-        sel = self._normalized_selection()
-        if sel is None:
-            return False
-        (r0, c0), (r1, c1) = sel
-        if y < r0 or y > r1:
-            return False
-        if y == r0 and x < c0:
-            return False
-        if y == r1 and x > c1:
-            return False
-        return True
+        return self._cell_inside_selection(x, y, self._normalized_selection())
 
     def selected_text(self) -> str:
+        frozen = getattr(self, "_selection_frozen_text", None)
+        if frozen is not None:
+            return frozen
+        return self._selection_text_visible()
+
+    def _selection_text_visible(self) -> str:
         sel = self._normalized_selection()
         if sel is None or self._model is None:
             return ""
@@ -765,6 +899,67 @@ class TerminalGridView(QWidget):
             end = (c1 + 1) if y == r1 else len(line)
             parts.append(line[start:end].rstrip())
         return "\n".join(parts)
+
+    def find_transcript_text(self, query: str, backward=False, restart=False) -> bool:
+        """Search retained normal-screen history without scrolling the live VT model.
+
+        Search result is displayed in a read-only dialog so historical matches
+        are inspectable, including those outside the currently visible grid.
+        """
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QPlainTextEdit
+        from PySide6.QtGui import QTextCursor, QTextDocument
+        text = self.transcript_text()
+        if not query or not text:
+            return False
+        dialog = getattr(self, "_search_dialog", None)
+        if dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("PTY-Verlauf durchsuchen (Momentaufnahme)")
+            dialog.resize(840, 540)
+            layout = QVBoxLayout(dialog)
+            view = QPlainTextEdit(dialog)
+            view.setReadOnly(True)
+            layout.addWidget(view)
+            self._search_dialog = dialog
+            self._search_view = view
+            self._search_offset = None
+        view = self._search_view
+        if view.toPlainText() != text:
+            view.setPlainText(text)
+            self._search_offset = None
+        if restart:
+            self._search_offset = None
+        length = len(query)
+        pos = self._search_offset
+        if backward:
+            before = len(text) if pos is None else pos
+            found = text.lower().rfind(query.lower(), 0, before)
+            if found < 0:
+                found = text.lower().rfind(query.lower())
+        else:
+            after = 0 if pos is None else pos + length
+            found = text.lower().find(query.lower(), after)
+            if found < 0:
+                found = text.lower().find(query.lower())
+        if found < 0:
+            return False
+        self._search_offset = found
+        cursor = view.textCursor()
+        cursor.setPosition(found)
+        cursor.setPosition(found + length, QTextCursor.MoveMode.KeepAnchor)
+        view.setTextCursor(cursor)
+        view.ensureCursorVisible()
+        dialog.show()
+        dialog.raise_()
+        return True
+
+    def transcript_text(self) -> str:
+        return self._model.transcript_text() if self._model is not None else ""
+
+    def copy_all_output(self) -> None:
+        text = self.transcript_text()
+        if text:
+            QApplication.clipboard().setText(text)
 
     def copy_selection(self) -> None:
         text = self.selected_text()
@@ -816,6 +1011,9 @@ class TerminalGridView(QWidget):
         cur_x, cur_y = cursor.get("x", 0), cursor.get("y", 0)
         last_font = None
         last_pen = None
+        # Die Zuordnung der logischen Markierungszeilen ist unabhaengig
+        # von der Zelle. Einmal pro Frame ermitteln statt pro Zeichen.
+        selection = self._normalized_selection()
 
         for y in range(first, last + 1):
             cells = self._model.row_cells(y)
@@ -828,22 +1026,32 @@ class TerminalGridView(QWidget):
             try:
                 self._paint_cells_in_row(painter, cells, y, cols, cw, ch,
                                          y_px, show_cursor, cur_x, cur_y,
-                                         last_font, last_pen)
+                                         last_font, last_pen, selection)
             finally:
                 painter.restore()
 
     def _paint_cells_in_row(self, painter, cells, y, cols, cw, ch, y_px,
-                            show_cursor, cur_x, cur_y, last_font, last_pen):
+                            show_cursor, cur_x, cur_y, last_font, last_pen,
+                            selection=None):
         """Paint one terminal row, clipping oversized glyphs to their cell."""
+        selected_bounds = selection
         for x in range(cols):
             cell = cells[x]
+            selected = self._cell_inside_selection(x, y, selected_bounds)
+            is_cursor_cell = show_cursor and x == cur_x and y == cur_y
+            # Leerzellen mit Standardhintergrund wurden bereits durch den
+            # zeilenweisen fillRect geloescht. Kein QColor/QFont/Painter-Aufruf.
+            # Sonderhintergruende, inverse Farben und Auswahl bleiben erhalten.
+            if (cell["char"] in ("", " ") and not selected
+                    and not is_cursor_cell and not cell["reverse"]
+                    and cell["bg"] == "default"):
+                continue
             fg = self._resolve_color(cell["fg"], self.default_fg)
             bg = self._resolve_color(cell["bg"], self.default_bg)
             if cell["reverse"]:
                 fg, bg = bg, fg
-            if self._is_selected(x, y):
+            if selected:
                 bg = self.selection_bg
-            is_cursor_cell = show_cursor and x == cur_x and y == cur_y
             if is_cursor_cell:
                 fg, bg = bg, fg  # Blockcursor: Zelle invertieren
 

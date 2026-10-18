@@ -2774,6 +2774,51 @@ class ShellDeckTerminalWidget(QWidget):
             except Exception:
                 pass
 
+    def active_history_text(self, clean=False):
+        """Unified output access. PTY reads the retained VT model, not QTextEdit."""
+        grid = getattr(self, "terminal_grid", None)
+        if getattr(self, "real_terminal_active", False) and grid is not None:
+            text = grid.transcript_text()
+        else:
+            text = self.output_area.toPlainText()
+            pending = getattr(self, "_output_queue", [])
+            if pending:
+                text += "".join(str(item[0]) for item in pending if item)
+        return self.window.clean_output_text(text) if clean else text
+
+    def populate_vt_context_menu(self, menu):
+        """Append shared history/search/export and tab actions to VT menu."""
+        grid = self.terminal_grid
+        menu.addAction("Alles kopieren", grid.copy_all_output)
+        menu.addAction("Kopieren ohne Steuerzeichen",
+                       lambda: self.copy_vt_text(clean=True, selected=True)).setEnabled(grid.has_selection())
+        menu.addAction("Alles kopieren ohne Steuerzeichen",
+                       lambda: self.copy_vt_text(clean=True))
+        menu.addAction("Ausgabe speichern...", lambda: self.window.save_current_output("txt"))
+        menu.addAction("Ausgabe als Markdown speichern",
+                       lambda: self.window.save_current_output("md"))
+        menu.addSeparator()
+        menu.addAction("Suchen (Strg+F)", self.show_output_search_dialog)
+        menu.addAction("Nächster Treffer (F3)", lambda: self.find_output_text(backward=False))
+        menu.addAction("Vorheriger Treffer (Umschalt+F3)", lambda: self.find_output_text(backward=True))
+        menu.addSeparator()
+        menu.addAction("Neuer Tab", self.window.new_tab)
+        menu.addAction("Tab duplizieren", self.window.duplicate_current_tab)
+        menu.addAction("Tab umbenennen", self.window.rename_current_tab)
+        menu.addAction("Tab-Ordner aktualisieren", self.window.update_current_tab_directory)
+        menu.addAction("Befehlspalette", self.window.show_command_palette)
+        menu.addAction("Aktuellen Tab schließen", self.window.close_current_tab)
+
+    def copy_vt_text(self, clean=False, selected=False):
+        grid = getattr(self, "terminal_grid", None)
+        if grid is None:
+            return
+        text = grid.selected_text() if selected else grid.transcript_text()
+        if clean:
+            text = self.window.clean_output_text(text)
+        if text:
+            QApplication.clipboard().setText(text)
+
     def show_terminal_context_menu(self, pos):
         sender = self.sender()
         if not hasattr(sender, "mapToGlobal"):
@@ -2993,6 +3038,14 @@ class ShellDeckTerminalWidget(QWidget):
             self.show_output_search_dialog()
             return
 
+        grid = getattr(self, "terminal_grid", None)
+        if getattr(self, "real_terminal_active", False) and grid is not None:
+            result = grid.find_transcript_text(query, backward=backward, restart=restart)
+            self.window.statusBar().showMessage(
+                f"Treffer: {query}" if result else f"Nicht gefunden: {query}"
+            )
+            return
+
         flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
         if restart:
             cursor = self.output_area.textCursor()
@@ -3052,6 +3105,17 @@ class ShellDeckTerminalWidget(QWidget):
 
 
 
+    def sync_command_task_panel_visibility(self):
+        """Enforce engine-specific visibility without altering saved QProcess UI preferences."""
+        classic = not self.process_uses_pty_engine() and not bool(getattr(self, "real_terminal_active", False))
+        visible = classic and bool(getattr(self, "command_task_panel_visible", True))
+        header = getattr(self, "command_task_header", None)
+        table = getattr(self, "command_task_list", None)
+        if header is not None:
+            header.setVisible(visible)
+        if table is not None:
+            table.setVisible(visible and bool(getattr(self, "command_task_panel_expanded", False)))
+
     def update_command_task_header_label(self):
         header = getattr(self, "command_task_header", None)
         if header is None:
@@ -3081,6 +3145,7 @@ class ShellDeckTerminalWidget(QWidget):
             else:
                 task_table.setMaximumHeight(0)
         self.update_command_task_header_label()
+        self.sync_command_task_panel_visibility()
         if save:
             try:
                 self.window.save_settings()
@@ -3107,6 +3172,7 @@ class ShellDeckTerminalWidget(QWidget):
             else:
                 task_table.setMaximumHeight(0)
         self.update_command_task_header_label()
+        self.sync_command_task_panel_visibility()
 
     def command_task_time_label(self, value=None):
         timestamp = float(value if value is not None else time.time())
@@ -4112,6 +4178,25 @@ class ShellDeckTerminalWidget(QWidget):
         )
         if self._qprocess_bash_batch:
             shell_args = ["--noprofile", "--norc"]
+        # Bash wurde bisher in ShellDeck ohne Benutzer-rc gestartet. Fuer
+        # lokale PTY-Sitzungen erzeugen wir optional eine isolierte rc-Datei.
+        # QProcess, andere Shells sowie Windows bleiben unveraendert.
+        old_prompt_rc = getattr(self, "_shelldeck_prompt_rc", None)
+        self._shelldeck_prompt_rc = None
+        if (os.name == "posix" and self.process_uses_pty_engine()
+                and str(self.shell_type or "").lower() == "bash"
+                and getattr(self.window, "terminal_prompt_enabled", lambda: True)()):
+            from shelldeck_prompt import create_bash_prompt_rc
+            try:
+                prompt_colors = self.window.terminal_colors()
+                self._shelldeck_prompt_rc, rc_path = create_bash_prompt_rc(prompt_colors)
+                shell_args = ["--noprofile", "--rcfile", rc_path, "-i"]
+            except (OSError, ValueError):
+                self._shelldeck_prompt_rc = None
+        # Vorherige rc-Datei erst freigeben, nachdem die alte Shell beendet
+        # wurde. Neue Datei bleibt bis zum naechsten Start/Tab-Abbau erhalten.
+        if old_prompt_rc is not None:
+            old_prompt_rc.cleanup()
         if self.process_uses_pty_engine() and str(self.shell_type or "").lower() in {"powershell", "pwsh"}:
             # PSReadLine repaints long input lines in a real terminal using
             # carriage-return redraws. QTextEdit is not a terminal emulator and
@@ -4575,6 +4660,18 @@ class ShellDeckTerminalWidget(QWidget):
             absolute = self.restore_command_for_venv(saved_venv)
             if absolute:
                 text = absolute
+        # PTY-Bash erbt VIRTUAL_ENV aus ShellDecks Startumgebung. Ist die
+        # identische venv bereits beim Bash-Start aktiv, wuerde die zeitversetzte
+        # Restore-Aktivierung nur eine weitere, ueberfluessige Prompt-Zeile
+        # erzeugen. Andere Shells/Engines und andere venvs bleiben unberuehrt.
+        if (self.process_uses_pty_engine()
+                and os.name == "posix"
+                and str(self.shell_type or "").lower() == "bash"
+                and self.command_looks_like_venv_activation(text)):
+            from shelldeck_restore_guard import inherited_venv_already_active
+            if inherited_venv_already_active(
+                    saved_venv, os.environ.get("VIRTUAL_ENV", "")):
+                return False
         if not self.is_safe_restore_command(text):
             self.output_area.append(
                 f"\n[Gespeicherter Befehl wird beim Start nicht automatisch ausgeführt: {text}]\n"
@@ -6632,6 +6729,7 @@ class ShellDeckTerminalWidget(QWidget):
                 widget.hide()
             self.terminal_grid.show()
             self.real_terminal_active = True
+            self.sync_command_task_panel_visibility()
             self._update_auto_vt_timer()
             self._refresh_detected_program()
             if focus:
@@ -6653,6 +6751,7 @@ class ShellDeckTerminalWidget(QWidget):
                 pass
             if focus:
                 self.input_line.setFocus()
+        self.sync_command_task_panel_visibility()
         return True
 
     def toggle_real_terminal_mode(self):
@@ -6948,6 +7047,7 @@ class ShellDeckTerminalWidget(QWidget):
             grid.default_bg = QColor(background)
             grid.default_fg = QColor(stdout_color)
             grid.selection_bg = QColor(selection)
+            grid.set_prompt_role_colors(colors)
             grid.setFont(self.window.terminal_font)
             grid.update()
         except Exception:

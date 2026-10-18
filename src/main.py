@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
     QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
     QDialog, QFormLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QSlider,
-    QDialogButtonBox, QCheckBox, QTabWidget, QMenu, QFileDialog,
+    QDialogButtonBox, QCheckBox, QScrollArea, QTabWidget, QMenu, QFileDialog,
     QLineEdit, QListWidget, QListWidgetItem, QSplitter, QMessageBox
 )
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer, QByteArray
@@ -486,7 +486,9 @@ class TerminalWindow(QMainWindow):
 
         self.pre_command_enabled_checkbox = QCheckBox("Vorbefehl aktiv", self.pre_command_bar)
         self.pre_command_enabled_checkbox.setToolTip(
-            "Führt den Vorbefehl vor normalen Eingaben aus dem unteren Eingabefeld aus."
+            "Vorbefehl für klassische ShellDeck-Eingaben (QProcess). "
+            "In PTY/ConPTY verwaltet die Shell ihre Eingaben selbst; "
+            "kein automatisches Einschleusen bei Enter in interaktive Programme."
         )
         self.pre_command_enabled_checkbox.toggled.connect(self.set_pre_command_enabled)
         pre_command_layout.addWidget(self.pre_command_enabled_checkbox)
@@ -1474,6 +1476,27 @@ class TerminalWindow(QMainWindow):
         self.show_status("KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.")
         return False
 
+    def focus_active_terminal(self):
+        """Focus the real input surface, never a hidden classic editor."""
+        if QApplication.activeModalWidget() is not None:
+            return False
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            return False
+        target = (getattr(tab, "terminal_grid", None)
+                  if getattr(tab, "real_terminal_active", False)
+                  else getattr(tab, "input_line", None))
+        if target is None or not target.isVisible():
+            return False
+        target.setFocus(Qt.FocusReason.OtherFocusReason)
+        return True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Tabs are restored before the window is mapped. Qt/Wayland may
+        # override focus assigned to a child while the window is hidden.
+        QTimer.singleShot(0, self.focus_active_terminal)
+
     def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path="", terminal_engine=None):
         effective_start_directory = start_directory
         if effective_start_directory is None:
@@ -1500,7 +1523,9 @@ class TerminalWindow(QMainWindow):
         self.active_tab_widget = target
         self.update_terminal_engine_ui()
         self.update_qprocess_bash_ui()
+        self.update_pre_command_ui()
         self.apply_color_scheme()
+        QTimer.singleShot(0, self.focus_active_terminal)
         return tab
 
     def update_tab_title(self, tab):
@@ -1982,6 +2007,10 @@ class TerminalWindow(QMainWindow):
                     tab.set_command_task_panel_visible(bool(item.get("command_task_panel_visible", True)), save=False)
                 if "command_task_panel_expanded" in item:
                     tab.set_command_task_panel_expanded(bool(item.get("command_task_panel_expanded", False)))
+                # Restoring the saved UI state must never expose the classic
+                # command toolbar over a live PTY grid. The shell has its own
+                # history; a new process starts with its own fresh prompt.
+                tab.sync_command_task_panel_visibility()
                 if item.get("pure_terminal_mode"):
                     tab.set_pure_terminal_mode(True, focus=False, save=False)
             restored = True
@@ -1993,7 +2022,7 @@ class TerminalWindow(QMainWindow):
         self.save_settings()
         current_tab = self.current_terminal()
         if isinstance(current_tab, TerminalTab):
-            current_tab.input_line.setFocus()
+            QTimer.singleShot(0, self.focus_active_terminal)
         self.show_status(f"Workspace geladen: {workspace.get('name', '')}")
 
 
@@ -2215,6 +2244,7 @@ class TerminalWindow(QMainWindow):
             self.update_terminal_engine_ui()
             self.update_qprocess_bash_ui()
             engine_label = self.terminal_engine_label_for_tab(tab)
+            QTimer.singleShot(0, self.focus_active_terminal)
             self.statusBar().showMessage(f"Shell-Backend: {self.shell_backend_label(tab.shell_type)} | Engine: {engine_label}")
 
     def search_current_output(self):
@@ -2241,12 +2271,13 @@ class TerminalWindow(QMainWindow):
     def update_view_menu_state(self):
         tab = self.current_terminal()
         is_terminal = isinstance(tab, TerminalTab)
+        classic_history = bool(is_terminal and not tab.process_uses_pty_engine())
         if hasattr(self, "command_task_panel_action"):
-            self.command_task_panel_action.setEnabled(is_terminal)
-            self.command_task_panel_action.setChecked(bool(is_terminal and getattr(tab, "command_task_panel_visible", True)))
+            self.command_task_panel_action.setEnabled(classic_history)
+            self.command_task_panel_action.setChecked(bool(classic_history and getattr(tab, "command_task_panel_visible", True)))
         if hasattr(self, "command_task_expand_action"):
-            self.command_task_expand_action.setEnabled(is_terminal and bool(getattr(tab, "command_task_panel_visible", True)))
-            self.command_task_expand_action.setChecked(bool(is_terminal and getattr(tab, "command_task_panel_expanded", False)))
+            self.command_task_expand_action.setEnabled(classic_history and bool(getattr(tab, "command_task_panel_visible", True)))
+            self.command_task_expand_action.setChecked(bool(classic_history and getattr(tab, "command_task_panel_expanded", False)))
         if hasattr(self, "pure_terminal_view_action"):
             self.pure_terminal_view_action.setEnabled(is_terminal and not getattr(tab, "real_terminal_active", False))
             self.pure_terminal_view_action.setChecked(bool(is_terminal and tab.inline_mode_active()))
@@ -2257,14 +2288,14 @@ class TerminalWindow(QMainWindow):
 
     def set_current_command_task_panel_visible(self, checked):
         tab = self.current_terminal()
-        if isinstance(tab, TerminalTab):
+        if isinstance(tab, TerminalTab) and not tab.process_uses_pty_engine():
             tab.set_command_task_panel_visible(bool(checked))
             self.show_status("Letzte Befehle eingeblendet" if checked else "Letzte Befehle ausgeblendet")
             self.update_view_menu_state()
 
     def set_current_command_task_panel_expanded(self, checked):
         tab = self.current_terminal()
-        if isinstance(tab, TerminalTab):
+        if isinstance(tab, TerminalTab) and not tab.process_uses_pty_engine():
             if checked and not bool(getattr(tab, "command_task_panel_visible", True)):
                 tab.set_command_task_panel_visible(True)
             tab.set_command_task_panel_expanded(bool(checked))
@@ -2989,6 +3020,10 @@ class TerminalWindow(QMainWindow):
                     "number": "#7C3AED",
                     "error_word": "#B42318",
                     "selection": "#BBD7FF",
+                    "prompt": "#15803D",
+                    "environment": "#0891B2",
+                    "command_marker": "#64748B",
+                    "error_marker": "#B42318",
                 },
                 "background_opacity": 100,
                 "contrast": 45,
@@ -3010,6 +3045,10 @@ class TerminalWindow(QMainWindow):
                     "number": "#C084FC",
                     "error_word": "#FCA5A5",
                     "selection": "#2D5F93",
+                    "prompt": "#86EFAC",
+                    "environment": "#67E8F9",
+                    "command_marker": "#64748B",
+                    "error_marker": "#FCA5A5",
                 },
                 "background_opacity": 100,
                 "contrast": 60,
@@ -3092,6 +3131,10 @@ class TerminalWindow(QMainWindow):
             for key in list(merged.keys()):
                 merged[key] = self.normalize_hex_color(loaded_colors.get(key), merged[key])
         return merged
+
+    def terminal_prompt_enabled(self):
+        """Motivbezogene, abschaltbare Prompt-Farbgebung fuer lokale PTY-Bash."""
+        return bool(self.active_theme().get("prompt_enabled", True))
 
     def terminal_colors(self):
         theme = self.active_theme()
@@ -3542,7 +3585,17 @@ class TerminalWindow(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Design anpassen")
-        layout = QFormLayout(dialog)
+        dialog.resize(760, 740)
+        dialog.setMinimumWidth(650)
+        outer_layout = QVBoxLayout(dialog)
+        scroll_area = QScrollArea(dialog)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        form_widget = QWidget(scroll_area)
+        layout = QFormLayout(form_widget)
+        layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        scroll_area.setWidget(form_widget)
+        outer_layout.addWidget(scroll_area)
 
         mode_combo = QComboBox(dialog)
         mode_combo.addItem("Hell", "light")
@@ -3583,11 +3636,23 @@ class TerminalWindow(QMainWindow):
             def choose_color():
                 theme_key = selected_theme_key()
                 current = QColor(self.theme_config[theme_key].get(key, "#000000"))
-                color = QColorDialog.getColor(current, self, label)
-                if color.isValid():
-                    self.theme_config[theme_key][key] = color.name().upper()
+                picker = QColorDialog(current, dialog)
+                picker.setWindowTitle(label)
+                picker.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+
+                def preview_color(color):
+                    if color.isValid():
+                        self.theme_config[theme_key][key] = color.name().upper()
+                        refresh_controls_from_theme()
+                        self.apply_color_scheme()
+
+                picker.currentColorChanged.connect(preview_color)
+                if picker.exec() != QDialog.DialogCode.Accepted:
+                    self.theme_config[theme_key][key] = current.name().upper()
                     refresh_controls_from_theme()
                     self.apply_color_scheme()
+                else:
+                    preview_color(picker.currentColor())
 
             button.clicked.connect(choose_color)
             layout.addRow(f"{label}:", button)
@@ -3610,11 +3675,23 @@ class TerminalWindow(QMainWindow):
                     self.default_theme_config()[theme_key].get("terminal_colors", {}).copy(),
                 )
                 current = QColor(terminal_colors.get(key, "#FFFFFF"))
-                color = QColorDialog.getColor(current, self, label)
-                if color.isValid():
-                    terminal_colors[key] = color.name().upper()
+                picker = QColorDialog(current, dialog)
+                picker.setWindowTitle(label)
+                picker.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+
+                def preview_color(color):
+                    if color.isValid():
+                        terminal_colors[key] = color.name().upper()
+                        refresh_controls_from_theme()
+                        self.apply_color_scheme()
+
+                picker.currentColorChanged.connect(preview_color)
+                if picker.exec() != QDialog.DialogCode.Accepted:
+                    terminal_colors[key] = current.name().upper()
                     refresh_controls_from_theme()
                     self.apply_color_scheme()
+                else:
+                    preview_color(picker.currentColor())
 
             button.clicked.connect(choose_color)
             layout.addRow(f"{label}:", button)
@@ -3629,6 +3706,24 @@ class TerminalWindow(QMainWindow):
         make_terminal_color_row("Zahlen", "number")
         make_terminal_color_row("Fehler-Wörter", "error_word")
         make_terminal_color_row("Auswahl-Markierung", "selection")
+        make_terminal_color_row("Shell-Prompt", "prompt")
+        make_terminal_color_row("Python-Umgebung", "environment")
+        # Markerfarben als Vorbereitung bestehender und kuenftiger Befehlsmarker;
+        # die Farben allein aktivieren keine zusaetzliche Erkennung.
+        make_terminal_color_row("Befehlsmarker", "command_marker")
+        make_terminal_color_row("Fehler-Marker", "error_marker")
+
+        prompt_enabled_check = QCheckBox(
+            "Lokalen PTY-Bash-Prompt automatisch färben (neue Tabs)", dialog)
+        def prompt_enabled_changed(checked):
+            self.theme_config[selected_theme_key()]["prompt_enabled"] = bool(checked)
+        prompt_enabled_check.toggled.connect(prompt_enabled_changed)
+        layout.addRow("Shell-Prompt:", prompt_enabled_check)
+
+        prompt_preview = QLabel(dialog)
+        prompt_preview.setMinimumHeight(60)
+        prompt_preview.setTextFormat(Qt.TextFormat.RichText)
+        layout.addRow("Prompt-Vorschau:", prompt_preview)
 
         contrast_row = QWidget(dialog)
         contrast_layout = QHBoxLayout(contrast_row)
@@ -3677,7 +3772,7 @@ class TerminalWindow(QMainWindow):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             dialog,
         )
-        layout.addRow(buttons)
+        outer_layout.addWidget(buttons)
 
         def refresh_controls_from_theme():
             theme = self.theme_config[selected_theme_key()]
@@ -3691,6 +3786,21 @@ class TerminalWindow(QMainWindow):
             )
             for key, button in terminal_color_buttons.items():
                 update_button_style(button, terminal_colors.get(key, "#FFFFFF"))
+            prompt_enabled_check.blockSignals(True)
+            prompt_enabled_check.setChecked(bool(theme.get("prompt_enabled", True)))
+            prompt_enabled_check.blockSignals(False)
+            prompt_preview.setText(
+                '<span style="color:{}">((.venv) )</span> '
+                '<span style="color:{}">bash-5.3$</span> '
+                '<span style="color:{}">python -m pytest</span><br>'
+                '<span style="color:{}">3 passed in 0.12s</span>'.format(
+                    terminal_colors.get("environment", "#67E8F9"),
+                    terminal_colors.get("prompt", "#86EFAC"),
+                    terminal_colors.get("input_text", "#FFFFFF"),
+                    terminal_colors.get("stdout", "#FFFFFF")))
+            prompt_preview.setStyleSheet(
+                'QLabel {background-color: %s; padding: 8px; border-radius: 5px;}'
+                % theme.get("background", "#101010"))
             contrast_slider.blockSignals(True)
             background_opacity_slider.blockSignals(True)
             transparent_check.blockSignals(True)
@@ -4031,11 +4141,7 @@ class TerminalWindow(QMainWindow):
         tab = self.current_terminal()
         if not isinstance(tab, TerminalTab):
             return ""
-        text = tab.output_area.toPlainText()
-        pending_queue = getattr(tab, "_output_queue", [])
-        if pending_queue:
-            text += "".join(str(item[0]) for item in pending_queue if item)
-        return self.clean_output_text(text) if clean else text
+        return tab.active_history_text(clean=clean)
 
     def save_current_output(self, forced_format=None):
         tab = self.current_terminal()
@@ -4104,7 +4210,7 @@ Vorbefehl-Leiste oben rechts
 - Im Client-Modus wird der Vorbefehl bewusst nicht angewendet, damit Python, SQL, Node oder Ollama keine unerwarteten Zusatzzeilen erhalten.
 - Sichtbarkeit, Aktiv-Haken, aktueller Vorbefehl und die letzten Vorbefehle werden gespeichert.
 - Ansicht → Vorbefehl-Leiste anzeigen blendet die Leiste ein oder aus.
-- Ansicht → Letzte Befehle anzeigen blendet die Befehlstabelle des aktuellen Tabs komplett ein oder aus.
+- Ansicht → Letzte Befehle anzeigen ist nur im klassischen QProcess-Modus verfügbar. Bei echtem PTY/ConPTY bleibt die Leiste grundsätzlich verborgen; Pfeil hoch/runter und Strg+R verwaltet die Shell selbst.
 - Ansicht → Reines Terminal schaltet den aktuellen Tab ohne Kontextmenü zwischen klassischer Eingabe und direkter Terminaleingabe um.
 - Bei expliziter Wahl von „PTY/ConPTY – interaktiv“ zeigt ShellDeck mit verfuegbarem VT-Backend (pyte) automatisch das echte Terminalgitter. Die untere klassische Befehlseingabe, der Ausfuehren-Button und „Letzte Befehle“ werden in dieser Ansicht ausgeblendet; Tastatureingaben gehen direkt ans PTY. Beim Wechsel zur QProcess-Engine erscheint die klassische Eingabe wieder. Ohne verfuegbares VT-Backend bleibt die klassische Eingabe als sicherer Rueckfall sichtbar.
 
@@ -4157,6 +4263,7 @@ Einstellungen-Menü
 - Schriftart: setzt die Terminal-Schrift für alle Tabs.
 - Farbschema: wechselt zwischen Dunkel, Hell und Hoher Kontrast.
 - Design anpassen: bearbeitet Akzent, Hintergrund, Textfarbe, Eingabefeld, Terminal-Farben, Kontrast, Hintergrund-Deckkraft und Fenster-Transparenz.
+- Shell-Prompt und Python-Umgebung besitzen im Design-Dialog eigene Farbwerte sowie eine Vorschau. "Lokalen PTY-Bash-Prompt automatisch faerben" wirkt nur bei neu gestarteten lokalen PTY-Bash-Tabs unter Linux/macOS. QProcess, SSH-Gegenseite, Windows-ConPTY und andere Shells erhalten keine automatische Prompt-Umstellung. ShellDeck-eigene, ab dieser Version neu erzeugte Prompt-Farbrollen werden im PTY-Renderer sofort umgefaerbt, auch im sichtbaren Verlauf; sonstige ANSI-Farben bleiben unveraendert. Die Farbauswahl zeigt eine Live-Vorschau und kann mit Abbrechen zurueckgesetzt werden. Die Bash-Startdatei ist temporaer und veraendert weder ~/.bashrc noch ~/.profile. Die Farbeingabe fuer Befehlsmarker/Fehler-Marker ersetzt keine Exitcode-Erkennung.
 - Design auf Standard zurücksetzen: stellt die Standardfarben wieder her.
 - Standardbefehl: Befehl, der beim Start eines neuen Tabs automatisch ausgeführt wird.
 - History-Größe: maximale Anzahl gespeicherter Befehle.
@@ -4190,14 +4297,14 @@ Interaktiver Client-Modus
 Kontextmenüs
 - Rechtsklick im unteren Eingabefeld: Kopieren, Einfügen, Einfügen + Ausführen, Ausschneiden, Alles auswählen, Datei anhängen, Neuer Tab, Tab duplizieren, Tab umbenennen, Befehlspalette, Tab-Ordner aktualisieren, Client-Modus beenden und aktuellen Tab schließen.
 - Einfügen + Ausführen übernimmt den Text aus der Zwischenablage in das Eingabefeld und startet ihn sofort. Ist der Vorbefehl sichtbar und aktiv, läuft er vorher.
-- Rechtsklick im Ausgabefeld: Kopieren, Alles kopieren, Kopieren ohne Steuerzeichen, Alles kopieren ohne Steuerzeichen, Ausgabe leeren, Ausgabe speichern, Ausgabe als Markdown/Text speichern, Suchen, nächster/vorheriger Treffer und Tab-Aktionen.
+- Rechtsklick in QProcess-Ausgabe oder VT-Gitter: Auswahl kopieren, ganzen vorhandenen Verlauf kopieren, Steuerzeichen bereinigen, Text/Markdown exportieren, Suche sowie Tab-Aktionen. PTY-Suche zeigt eine schreibgeschützte Momentaufnahme; VT-Diagnose bleibt separat erreichbar. PTY-Ausgabe leeren ist nicht mit einem QProcess-Textfeld gleichzusetzen.
 - Im Ollama-Ausgabefeld gibt es zusätzlich Ollama-Antwort stoppen, letzten Codeblock kopieren und Ollama-Chat als Markdown speichern.
 - Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, in Ansicht verschieben, in nächste Ansicht verschieben, Tab entkoppeln/wieder koppeln und Tab schließen.
 
 Ausgabe, Suche und Export
-- Ctrl+F sucht in der Ausgabe des aktuellen Tabs.
+- Ctrl+F sucht in der Ausgabe des aktuellen Tabs (PTY: begrenzter VT-Verlauf als schreibgeschützte Momentaufnahme).
 - F3 springt zum nächsten Treffer, Shift+F3 zum vorherigen Treffer.
-- Ausgabe kann als Text oder Markdown gespeichert werden.
+- Ausgabe kann als Text oder Markdown gespeichert werden. Im echten PTY-Terminal werden dafür der erhaltene normale VT-Scrollback und der normale Bildschirm verwendet; TUI-Alternativbildschirm und bereits verworfene History gehören nicht zum Export.
 - Kopieren ohne Steuerzeichen entfernt ANSI-/Terminal-Steuerzeichen aus der kopierten Ausgabe.
 - Ausgabe leeren entfernt nur den sichtbaren Inhalt, nicht den laufenden Prozess.
 - Umfangreiche Ausgaben werden in der klassischen Ansicht zeitbudgetiert und farbgetreu gebündelt eingefügt. Die Begrenzung des angezeigten Scrollbacks wirkt nicht auf die noch wartende Prozessausgabe.

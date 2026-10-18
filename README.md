@@ -534,3 +534,30 @@ startet ShellDeck mit dem im Code hinterlegten Rückfallwert.
 - Regressionen: `PYTHONPATH=src python -m pytest -q
   src/test_shelldeck_vt_private_sgr.py`. Die Stream-Integration wird nur
   bei installiertem pyte getestet.
+
+
+### PTY-Darstellungsoptimierung (Patch 228–230)
+
+Die Markierung wird beim Zeichnen nur einmal pro Bildschirmaktualisierung
+auf sichtbare Zeilen abgebildet. Leere Zellen mit Standardhintergrund
+werden ohne einzelne Farb- und Zeichenoperationen übersprungen. Andere
+ANSI-Attribute, Unicode-Zeichen, echte Terminal-Cursorposition und
+PTY-Feed-Verarbeitung bleiben unverändert. Diese Optimierung behebt
+**nicht** den noch offenen Bash/Readline-Cursorfehler oder die vollständige
+Scrollback-Markierung; dafür sind weitere zielgerichtete Tests erforderlich.
+Die AST-Regressionsprüfungen kontrollieren die Renderstruktur, nicht
+den tatsächlichen Ressourcenverbrauch.
+
+
+### VT-Auswahl und Spalten-Regression (231–233)
+
+Eine bestehende Markierung wird bei ausdrücklichem Löschen des gesamten
+Bildschirms (`CSI 2J`, `CSI 3J`) oder VT-Reset verworfen. Einzelne
+Zeilenlöschungen (`CSI K`) und normales Scrollen heben die Auswahl nicht
+pauschal auf. Das Verhalten des Scrollback-Speichers ist davon getrennt.
+
+Die Regressionstests unter `src/test_shelldeck_terminal_control_232.py`
+prüfen außerdem Tabstopps und automatische Zeilenumbrüche am rechten Rand.
+Das ist noch keine vollständige Behebung vereinzelt fehlplatzierter Zeichen
+bei mehrspaltigen `dir`/`ls`-Ausgaben; hierzu müssen PTY-Bytefolge,
+VT-Zellposition und Qt-Rendering getrennt geprüft werden.
