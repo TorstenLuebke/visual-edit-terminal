@@ -1,0 +1,10 @@
+{
+  "upstream": "https://github.com/wezterm/wezterm",
+  "crate": "wezterm-term",
+  "declared_crate_version": "0.1.0",
+  "revision": null,
+  "lockfile_sha256": null,
+  "transitive_license_review_complete": false,
+  "native_and_assets_review_complete": false,
+  "target_platforms_reviewed": []
+}
