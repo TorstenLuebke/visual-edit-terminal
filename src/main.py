@@ -16,6 +16,10 @@ import getpass
 import urllib.error
 import urllib.request
 from pathlib import Path
+# A user-confirmed diagnostic restart must wait for the previous GUI to close
+# and save its workspace before we construct tabs or run startup commands.
+from shelldeck_vt_startup_capture_274 import wait_for_restarted_parent
+wait_for_restarted_parent()
 # The GUI and its embedded PTYs must not consume the launcher's controlling
 # terminal. Isolate terminal-launched GUI sessions before importing Qt;
 # graphical desktop launches without a controlling terminal are unchanged.
@@ -26,6 +30,7 @@ if __name__ == "__main__" and os.name == "posix":
         raise SystemExit(_session_result)
 
 from shelldeck_version import APP_VERSION
+from shelldeck_vt_diagnostics_help_283 import vt_diagnostics_help_section
 from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
 from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
@@ -445,6 +450,14 @@ class TerminalWindow(QMainWindow):
         help_action.triggered.connect(self.show_help_dialog)
         help_menu.addAction(help_action)
 
+        vt_diagnostics_help_action = QAction("Terminaldiagnose und Aufzeichnung …", self)
+        vt_diagnostics_help_action.setToolTip(
+            "Erklaert Modell-/Ansicht-Diagnose, PTY-Rohdaten und Startaufzeichnung."
+        )
+        vt_diagnostics_help_action.triggered.connect(self.show_vt_diagnostics_help_dialog)
+        help_menu.addAction(vt_diagnostics_help_action)
+        help_menu.addSeparator()
+
         about_action = QAction("Über", self)
         about_action.triggered.connect(self.show_about_dialog)
         help_menu.addAction(about_action)
@@ -486,9 +499,10 @@ class TerminalWindow(QMainWindow):
 
         self.pre_command_enabled_checkbox = QCheckBox("Vorbefehl aktiv", self.pre_command_bar)
         self.pre_command_enabled_checkbox.setToolTip(
-            "Vorbefehl für klassische ShellDeck-Eingaben (QProcess). "
-            "In PTY/ConPTY verwaltet die Shell ihre Eingaben selbst; "
-            "kein automatisches Einschleusen bei Enter in interaktive Programme."
+            "Führt Vorbefehle vor regulären Shell-Befehlen aus. "
+            "In der echten Bash-PTY-Ansicht geschieht das über Readline vor Enter, "
+            "ohne Eingaben an laufende Programme zu verändern. "
+            "Andere PTY-Shells erfordern eine separate native Integration."
         )
         self.pre_command_enabled_checkbox.toggled.connect(self.set_pre_command_enabled)
         pre_command_layout.addWidget(self.pre_command_enabled_checkbox)
@@ -1497,7 +1511,7 @@ class TerminalWindow(QMainWindow):
         # override focus assigned to a child while the window is hidden.
         QTimer.singleShot(0, self.focus_active_terminal)
 
-    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path="", terminal_engine=None):
+    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path="", terminal_engine=None, startup_capture=False):
         effective_start_directory = start_directory
         if effective_start_directory is None:
             current_tab = self.current_terminal()
@@ -1514,6 +1528,7 @@ class TerminalWindow(QMainWindow):
             restore_command=restore_command,
             venv_path=venv_path,
             terminal_engine=terminal_engine or self.terminal_engine,
+            startup_capture=startup_capture,
         )
         target = target_tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
         if target not in self.terminal_tab_widgets() or (not target.isVisible() and not self.is_detached_tab_widget(target)):
@@ -2563,8 +2578,13 @@ class TerminalWindow(QMainWindow):
             )
 
     def restore_tabs_from_settings(self):
+        from shelldeck_vt_startup_capture_274 import (
+            requested_startup_trace_tab_index,
+        )
+        capture_index = requested_startup_trace_tab_index()
+        captured_tab = None
         restored = False
-        for item in getattr(self, "saved_tabs", []):
+        for restore_index, item in enumerate(getattr(self, "saved_tabs", [])):
             if not isinstance(item, dict):
                 continue
             shell_type = self.normalize_shell_type(item.get("shell_type", self.shell_type) or self.shell_type)
@@ -2581,7 +2601,10 @@ class TerminalWindow(QMainWindow):
                 venv_path=item.get("venv_path", ""),
                 terminal_engine=item.get("terminal_engine", self.terminal_engine),
                 target_tab_widget=self.target_widget_for_saved_tab(item),
+                startup_capture=(restore_index == capture_index),
             )
+            if restore_index == capture_index:
+                captured_tab = tab
             if isinstance(tab, TerminalTab):
                 ollama_model = str(item.get("ollama_model", "") or "").strip()
                 client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
@@ -2601,7 +2624,30 @@ class TerminalWindow(QMainWindow):
                     tab.set_pure_terminal_mode(True, focus=False, save=False)
             restored = True
         if not restored:
-            self.new_tab()
+            self.new_tab(startup_capture=(capture_index == 0))
+        # The last restored tab otherwise steals focus from the recorded tab.
+        if captured_tab is not None:
+            pane, position = self.tab_widget_for_tab(captured_tab)
+            if pane is not None and position >= 0:
+                pane.setCurrentIndex(position)
+                self.active_tab_widget = pane
+        # The diagnostic flag is a one-shot permission, never inherited by
+        # newly launched user processes or tabs.
+        from shelldeck_vt_startup_capture_274 import (
+            STARTUP_TRACE_ENV, STARTUP_TRACE_TARGET_ENV,
+        )
+        os.environ.pop(STARTUP_TRACE_TARGET_ENV, None)
+        os.environ.pop(STARTUP_TRACE_ENV, None)
+        if capture_index is not None:
+            grid = getattr(captured_tab, "terminal_grid", None)
+            if not bool(getattr(grid, "_vt_trace_start_snapshot", None)):
+                QTimer.singleShot(0, lambda: QMessageBox.warning(
+                    self, "Startdiagnose nicht gestartet",
+                    "Die Aufzeichnung konnte im ursprünglich ausgewählten Tab "
+                    "nicht gestartet werden (z.B. weil dieser kein VT-Terminal "
+                    "mehr ist). In keinem anderen Tab wurde ersatzweise "
+                    "aufgezeichnet. Bitte im PTY-Modus erneut versuchen.",
+                ))
 
     def tab_settings_item(self, tab, tab_widget, detached_window=None):
         item = {
@@ -4204,7 +4250,7 @@ Vorbefehl-Leiste oben rechts
 - „Vorbefehl aktiv“ bestimmt, ob der Vorbefehl vor normalen Eingaben ausgeführt wird.
 - Im Eingabefeld daneben kannst du einen oder mehrere Vorbefehle eintragen; mehrere Vorbefehle werden mit Semikolon getrennt.
 - Beispiel: oben cls, unten dir -> zuerst wird cls ausgeführt, danach dir.
-- Die Vorbefehl-Leiste wirkt auf normale Befehle aus dem unteren Eingabefeld und auf „Einfügen + Ausführen“.
+- Im QProcess-Modus wirkt die Vorbefehl-Leiste auf normale Befehle aus dem unteren Eingabefeld und auf „Einfügen + Ausführen“. In einem echten lokalen Bash-PTY wird der Vorbefehl vor einem mit Enter bestaetigten Shell-Befehl ueber Readline ausgefuehrt; Eingaben an laufende interaktive Programme bleiben davon unberuehrt. Andere PTY-Shells benoetigen eigene Integrationen.
 - Nach der Rückkehr eines erkannten Shell-Prompts – auch bei mehrfach aktivierten virtuellen Umgebungen – werden normale Eingaben wieder mit Vorbefehl ausgeführt.
 - Während eine Anwendung tatsächlich auf Antworten wartet, bleibt die Eingabe roh; Vorbefehle werden dabei bewusst nicht angewendet.
 - Im Client-Modus wird der Vorbefehl bewusst nicht angewendet, damit Python, SQL, Node oder Ollama keine unerwarteten Zusatzzeilen erhalten.
@@ -4297,7 +4343,8 @@ Interaktiver Client-Modus
 Kontextmenüs
 - Rechtsklick im unteren Eingabefeld: Kopieren, Einfügen, Einfügen + Ausführen, Ausschneiden, Alles auswählen, Datei anhängen, Neuer Tab, Tab duplizieren, Tab umbenennen, Befehlspalette, Tab-Ordner aktualisieren, Client-Modus beenden und aktuellen Tab schließen.
 - Einfügen + Ausführen übernimmt den Text aus der Zwischenablage in das Eingabefeld und startet ihn sofort. Ist der Vorbefehl sichtbar und aktiv, läuft er vorher.
-- Rechtsklick in QProcess-Ausgabe oder VT-Gitter: Auswahl kopieren, ganzen vorhandenen Verlauf kopieren, Steuerzeichen bereinigen, Text/Markdown exportieren, Suche sowie Tab-Aktionen. PTY-Suche zeigt eine schreibgeschützte Momentaufnahme; VT-Diagnose bleibt separat erreichbar. PTY-Ausgabe leeren ist nicht mit einem QProcess-Textfeld gleichzusetzen.
+- Rechtsklick in QProcess-Ausgabe oder VT-Gitter: Auswahl kopieren, ganzen vorhandenen Verlauf kopieren, Steuerzeichen bereinigen, Text/Markdown exportieren, Suche sowie Tab-Aktionen. PTY-Suche zeigt eine schreibgeschützte Momentaufnahme; VT-Diagnose bleibt separat erreichbar.
+- VT-Kontextmenü unten: „ShellDeck neu starten + Startaufzeichnung …“ zeichnet die erste PTY-Ausgabe ab Shell-Start auf (nach Bestätigung). Währenddessen zeigt das Terminal ein schwebendes „● REC“ mit „■ Stopp“ zum sofortigen Beenden und Speichern. Rohdaten können vertrauliche Inhalte enthalten; vor dem Weitergeben prüfen. PTY-Ausgabe leeren ist nicht mit einem QProcess-Textfeld gleichzusetzen.
 - Im Ollama-Ausgabefeld gibt es zusätzlich Ollama-Antwort stoppen, letzten Codeblock kopieren und Ollama-Chat als Markdown speichern.
 - Rechtsklick auf die Tab-Leiste: Neuer Tab, Tab duplizieren, Tab umbenennen, Tab-Ordner aktualisieren, in Ansicht verschieben, in nächste Ansicht verschieben, Tab entkoppeln/wieder koppeln und Tab schließen.
 
@@ -4392,6 +4439,7 @@ Echtes Terminal (VT)
 - Die VT-Zellzeichnung verwendet wiederverwendete Schriftvarianten und einen begrenzten Farbcache; bei kleinen Aenderungen werden nur betroffene Zeilen neu gezeichnet. Bei einer Groessenaenderung wird dagegen die gesamte VT-Flaeche neu gezeichnet und nur die aktive VT-Gittergroesse an das PTY gemeldet. VT- und klassische Scrollback-Grenze werden getrennt eingestellt und gespeichert.
 - "Reines Terminal" und "Echtes Terminal" schliessen sich pro Tab aus. Die zeilenbasierten Zusatzfunktionen (Befehls-Tabelle, Prompt-Leiste, KI-Prompt) gehoeren zum klassischen Modus und bleiben dort erhalten.
 
+{vt_diagnostics_help_section()}
 Hinweise
 - Standard QProcess ist der stabile Kompatibilitätsmodus. Normale Shell-Befehle funktionieren gut; Programme mit Vollbild-Terminalsteuerung können eingeschränkt sein.
 - PTY/ConPTY experimentell ist zum Testen echterer Terminal-Interaktion gedacht und sollte erst nach einem gesicherten Git-Stand genutzt werden.
@@ -4400,15 +4448,16 @@ Hinweise
 - Unter Linux funktioniert die App grundsätzlich mit PySide6 und verfügbaren Shells wie bash, zsh, fish oder sh.
 """
 
-    def show_help_dialog(self):
+    def _show_read_only_help_dialog(self, title, contents):
+        """Gemeinsame schreibgeschuetzte Hilfe; greift niemals in PTY/Jobs ein."""
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Hilfe — {APP_NAME}")
+        dialog.setWindowTitle(title)
         dialog.resize(760, 620)
         layout = QVBoxLayout(dialog)
 
         text = QTextEdit(dialog)
         text.setReadOnly(True)
-        text.setPlainText(self.help_text())
+        text.setPlainText(contents)
         layout.addWidget(text)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
@@ -4416,6 +4465,14 @@ Hinweise
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
         dialog.exec()
+
+    def show_help_dialog(self):
+        self._show_read_only_help_dialog(f"Hilfe — {APP_NAME}", self.help_text())
+
+    def show_vt_diagnostics_help_dialog(self):
+        self._show_read_only_help_dialog(
+            f"Terminaldiagnose — {APP_NAME}", vt_diagnostics_help_section()
+        )
 
     def show_about_dialog(self):
         dialog = QDialog(self)

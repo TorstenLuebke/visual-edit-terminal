@@ -757,8 +757,25 @@ class PosixPtyChild:
         except Exception:
             pass
 
+    @staticmethod
+    def _set_initial_tty_size(fd, initial_size):
+        """Set TIOCSWINSZ before the child can initialise Readline/PS1.
+
+        openpty() starts at 0x0 on Linux. Sending the first SIGWINCH after
+        spawn is too late for Bash's first prompt. This is confined to the
+        newly allocated PTY; it never changes the host terminal.
+        """
+        if initial_size is None:
+            return
+        rows, cols = initial_size
+        import fcntl
+        import struct
+        import termios
+        fcntl.ioctl(fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", int(rows), int(cols), 0, 0))
+
     @classmethod
-    def _spawn_with_posix_spawn(cls, args, cwd):
+    def _spawn_with_posix_spawn(cls, args, cwd, initial_size=None):
         """Startet ein PTY ohne fork() im bereits mehrthreadigen GUI-Prozess.
 
         POSIX_SPAWN_OPEN oeffnet das Slave-TTY *nach* setsid() im Kind.
@@ -767,6 +784,9 @@ class PosixPtyChild:
         """
         master_fd, slave_fd = os.openpty()
         try:
+            # The child must inherit a valid size *before* exec. Qt's later
+            # resize notification cannot repair a prompt already drawn.
+            cls._set_initial_tty_size(slave_fd, initial_size)
             slave_name = os.ttyname(slave_fd)
             file_actions = [
                 (os.POSIX_SPAWN_OPEN, 0, slave_name, os.O_RDWR, 0o600),
@@ -797,13 +817,14 @@ class PosixPtyChild:
             os.close(slave_fd)
 
     @classmethod
-    def _spawn_with_fork(cls, args, cwd):
+    def _spawn_with_fork(cls, args, cwd, initial_size=None):
         """Kompatibilitaetsweg, falls POSIX_SPAWN_SETSID nicht verfuegbar ist."""
         import pty
 
         pid, fd = pty.fork()
         if pid == 0:
             try:
+                cls._set_initial_tty_size(0, initial_size)
                 if cwd:
                     os.chdir(cwd)
                 os.environ.setdefault("TERM", "xterm-256color")
@@ -813,25 +834,38 @@ class PosixPtyChild:
         return cls(pid, fd)
 
     @classmethod
-    def spawn(cls, command_line, cwd=None):
+    def spawn(cls, command_line, cwd=None, initial_size=None):
         import errno
 
         args = shlex.split(str(command_line or ""), posix=True)
         if not args:
             raise ValueError("Kein PTY-Startbefehl angegeben.")
+        if initial_size is not None:
+            try:
+                rows, cols = initial_size
+                rows, cols = int(rows), int(cols)
+                if not 1 <= rows <= 65535 or not 1 <= cols <= 65535:
+                    raise ValueError()
+                initial_size = (rows, cols)
+            except (TypeError, ValueError):
+                raise ValueError("Ungueltige initiale PTY-Groesse") from None
         # Linux unterstuetzt POSIX_SPAWN_SETSID; dort entfällt das potentiell
         # deadlockgefaehrdete forkpty() aus dem mehrthreadigen Qt-Prozess.
         # Aeltere POSIX-Systeme duerfen beim bewaehrten PTY-Weg bleiben.
         if all(hasattr(os, name) for name in
                ("posix_spawnp", "openpty", "POSIX_SPAWN_OPEN", "POSIX_SPAWN_DUP2")):
             try:
-                return cls._spawn_with_posix_spawn(args, cwd)
+                return cls._spawn_with_posix_spawn(args, cwd, initial_size)
             except (TypeError, NotImplementedError):
                 pass
             except OSError as exc:
                 if exc.errno not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
                     raise
-        return cls._spawn_with_fork(args, cwd)
+        # Preserve the legacy two-argument fallback call for existing callers
+        # when no initial size was provided.
+        if initial_size is None:
+            return cls._spawn_with_fork(args, cwd)
+        return cls._spawn_with_fork(args, cwd, initial_size)
 
     def isalive(self):
         # Nur eine Thread-Seite darf waitpid() ausfuehren. Insbesondere beim
@@ -989,6 +1023,18 @@ class PtyTerminalProcess(QThread):
         self._error_string = ""
         self._running = False
         self._shelldeck_engine = "pty"
+        self._initial_window_size = None
+
+    def set_initial_window_size(self, rows, cols):
+        """Remember geometry for PTY creation; never resize a running shell here."""
+        try:
+            rows, cols = int(rows), int(cols)
+            if not 1 <= rows <= 65535 or not 1 <= cols <= 65535:
+                return False
+        except (TypeError, ValueError):
+            return False
+        self._initial_window_size = (rows, cols)
+        return True
 
     @staticmethod
     def availability_message():
@@ -1061,7 +1107,10 @@ class PtyTerminalProcess(QThread):
                     finally:
                         os.chdir(old_cwd)
             else:
-                self._pty = PosixPtyChild.spawn(command_line, cwd=cwd)
+                self._pty = PosixPtyChild.spawn(
+                    command_line, cwd=cwd,
+                    initial_size=self._initial_window_size,
+                )
             self._running = True
             self._error_string = ""
             self._reader = PtyReaderThread(self._pty, self)
@@ -1406,7 +1455,7 @@ class ShellDeckTerminalWidget(QWidget):
     erhaelt damit exakt das bisherige Verhalten (Tabs, Themes, Profile).
     """
 
-    def __init__(self, window=None, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None, restore_command="", venv_path="", terminal_engine=None, parent=None):
+    def __init__(self, window=None, title="Terminal", shell_type=None, custom_title=None, start_directory=None, command_history=None, restore_command="", venv_path="", terminal_engine=None, parent=None, startup_capture=False):
         if window is None:
             window = DefaultTerminalHost()
         if parent is None and isinstance(window, QWidget):
@@ -1473,6 +1522,7 @@ class ShellDeckTerminalWidget(QWidget):
         # Echter VT-Terminalmodus (optional, nur mit pyte + PTY-Engine).
         self.real_terminal_active = False
         self.terminal_grid = None
+        self._startup_capture_eligible = bool(startup_capture)
         # Ein manuell deaktivierter VT-Modus bleibt fuer denselben Vordergrundjob aus.
         self._auto_vt_suppressed_identity = None
         # Zuletzt an das PTY gemeldete Fenstergroesse (Zeilen, Spalten), um
@@ -1628,6 +1678,22 @@ class ShellDeckTerminalWidget(QWidget):
         self._terminal_resize_timer.setSingleShot(True)
         self._terminal_resize_timer.setInterval(100)
         self._terminal_resize_timer.timeout.connect(self.update_terminal_size)
+        # Initial geometry is often 2x12 or 1x10 while Qt restores tabs.
+        # Starting Readline then, followed by several SIGWINCH, can leave its
+        # initial prompt repainted with the cursor at the beginning of the row.
+        # Wait for a usable, stable grid before spawning the FIRST POSIX PTY.
+        # Separate timers: a quiet-period timer and a bounded hidden-tab fallback.
+        self._initial_pty_shell_pending = False
+        self._initial_pty_size_fallback = None
+        self._initial_pty_hold_small_grid = False
+        self._initial_pty_start_timer = QTimer(self)
+        self._initial_pty_start_timer.setSingleShot(True)
+        self._initial_pty_start_timer.setInterval(180)
+        self._initial_pty_start_timer.timeout.connect(self._finish_initial_pty_shell_start)
+        self._initial_pty_timeout_timer = QTimer(self)
+        self._initial_pty_timeout_timer.setSingleShot(True)
+        self._initial_pty_timeout_timer.setInterval(1500)
+        self._initial_pty_timeout_timer.timeout.connect(self._force_initial_pty_shell_start)
 
         # Reines-Terminal-Modus: Eingabe direkt im Ausgabebereich.
         self.pure_terminal_mode = False
@@ -1668,9 +1734,11 @@ class ShellDeckTerminalWidget(QWidget):
         # VT-Ansicht. Nur das Ausblenden der unteren Eingabe wuerde sonst
         # jede Tastatureingabe blockieren (QTextEdit ist read-only).
         self._sync_explicit_pty_view()
-        self.start_shell()
+        self._start_first_shell_after_layout()
 
-        if self.window.default_command and self.process.waitForStarted(2000):
+        if (self.window.default_command
+                and not getattr(self, "_initial_pty_shell_pending", False)
+                and self.process.waitForStarted(2000)):
             self.run_startup_command(self.window.default_command)
 
     def terminal_stdout_color(self):
@@ -2342,7 +2410,7 @@ class ShellDeckTerminalWidget(QWidget):
                     f"\n[Automatischer Startbefehl übersprungen (zeigt auf ShellDeck selbst): {translated}]\n"
                 )
                 continue
-            if translated.lower() in {"cls", "clear"}:
+            if translated.lower() in {"cls", "clear"} and not self.process_uses_pty_engine():
                 self.output_area.clear()
                 self._awaiting_command_completion = False
                 if getattr(self, "interaction_prompt_active", False):
@@ -2785,6 +2853,53 @@ class ShellDeckTerminalWidget(QWidget):
             if pending:
                 text += "".join(str(item[0]) for item in pending if item)
         return self.window.clean_output_text(text) if clean else text
+
+    def restart_shelldeck_with_vt_startup_trace(self):
+        """Explicitly restart the *application* and capture the first PTY bytes.
+
+        This is opt-in, not a global recorder. The new process waits until the
+        old process has saved and closed its workspace before opening tabs.
+        """
+        if not callable(getattr(self.window, "close", None)):
+            return False  # Standalone host is not a ShellDeck application.
+        answer = QMessageBox.warning(
+            self, "ShellDeck mit Startaufzeichnung neu starten?",
+            "ShellDeck wird vollständig neu gestartet. Laufende Programme, "
+            "nicht gespeicherte Shell-Zustände und Terminal-Sitzungen werden beendet.\n\n"
+            "Im ersten neuen echten Terminal werden die PTY-Ausgaben ab dem "
+            "Start aufgezeichnet (maximal 4 MiB). Die Aufzeichnung kann mit "
+            "'■ Stopp' neben '● REC' beendet und gespeichert werden. "
+            "Die Daten können vertrauliche Inhalte enthalten.\n\n"
+            "Jetzt neu starten?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        from shelldeck_vt_startup_capture_274 import (
+            create_private_trace_directory, launch_diagnostic_restart,
+        )
+        try:
+            # The restore order matches collect_tab_settings(), not the first
+            # VT grid constructed. Capture the tab that initiated the restart.
+            target_index = next(
+                i for i, (_, _, tab) in enumerate(self.window.all_terminal_tabs())
+                if tab is self
+            )
+        except (AttributeError, StopIteration, TypeError):
+            QMessageBox.warning(self, "Startdiagnose",
+                                "Aktueller Tab konnte nicht zugeordnet werden.")
+            return False
+        try:
+            directory = create_private_trace_directory()
+            launch_diagnostic_restart(directory, target_index=target_index)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Startdiagnose", f"Neustart fehlgeschlagen: {exc}")
+            return False
+        # Defer closing until the context-menu Qt event has unwound. The new
+        # process does not initialize Qt until this one has exited.
+        QTimer.singleShot(0, self.window.close)
+        return True
 
     def populate_vt_context_menu(self, menu):
         """Append shared history/search/export and tab actions to VT menu."""
@@ -3828,6 +3943,37 @@ class ShellDeckTerminalWidget(QWidget):
             append_split_commands(raw_command_text)
         return commands
 
+    def compose_pty_command_sequence(self, commands_with_origin):
+        """Submit ordinary PTY precommands and the user command as ONE shell unit.
+
+        Separate PTY writes can be consumed by an interactive foreground
+        program rather than the shell. A single shell statement preserves
+        ordering and shell state (for example ``cd`` and ``export``).
+        Only use this for straightforward single-line shell statements;
+        special ShellDeck dispatch and multi-line input retain their routes.
+        """
+        if not self.process_uses_pty_engine() or len(commands_with_origin) < 2:
+            return None
+        shell = str(self.shell_type or "").lower()
+        separator = " & " if shell == "cmd" else " ; "
+        if shell not in {"bash", "zsh", "sh", "fish", "powershell", "pwsh", "cmd"}:
+            return None
+        values = []
+        for raw, _is_user in commands_with_origin:
+            command = self.translate_cross_platform_command(raw)
+            if not command or "\n" in command or "\r" in command:
+                return None
+            if self.parse_ollama_run_model(command) or self.parse_direct_client_command(command):
+                return None
+            if command_targets_shelldeck(command):
+                return None
+            values.append(command)
+        # Joining complete commands without escaping them changes the
+        # behaviour of comments / continuations. Keep those on the old path.
+        if any(value.rstrip().endswith(("\\", "`")) or value.lstrip().startswith("#") for value in values):
+            return None
+        return separator.join(values)
+
     def run_text_command(self, command):
         self.input_line.setPlainText(command)
         self.input_line.moveCursor(QTextCursor.MoveOperation.End)
@@ -4109,6 +4255,12 @@ class ShellDeckTerminalWidget(QWidget):
         size = self._terminal_grid_size()
         if not size:
             return
+        if getattr(self, "_initial_pty_shell_pending", False):
+            return
+        if getattr(self, "_initial_pty_hold_small_grid", False):
+            if not self._usable_initial_pty_geometry(size):
+                return
+            self._initial_pty_hold_small_grid = False
         if size == getattr(self, "_last_pty_size", None):
             return
         self._last_pty_size = size
@@ -4139,6 +4291,71 @@ class ShellDeckTerminalWidget(QWidget):
         if callable(decoder_factory):
             self._qprocess_decoders = decoder_factory()
 
+    @staticmethod
+    def _usable_initial_pty_geometry(size):
+        """Reject transient Qt layout sizes, not intentional later resizes."""
+        if size is None:
+            return False
+        try:
+            rows, cols = map(int, size)
+        except (TypeError, ValueError):
+            return False
+        return rows >= 8 and cols >= 40
+
+    def _start_first_shell_after_layout(self):
+        """Defer only the FIRST interactive POSIX VT shell until Qt settles.
+
+        Other shells, QProcess and Windows ConPTY keep their original startup
+        behavior. A bounded timeout also starts restored but hidden tabs.
+        """
+        if not (os.name == "posix" and self.process_uses_pty_engine()
+                and getattr(self, "real_terminal_active", False)):
+            self.start_shell()
+            return
+        self._initial_pty_shell_pending = True
+        self._initial_pty_timeout_timer.start()
+        self._schedule_initial_pty_start(self._terminal_grid_size())
+
+    def _schedule_initial_pty_start(self, size):
+        """A geometry change restarts the quiet period, before PTY exists."""
+        if not getattr(self, "_initial_pty_shell_pending", False):
+            return
+        timer = self._initial_pty_start_timer
+        if self._usable_initial_pty_geometry(size):
+            timer.start()
+        else:
+            timer.stop()
+
+    def _launch_initial_pty_shell(self, *, fallback=False):
+        if (not getattr(self, "_initial_pty_shell_pending", False)
+                or getattr(self, "_terminal_cleaned_up", False)):
+            return
+        self._initial_pty_shell_pending = False
+        self._initial_pty_start_timer.stop()
+        self._initial_pty_timeout_timer.stop()
+        # Hidden tabs can have a bogus 1x10 Qt geometry indefinitely.
+        # Start them at 24x80 rather than propagate that layout artefact into
+        # Readline. Release this safeguard once a real grid is available.
+        self._initial_pty_size_fallback = (24, 80) if fallback else None
+        self._initial_pty_hold_small_grid = bool(fallback)
+        try:
+            self.start_shell()
+            # The constructor's automatic command ran before when the shell
+            # started synchronously. Preserve it after this deferred spawn.
+            command = getattr(self.window, "default_command", None)
+            if command and self.process.waitForStarted(2000):
+                self.run_startup_command(command)
+        finally:
+            self._initial_pty_size_fallback = None
+
+    def _finish_initial_pty_shell_start(self):
+        if self._usable_initial_pty_geometry(self._terminal_grid_size()):
+            self._launch_initial_pty_shell()
+
+    def _force_initial_pty_shell_start(self):
+        self._launch_initial_pty_shell(
+            fallback=not self._usable_initial_pty_geometry(self._terminal_grid_size()))
+
     def _schedule_shell_callback(self, delay_ms, callback):
         """Timer strikt an Tab, Prozessobjekt und Shell-Generation binden."""
         process = getattr(self, "process", None)
@@ -4157,6 +4374,8 @@ class ShellDeckTerminalWidget(QWidget):
         # Identitaet einer gestarteten Shell, auch wenn das selbe QProcess-
         # Objekt bei einem Restart wiederverwendet wird.
         self._shell_generation = getattr(self, "_shell_generation", 0) + 1
+        getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)(
+            "shell_start", shell_generation=self._shell_generation)
         self._reset_shell_transient_state()
         shell_path = self.window.system_shell(self.shell_type)
         if not shell_path:
@@ -4178,18 +4397,24 @@ class ShellDeckTerminalWidget(QWidget):
         )
         if self._qprocess_bash_batch:
             shell_args = ["--noprofile", "--norc"]
-        # Bash wurde bisher in ShellDeck ohne Benutzer-rc gestartet. Fuer
-        # lokale PTY-Sitzungen erzeugen wir optional eine isolierte rc-Datei.
-        # QProcess, andere Shells sowie Windows bleiben unveraendert.
+        # Fuer lokale PTY-Bash erzeugen wir eine isolierte rc-Datei. Die
+        # Readline-Vorbefehle funktionieren auch bei deaktivierter farbiger
+        # ShellDeck-Prompt-Option; QProcess und andere Shells bleiben wie zuvor.
         old_prompt_rc = getattr(self, "_shelldeck_prompt_rc", None)
         self._shelldeck_prompt_rc = None
+        self._shelldeck_grid_precommand_file = None
+        self._shelldeck_grid_precommand_last = None
         if (os.name == "posix" and self.process_uses_pty_engine()
-                and str(self.shell_type or "").lower() == "bash"
-                and getattr(self.window, "terminal_prompt_enabled", lambda: True)()):
+                and str(self.shell_type or "").lower() == "bash"):
             from shelldeck_prompt import create_bash_prompt_rc
             try:
                 prompt_colors = self.window.terminal_colors()
-                self._shelldeck_prompt_rc, rc_path = create_bash_prompt_rc(prompt_colors)
+                self._shelldeck_prompt_rc, rc_path = create_bash_prompt_rc(
+                    prompt_colors,
+                    include_prompt=getattr(self.window, "terminal_prompt_enabled", lambda: True)(),
+                )
+                self._shelldeck_grid_precommand_file = str(Path(rc_path).with_name("grid_precommand"))
+                self.sync_grid_precommand_file()
                 shell_args = ["--noprofile", "--rcfile", rc_path, "-i"]
             except (OSError, ValueError):
                 self._shelldeck_prompt_rc = None
@@ -4212,11 +4437,24 @@ class ShellDeckTerminalWidget(QWidget):
                 "-Command",
                 "try { Remove-Module PSReadLine -ErrorAction SilentlyContinue } catch {}",
             ]
+        # A newly opened POSIX PTY starts with 0 rows / 0 columns. Bash may
+        # already have painted PS1 before the subsequent Qt resize callback.
+        # Prime the *new* PTY from the active terminal grid before spawning.
+        # QProcess has no such hook and retains its existing start path.
+        prime_pty_size = getattr(self.process, "set_initial_window_size", None)
+        initial_pty_size = None
+        if callable(prime_pty_size):
+            size = (getattr(self, "_initial_pty_size_fallback", None)
+                    or self._terminal_grid_size())
+            if size and prime_pty_size(*size) is not False:
+                initial_pty_size = size
         self.process.start(shell_path, shell_args)
         self._auto_vt_suppressed_identity = None
         self._update_auto_vt_timer()
-        # Neuer Kindprozess -> Groesse erneut melden (Cache zuruecksetzen).
-        self._last_pty_size = None
+        # The POSIX slave already has this exact size before Bash executes.
+        # Do not send a redundant SIGWINCH during its very first prompt.
+        # Grid geometry changes still invalidate the cache normally.
+        self._last_pty_size = initial_pty_size if os.name == "posix" else None
         QTimer.singleShot(0, self.update_terminal_size)
         self.display_shell_status(shell_path)
 
@@ -6105,7 +6343,12 @@ class ShellDeckTerminalWidget(QWidget):
             prefix_text = self.window.active_pre_command_text()
             if prefix_text:
                 self.window.remember_pre_command_text(prefix_text)
-                prefix_commands = self.command_sequence_from_text(prefix_text, include_prefix=False)
+                # Bei echter PTY-Bash wird derselbe Vorbefehl bereits vom
+                # Readline-Accept-Line-Hook ausgefuehrt. Andernfalls wuerde
+                # der klassische API-Pfad ihn doppelt an die Shell senden.
+                native_hook = self.sync_grid_precommand_file()
+                if not native_hook:
+                    prefix_commands = self.command_sequence_from_text(prefix_text, include_prefix=False)
 
         # Noninteractive Bash wraps an entire submitted input in one completion
         # frame. Splitting at semicolons would dispatch the second fragment
@@ -6124,6 +6367,21 @@ class ShellDeckTerminalWidget(QWidget):
         self.history_index = -1
         self.current_command = ""
 
+        # In PTY the shell must parse the precommands before it starts the
+        # foreground command. Sending separate writes is not a sequencing
+        # guarantee: a child can read subsequent writes as its own stdin.
+        composed = self.compose_pty_command_sequence(commands_with_origin)
+        if composed is not None:
+            if self.process.state() != QProcess.ProcessState.Running:
+                self.output_area.append("Shell ist nicht aktiv: " +
+                                        (self.process.errorString() or "Prozess wurde beendet."))
+                return
+            self.start_command_task(command_text, composed, prefix_text)
+            self._auto_vt_for_direct_command(command_text)
+            self.write_shell_command(composed)
+            self.input_line.clear()
+            return
+
         task_started = False
         for raw_command, is_user_command in commands_with_origin:
             command = self.translate_cross_platform_command(raw_command)
@@ -6135,7 +6393,7 @@ class ShellDeckTerminalWidget(QWidget):
             if direct_client:
                 self.start_direct_client_process(direct_client)
                 continue
-            if command.lower() in ("cls", "clear"):
+            if command.lower() in ("cls", "clear") and not self.process_uses_pty_engine():
                 if is_user_command and not task_started:
                     self.start_command_task(command_text, command, prefix_text)
                     task_started = True
@@ -6717,6 +6975,7 @@ class ShellDeckTerminalWidget(QWidget):
                 self.terminal_grid = TerminalGridView(
                     parent=self, font=self.window.terminal_font,
                     history=getattr(self.window, "vt_scrollback_lines", 2000),
+                    startup_capture_eligible=self._startup_capture_eligible,
                 )
                 self.terminal_grid.dataReady.connect(self._write_terminal_grid_input)
                 self.terminal_grid.sizeChanged.connect(self._on_terminal_grid_size)
@@ -6752,10 +7011,36 @@ class ShellDeckTerminalWidget(QWidget):
             if focus:
                 self.input_line.setFocus()
         self.sync_command_task_panel_visibility()
+        self.sync_grid_precommand_file()
         return True
 
     def toggle_real_terminal_mode(self):
         return self.set_real_terminal_mode(not getattr(self, "real_terminal_active", False))
+
+    def sync_grid_precommand_file(self):
+        """Aktualisiert den Bash-Readline-Hook ohne Eingaben zu manipulieren.
+
+        Nur der echte PTY-Gittermodus nutzt den Hook. In der klassischen
+        Ansicht verarbeitet execute_command() Vorbefehle wie bisher selbst.
+        Schreiboperationen erfolgen nur bei Aenderungen; das Ziel liegt im
+        privaten temporären Verzeichnis der aktuellen Bash-Sitzung.
+        """
+        path = getattr(self, "_shelldeck_grid_precommand_file", None)
+        if not path:
+            return False
+        active = (self.process_uses_pty_engine()
+                  and getattr(self, "real_terminal_active", False)
+                  and str(self.shell_type or "").lower() == "bash")
+        prefix = str(self.window.active_pre_command_text() or "") if active else ""
+        if prefix != getattr(self, "_shelldeck_grid_precommand_last", None):
+            try:
+                Path(path).write_text(prefix, encoding="utf-8")
+            except OSError:
+                # Keine versteckte Ersatz-Ausfuehrung, die laufende Programme
+                # versehentlich mit Shell-Befehlen beschicken koennte.
+                return False
+            self._shelldeck_grid_precommand_last = prefix
+        return bool(prefix)
 
     def _write_terminal_grid_input(self, data):
         """Grid-Eingaben senden; opt-in Diagnose speichert niemals Nutzdaten.
@@ -6777,6 +7062,10 @@ class ShellDeckTerminalWidget(QWidget):
             audit.record(bytes_count=len(bytes(data)), status="no_writer")
             return
         payload = bytes(data)
+        # Echt-Terminal nutzt den Bash-Readline-Hook. Qt darf Enter niemals
+        # blind in "Vorbefehl + Nutzereingabe" umwandeln: Im Vordergrund kann
+        # ein Editor, eine Passwortabfrage oder ein anderes Programm lesen.
+        self.sync_grid_precommand_file()
         try:
             written = writer(payload)
         except Exception:
@@ -6787,17 +7076,32 @@ class ShellDeckTerminalWidget(QWidget):
 
     def _on_terminal_grid_size(self, rows, cols):
         """Vom Grid gemeldete Größe an das PTY weiterreichen (TIOCSWINSZ)."""
+        size = (int(rows), int(cols))
+        if getattr(self, "_initial_pty_shell_pending", False):
+            self._schedule_initial_pty_start(size)
+            return
+        if getattr(self, "_initial_pty_hold_small_grid", False):
+            if not self._usable_initial_pty_geometry(size):
+                return
+            self._initial_pty_hold_small_grid = False
         process = getattr(self, "process", None)
+        # A Qt grid can resize before the process has been started. Calling
+        # set_window_size then returns False, but the former code nevertheless
+        # recorded "success": true and cached a size the PTY never received.
+        if getattr(process, "_running", None) is False:
+            return
         setter = getattr(process, "set_window_size", None)
         if callable(setter):
             try:
-                setter(rows, cols)
-                getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("pty_resize_from_grid", rows=int(rows), cols=int(cols),
-                                     success=True)
+                result = setter(rows, cols)
+                success = result is not False
             except Exception:
-                getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("pty_resize_from_grid", rows=int(rows), cols=int(cols),
-                                     success=False)
-        self._last_pty_size = (int(rows), int(cols))
+                success = False
+            getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)(
+                "pty_resize_from_grid", rows=int(rows), cols=int(cols),
+                success=success)
+            if success:
+                self._last_pty_size = size
 
     @staticmethod
     def _new_qprocess_decoders():

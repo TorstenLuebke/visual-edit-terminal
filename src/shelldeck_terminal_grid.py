@@ -25,7 +25,10 @@ from typing import Dict, Optional
 
 from PySide6.QtCore import Qt, QRect, QRectF, QSize, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QMenu, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QFileDialog, QMessageBox, QMenu, QWidget,
+    QFrame, QHBoxLayout, QLabel, QPushButton,
+)
 
 from shelldeck_scrollback import normalize_vt_scrollback_lines
 from shelldeck_prompt import PROMPT_ROLE_RGB, ENVIRONMENT_ROLE_RGB
@@ -110,7 +113,7 @@ class TerminalGridView(QWidget):
 
     def __init__(self, parent=None, rows: int = 24, cols: int = 80,
                  font: Optional[QFont] = None, enable_history: bool = True,
-                 history: int = 2000):
+                 history: int = 2000, startup_capture_eligible: bool = True):
         super().__init__(parent)
         self._model = vt.VtScreen(rows=rows, cols=cols,
                                   enable_history=enable_history, history=history) \
@@ -152,6 +155,10 @@ class TerminalGridView(QWidget):
         self._vt_raw_trace = VtRawTrace()
         self._vt_trace_start_snapshot = None
         self._vt_trace_start_geometry = None
+        self._vt_trace_destination = None
+        # Standalone grids retain the old opt-in default. ShellDeck tabs
+        # explicitly select only the originating restored tab.
+        self._startup_capture_eligible = bool(startup_capture_eligible)
         self._cursor_visible_phase = True
         self.cursor_blink = True
         self._blink_timer = QTimer(self)
@@ -161,6 +168,71 @@ class TerminalGridView(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._recompute_metrics()
+        # This floating badge is a child overlay, NOT a layout item. Showing or
+        # hiding it cannot change terminal rows/cols or trigger PTY SIGWINCH.
+        self._build_trace_badge()
+        self._start_explicit_startup_trace()
+
+    def _build_trace_badge(self):
+        self._trace_badge = QFrame(self)
+        self._trace_badge.setObjectName("ShellDeckVtTraceBadge")
+        self._trace_badge.setStyleSheet(
+            "QFrame#ShellDeckVtTraceBadge { background: #491c21; "
+            "border: 1px solid #f87171; border-radius: 6px; } "
+            "QLabel { color: #fecaca; font-weight: bold; } "
+            "QPushButton { color: white; background: #8b1e2a; "
+            "padding: 3px 7px; border: 1px solid #f87171; border-radius: 4px; } "
+            "QPushButton:hover { background: #b91c1c; }"
+        )
+        bar = QHBoxLayout(self._trace_badge)
+        bar.setContentsMargins(7, 3, 5, 3)
+        bar.setSpacing(7)
+        self._trace_label = QLabel("● REC", self._trace_badge)
+        self._trace_button = QPushButton("■ Stopp", self._trace_badge)
+        self._trace_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._trace_button.setToolTip(
+            "VT-Rohdatenaufzeichnung beenden und speichern (maximal 4 MiB)."
+        )
+        self._trace_button.clicked.connect(self.toggle_vt_raw_trace)
+        bar.addWidget(self._trace_label)
+        bar.addWidget(self._trace_button)
+        self._trace_badge.hide()
+
+    def _position_trace_badge(self):
+        self._trace_badge.adjustSize()
+        self._trace_badge.move(max(0, self.width() - self._trace_badge.width() - 8), 8)
+        self._trace_badge.raise_()
+
+    def _sync_trace_badge(self):
+        trace = self._vt_raw_trace
+        started = self._vt_trace_start_snapshot is not None
+        self._trace_badge.setVisible(started)
+        if started:
+            self._trace_label.setText("● REC" if trace.active else "● REC beendet")
+            self._trace_button.setText("■ Stopp" if trace.active else "Speichern")
+            self._position_trace_badge()
+
+    def _start_explicit_startup_trace(self):
+        """Start *before* the first child PTY is spawned, never by default."""
+        from shelldeck_vt_startup_capture_274 import claim_startup_trace_directory
+        try:
+            directory = claim_startup_trace_directory(
+                eligible=self._startup_capture_eligible)
+        except (OSError, ValueError) as exc:
+            # A broken opt-in must not prevent terminal startup.
+            import sys
+            print(f"ShellDeck Startdiagnose deaktiviert: {exc}", file=sys.stderr)
+            return
+        if directory is None or self._model is None:
+            return
+        from shelldeck_vt_diagnostic import model_snapshot
+        self._vt_trace_destination = directory
+        self._vt_trace_start_snapshot = model_snapshot(self._model)
+        self._vt_trace_start_geometry = (self._model.rows, self._model.cols)
+        self._vt_raw_trace.start()
+        self.trace_event("trace_started", rows=self._model.rows,
+                         cols=self._model.cols)
+        self._sync_trace_badge()
 
     # --- Verfügbarkeit ----------------------------------------------------
     def is_usable(self) -> bool:
@@ -244,6 +316,11 @@ class TerminalGridView(QWidget):
         if self._model is None:
             return
         self._vt_raw_trace.append(data)
+        if (self._vt_trace_start_snapshot is not None
+                and not self._vt_raw_trace.active):
+            # Reaching the bounded trace limit ends recording automatically,
+            # but the Save button must remain visible until export succeeds.
+            self._sync_trace_badge()
         self._invalidate_selection_on_screen_erase(data)
         # Die bereits vorhandene Reader-ACK-Sperre bleibt unverändert.
         # Einzelne GUI-Slots übergeben dem VT-Modell kleinere Teilstücke,
@@ -381,6 +458,7 @@ class TerminalGridView(QWidget):
         self.trace_event("grid_widget_resize", width=self.width(), height=self.height())
         super().resizeEvent(event)
         self._apply_grid_from_size()
+        self._position_trace_badge()
 
     def sizeHint(self) -> QSize:
         if self._model is None:
@@ -677,10 +755,18 @@ class TerminalGridView(QWidget):
         diagnostic.triggered.connect(self.save_vt_diagnostic)
         trace_action = menu.addAction(
             "VT-Rohdatenaufzeichnung beenden …" if self._vt_raw_trace.active
-            else "VT-Rohdatenaufzeichnung starten …"
+            else ("VT-Rohdatenaufzeichnung speichern …"
+                  if self._vt_trace_start_snapshot is not None
+                  else "VT-Rohdatenaufzeichnung starten …")
         )
         trace_action.setEnabled(self._model is not None)
         trace_action.triggered.connect(self.toggle_vt_raw_trace)
+        if (host is not None
+                and hasattr(host, "restart_shelldeck_with_vt_startup_trace")
+                and callable(getattr(getattr(host, "window", None), "close", None))):
+            menu.addSeparator()
+            restart = menu.addAction("ShellDeck neu starten + Startaufzeichnung …")
+            restart.triggered.connect(host.restart_shelldeck_with_vt_startup_trace)
         return menu
 
     def trace_event(self, event, **fields):
@@ -696,7 +782,7 @@ class TerminalGridView(QWidget):
         may contain secrets and must be inspected before sharing.
         """
         trace = self._vt_raw_trace
-        if not trace.active and not trace.size:
+        if not trace.active and self._vt_trace_start_snapshot is None:
             answer = QMessageBox.warning(
                 self, "VT-Rohdaten – Datenschutz",
                 "Es werden die unveraenderten Terminal-Ausgabebytes inklusive "
@@ -714,10 +800,35 @@ class TerminalGridView(QWidget):
                 trace.event("trace_started", rows=self._model.rows, cols=self._model.cols,
                             width=self.width(), height=self.height(),
                             alternate=self._model.in_alternate_screen())
+                self._sync_trace_badge()
             return
-        trace.event("trace_stopped", rows=self._model.rows, cols=self._model.cols,
-                    alternate=self._model.in_alternate_screen())
+        if trace.active:
+            trace.event("trace_stopped", rows=self._model.rows, cols=self._model.cols,
+                        alternate=self._model.in_alternate_screen())
         data = trace.stop()
+        self._sync_trace_badge()
+        if self._vt_trace_destination is not None:
+            from shelldeck_vt_diagnostic import model_snapshot
+            from shelldeck_vt_startup_capture_274 import export_startup_trace
+            try:
+                result = export_startup_trace(
+                    self._vt_trace_destination, trace,
+                    start_model=self._vt_trace_start_snapshot or "",
+                    end_model=model_snapshot(self._model),
+                    geometry=self._vt_trace_start_geometry or
+                             (self._model.rows, self._model.cols),
+                    session_generation=getattr(self.parentWidget(), "_shell_generation", 0),
+                )
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "Startdiagnose", f"Speichern fehlgeschlagen: {exc}")
+                return
+            self._clear_completed_trace()
+            QMessageBox.information(
+                self, "Startdiagnose gespeichert",
+                f"Die Startaufzeichnung wurde gespeichert unter:\n{result.parent}\n\n"
+                "Bitte die Dateien vor dem Weitergeben auf vertrauliche Inhalte prüfen.",
+            )
+            return
         filename, _ = QFileDialog.getSaveFileName(
             self, "VT-Rohdaten speichern", "ShellDeck_VT_Rohdaten.bin",
             "Binaerdaten (*.bin)",
@@ -745,16 +856,23 @@ class TerminalGridView(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "VT-Rohdaten", f"Speichern fehlgeschlagen: {exc}")
             return
-        trace._chunks.clear()
-        trace._size = 0
-        self._vt_trace_start_snapshot = None
-        self._vt_trace_start_geometry = None
+        self._clear_completed_trace()
         QMessageBox.information(
             self, "VT-Rohdaten gespeichert",
             "Rohbytes und Startmodell wurden gespeichert. Bitte vor dem Weitergeben "
             "auf vertrauliche Informationen pruefen. Ergaenzend die VT-Diagnose "
             "(Modell und Ansicht) speichern.",
         )
+
+    def _clear_completed_trace(self):
+        trace = self._vt_raw_trace
+        trace._chunks.clear()
+        trace._size = 0
+        trace.events.clear()
+        self._vt_trace_start_snapshot = None
+        self._vt_trace_start_geometry = None
+        self._vt_trace_destination = None
+        self._sync_trace_badge()
 
     def save_vt_diagnostic(self) -> None:
         """Explicit one-shot capture; never write terminal contents implicitly."""
