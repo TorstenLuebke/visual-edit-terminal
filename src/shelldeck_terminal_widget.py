@@ -35,6 +35,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from shelldeck_resize_audit_288 import ResizeAudit
+from shelldeck_pty_input_queue_289 import PtyInputQueue
 from shelldeck_ollama import build_generate_payload, extract_generate_response, ollama_api_error_message, normalize_system_prompt
 from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
 
@@ -1025,6 +1026,13 @@ class PtyTerminalProcess(QThread):
         self._running = False
         self._shelldeck_engine = "pty"
         self._initial_window_size = None
+        # QThread as QObject lives in its creator (GUI) thread. The reader
+        # thread never touches this FIFO or its timer.
+        self._input_queue = PtyInputQueue()
+        self._input_bracketed_paste_pending = False
+        self._input_timer = QTimer(self)
+        self._input_timer.setInterval(8)
+        self._input_timer.timeout.connect(self._drain_posix_input)
 
     def set_initial_window_size(self, rows, cols):
         """Remember geometry for PTY creation; never resize a running shell here."""
@@ -1079,6 +1087,7 @@ class PtyTerminalProcess(QThread):
             return " ".join(shlex.quote(value) for value in values)
 
     def start(self, program, args=None):
+        self._clear_posix_input()
         message = self.availability_message()
         if message:
             self._error_string = message
@@ -1167,6 +1176,7 @@ class PtyTerminalProcess(QThread):
         if not self._running:
             return
         self._running = False
+        self._clear_posix_input()
         self.finished.emit(int(exit_code), exit_status)
 
     def readAllStandardOutput(self):
@@ -1185,20 +1195,66 @@ class PtyTerminalProcess(QThread):
     def waitForStarted(self, msecs=30000):
         return self._running
 
+    def _clear_posix_input(self):
+        self._input_timer.stop()
+        self._input_queue.clear()
+        self._input_bracketed_paste_pending = False
+
+    def _drain_posix_input(self):
+        """One small write per event-loop turn; retry short writes/EAGAIN.
+
+        The delay lets Bash/Readline drain its TTY input while Qt continues
+        rendering output and responding to user actions. Never block the GUI
+        waiting for a full PTY write or silently discard a partial write.
+        """
+        if not self._running or not isinstance(self._pty, PosixPtyChild):
+            self._clear_posix_input()
+            return False
+        try:
+            self._input_queue.drain_once(self._pty.write)
+        except Exception as exc:
+            self._error_string = "PTY-Eingabe fehlgeschlagen: " + str(exc)
+            self._clear_posix_input()
+            self.errorOccurred.emit(QProcess.ProcessError.WriteError)
+            return False
+        if self._input_queue.pending_bytes:
+            if not self._input_timer.isActive():
+                self._input_timer.start()
+        else:
+            self._input_timer.stop()
+            self._input_bracketed_paste_pending = False
+        return True
+
     def write(self, data):
         if not self._running or self._pty is None:
             self._error_string = "PTY/ConPTY-Prozess läuft nicht."
             return -1
         raw = bytes(data or b"")
         if isinstance(self._pty, PosixPtyChild):
-            # Rohbytes direkt uebergeben: insbesondere CSI, OSC, UTF-8 und
-            # abgeschnittene Mehrbytefolgen muessen exakt erhalten bleiben.
-            try:
-                return self._pty.write(raw)
-            except Exception as exc:
-                self._error_string = str(exc)
+            if not raw:
+                return 0
+            input_length = len(raw)
+            # Ctrl+C must interrupt a pending paste immediately. If its
+            # bracket-open marker was already sent, close that bracket first:
+            # otherwise Readline may swallow Ctrl+C as pasted text.
+            if raw == b"\x03" and self._input_queue.pending_bytes:
+                close_bracket = (b"\x1b[201~" if
+                                 self._input_bracketed_paste_pending else b"")
+                self._clear_posix_input()
+                raw = close_bracket + raw
+            if not self._input_queue.enqueue(raw):
+                self._error_string = "PTY-Eingabepuffer voll (32 MiB)."
                 self.errorOccurred.emit(QProcess.ProcessError.WriteError)
                 return -1
+            if raw.startswith(b"\x1b[200~") and raw.endswith(b"\x1b[201~"):
+                self._input_bracketed_paste_pending = True
+            # Normal keystrokes are sent immediately. Big pastes are staged in
+            # 256-byte pieces, and remaining bytes are sent by the Qt timer.
+            if not self._input_timer.isActive():
+                if not self._drain_posix_input():
+                    return -1
+            return input_length
+        # ConPTY handling is deliberately unchanged; its API takes text.
         for encoding in ("utf-8", "cp1252", "cp850", "latin-1"):
             try:
                 text = raw.decode(encoding)
@@ -1275,6 +1331,7 @@ class PtyTerminalProcess(QThread):
         return False
 
     def terminate(self):
+        self._clear_posix_input()
         if not self._pty:
             self._running = False
             return
@@ -1300,6 +1357,7 @@ class PtyTerminalProcess(QThread):
         return True
 
     def kill(self):
+        self._clear_posix_input()
         # Der Reader darf den PTY-Master nicht mehr benutzen, waehrend er
         # geschlossen wird. Sein Ende ist aber NICHT das Ende des Kindes.
         self._stop_reader_before_pty_close(250)
@@ -1389,6 +1447,7 @@ class PtyTerminalProcess(QThread):
         Normalfall weder die "tcsetattr"-Meldung von bash noch ein verwaister
         Reader-QThread.
         """
+        self._clear_posix_input()
         pty = self._pty
         if pty is None and (self._reader is None or not self._reader.isRunning()):
             self._running = False
