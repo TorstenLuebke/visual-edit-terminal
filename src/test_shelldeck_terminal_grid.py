@@ -46,6 +46,22 @@ class TerminalGridViewTests(unittest.TestCase):
         self.addCleanup(view.close)
         return view
 
+    @staticmethod
+    def _select_visible_cells(view, start=(0, 0), end=(0, 4)):
+        """Emulate the row-bound selection established by mouse events.
+
+        The UI stores both viewport coordinates AND the identity of each
+        pyte row so scrolling cannot silently redirect an old selection to
+        different screen content. Tests must set up both parts of that state.
+        """
+        view._sel_anchor = start
+        view._sel_head = end
+        view._sel_anchor_row_id = view._selection_row_id(start[0])
+        view._sel_head_row_id = view._selection_row_id(end[0])
+        view._selection_frozen_text = None
+        assert view._sel_anchor_row_id is not None
+        assert view._sel_head_row_id is not None
+
     def test_usable_with_pyte(self):
         view = self._make()
         self.assertTrue(view.is_usable())
@@ -242,12 +258,20 @@ class TerminalGridViewTests(unittest.TestCase):
         from PySide6.QtWidgets import QApplication
         view = self._make()
         view.feed("hello")
-        view._sel_anchor = (0, 0)
-        view._sel_head = (0, 4)
+        self._select_visible_cells(view)
         self.assertTrue(view.has_selection())
         self.assertEqual(view.selected_text(), "hello")
         view.copy_selection()
         self.assertEqual(QApplication.clipboard().text(), "hello")
+
+    def test_stale_selection_never_copies_a_different_scrolled_row(self):
+        """A live selection cannot silently change content when rows scroll."""
+        view = self._make(rows=4, cols=24)
+        view.feed("hallo")
+        self._select_visible_cells(view)
+        self.assertEqual(view.selected_text(), "hallo")
+        view.feed("\r\nsecond\r\nthird\r\nfourth\r\nfifth")
+        self.assertEqual(view.selected_text(), "")
 
     def test_context_menu_copy_and_paste(self):
         from PySide6.QtWidgets import QApplication
@@ -261,7 +285,7 @@ class TerminalGridViewTests(unittest.TestCase):
         self.assertTrue(actions[4].isEnabled())
         self.assertFalse(actions[0].isEnabled())
         self.assertTrue(actions[1].isEnabled())
-        view._sel_anchor, view._sel_head = (0, 0), (0, 4)
+        self._select_visible_cells(view)
         menu = view._create_context_menu()
         actions = [a for a in menu.actions() if not a.isSeparator()]
         actions[0].trigger()
@@ -282,7 +306,7 @@ class TerminalGridViewTests(unittest.TestCase):
 
         view = self._make()
         view.feed("hallo")
-        view._sel_anchor, view._sel_head = (0, 0), (0, 4)
+        self._select_visible_cells(view)
         QApplication.clipboard().setText("vorher")
         copied = self._key(view, Qt.Key.Key_Insert, "",
                            Qt.KeyboardModifier.ControlModifier)

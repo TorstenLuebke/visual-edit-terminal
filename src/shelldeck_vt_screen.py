@@ -14,7 +14,7 @@ Textdarstellung. Es werden beim Import keine Seiteneffekte ausgelöst.
 from __future__ import annotations
 
 import codecs
-from collections import deque
+from collections import deque, defaultdict
 from typing import Dict, List, Optional
 
 from shelldeck_scrollback import normalize_vt_scrollback_lines
@@ -63,7 +63,139 @@ class _PrivateSgrCompatibility:
         return super().select_graphic_rendition(*attrs)
 
 
+def _is_default_blank_cell(cell):
+    """True for a plain, unstyled space, including pyte's resize padding.
+
+    pyte may materialize implicit empty cells when the viewport is resized or
+    repainted.  A sparse row's highest *stored* column therefore is not a
+    reliable measure of how much text was actually written there.  Styled
+    spaces remain significant, as do any spaces inside a logical text line.
+    """
+    data = getattr(cell, "data", cell if isinstance(cell, str) else None)
+    if data not in (" ", "", None):
+        return False
+    if getattr(cell, "fg", "default") not in ("default", "", None):
+        return False
+    if getattr(cell, "bg", "default") not in ("default", "", None):
+        return False
+    return not any(bool(getattr(cell, attr, False)) for attr in (
+        "bold", "italics", "underscore", "strikethrough", "reverse", "blink"
+    ))
+
+
+def _row_has_text_cells(row):
+    """Do not mistake only-blank, materialized pyte rows for real output."""
+    return any(not _is_default_blank_cell(cell) for cell in row.values())
+
+
+def _reflow_logical_rows(rows, old_cols, new_cols, soft_wrap_ids,
+                         cursor_row, cursor_x):
+    """Rewrap sparse VT cells, retaining Char objects and real line breaks.
+
+    `soft_wrap_ids` contains IDs of the *row objects* (not y coordinates):
+    pyte moves row objects when scrolling. Only rows joined by automatic
+    wrapping are merged; explicit CR/LF still denote separate logical lines.
+    The function itself is pyte-/Qt-free, allowing isolated regression tests.
+    """
+    out = []
+    out_soft = set()
+    cursor_out = None
+    segment = {}
+    length = 0
+    segment_cursor = None
+
+    def flush():
+        nonlocal segment, length, segment_cursor, cursor_out
+        count = max(1, (length + new_cols - 1) // new_cols)
+        start = len(out)
+        for part in range(count):
+            left = part * new_cols
+            out.append({x - left: char for x, char in segment.items()
+                        if left <= x < left + new_cols})
+            if part + 1 < count:
+                out_soft.add(start + part)
+        if segment_cursor is not None:
+            offset = segment_cursor
+            # A cursor after the final cell is pending autowrap. It belongs
+            # to the previous row at x == columns, not the next blank row.
+            if offset and offset % new_cols == 0:
+                cursor_out = (start + offset // new_cols - 1, new_cols)
+            else:
+                cursor_out = (start + offset // new_cols, offset % new_cols)
+        segment, length, segment_cursor = {}, 0, None
+
+    for index, row in enumerate(rows):
+        positions = {x: char for x, char in row.items()
+                     if isinstance(x, int) and 0 <= x < old_cols}
+        # A pyte row can contain default blank cells right up to the current
+        # right margin even when nothing was printed there.  Counting those
+        # cells makes each tiny drag step append another apparent line; after
+        # enough steps the shell output scrolls entirely off the viewport.
+        used = max((x + 1 for x, cell in positions.items()
+                    if not _is_default_blank_cell(cell)), default=0)
+        wrapped = id(row) in soft_wrap_ids
+        if wrapped:
+            # A true soft wrap is a full physical row, including deliberate
+            # spaces before the continuation on the following row.
+            used = max(used, old_cols)
+        if index == cursor_row:
+            used = max(used, max(0, min(old_cols, int(cursor_x))))
+            segment_cursor = length + max(0, min(old_cols, int(cursor_x)))
+        # Never copy trailing synthetic padding into the next logical line.
+        # Interior default spaces are still kept to preserve layout.
+        segment.update({length + x: char for x, char in positions.items()
+                        if x < used})
+        length += used
+        if not wrapped:
+            flush()
+    if length or segment_cursor is not None:
+        flush()
+    return out, out_soft, cursor_out
+
+
 if pyte is not None:
+    class _SoftWrapTracking:
+        """Record natural wraps without confusing them with hard newlines.
+
+        Track row identities so regular scrolling and HistoryScreen's row
+        transfers keep their wrap metadata. There is no global pyte patch.
+        """
+
+        def draw(self, data):
+            # Stream normally delivers a single printable character. Handle
+            # longer chunks as well, to catch wraps in the middle of a chunk.
+            clusters = getattr(pyte.screens, "grapheme_clusters", None)
+            for character in (clusters(data) if callable(clusters) else data):
+                if (self.cursor.x == self.columns
+                        and pyte.modes.DECAWM in self.mode):
+                    previous = self.buffer[self.cursor.y]
+                    wraps = getattr(self, "_shelldeck_softwrap_rows", None)
+                    if wraps is None:
+                        wraps = self._shelldeck_softwrap_rows = {}
+                    wraps[id(previous)] = previous
+                    # A long-running shell must not retain unbounded, already
+                    # scrolled-away row objects through the wrap metadata.
+                    if len(wraps) > 2400:
+                        wraps.pop(next(iter(wraps)))
+                super().draw(character)
+
+        def reset(self):
+            self._shelldeck_softwrap_rows = {}
+            return super().reset()
+
+        def erase_in_display(self, *args, **kwargs):
+            # An explicitly erased screen is no longer one continuous line.
+            self._shelldeck_softwrap_rows = {}
+            return super().erase_in_display(*args, **kwargs)
+
+        def erase_in_line(self, *args, **kwargs):
+            wraps = getattr(self, "_shelldeck_softwrap_rows", None)
+            if wraps is not None:
+                row = self.buffer.get(self.cursor.y)
+                if row is not None:
+                    wraps.pop(id(row), None)
+            return super().erase_in_line(*args, **kwargs)
+
     class _RegionScrollCompatibility:
         """Move actual cell rows for SU/SD inside DECSTBM (zero-based margins).
 
@@ -115,10 +247,10 @@ if pyte is not None:
                     self.buffer.pop(y, None)
             self.dirty.update(range(top, bottom + 1))
 
-    class _CompatibleHistoryScreen(_RegionScrollCompatibility, _PrivateSgrCompatibility, pyte.HistoryScreen):
+    class _CompatibleHistoryScreen(_SoftWrapTracking, _RegionScrollCompatibility, _PrivateSgrCompatibility, pyte.HistoryScreen):
         """Normal VT screen with history and explicit SU/SD support."""
 
-    class _CompatibleScreen(_RegionScrollCompatibility, _PrivateSgrCompatibility, pyte.Screen):
+    class _CompatibleScreen(_SoftWrapTracking, _RegionScrollCompatibility, _PrivateSgrCompatibility, pyte.Screen):
         """Alternate VT screen with isolated scroll-region and SGR fixes."""
 
     class _CompatibleStream(pyte.Stream):
@@ -308,16 +440,94 @@ class VtScreen:
             self.stream.feed(text)
 
     # --- Geometrie --------------------------------------------------------
+    @staticmethod
+    def _make_row(template, cells):
+        """Construct pyte-compatible sparse rows across pyte 0.8+ versions."""
+        if hasattr(template, "default"):
+            row = type(template)(template.default)
+        elif isinstance(template, defaultdict):
+            row = defaultdict(template.default_factory)
+        else:
+            row = type(template)()
+        row.update(cells)
+        return row
+
+    def _reflow_main_screen(self, rows, cols):
+        """Reconstruct normal-screen text for a new width, before pyte clips it.
+
+        Do not reorder application/TUI screens, custom scrolling regions or a
+        scrolled-back history viewport: their cursor addressing is absolute.
+        """
+        normal = self.screen.normal
+        history = getattr(normal, "history", None)
+        if (self.screen.alternate_active or normal.margins is not None
+                or (history is not None and history.bottom)):
+            return None
+        past = list(history.top) if history is not None else []
+        # Large histories must not freeze Qt during interactive window drags.
+        older = past[:-2000]
+        past = past[-2000:]
+        visible = [normal.buffer[y] for y in range(self._rows)]
+        # Mere presence of default blank cells is *not* evidence of output.
+        # Otherwise the growing, empty lower viewport is repeatedly reflowed
+        # and pushes actual command output into scrollback on every resize.
+        last = max((i for i, line in enumerate(visible)
+                    if _row_has_text_cells(line)), default=-1)
+        last = max(last, min(self._rows - 1, int(normal.cursor.y)))
+        source = past + visible[:last + 1]
+        wraps = getattr(normal, "_shelldeck_softwrap_rows", {})
+        cursor_row = len(past) + min(self._rows - 1, int(normal.cursor.y))
+        return (older, *_reflow_logical_rows(source, self._cols, cols, wraps,
+                                             cursor_row, int(normal.cursor.x)))
+
+    def _apply_main_reflow(self, result, rows):
+        """Replace text rows after resizing pyte's own geometry and modes."""
+        older, lines, soft_indices, cursor = result
+        normal = self.screen.normal
+        history = getattr(normal, "history", None)
+        split = max(0, len(lines) - rows)
+        top_lines = older + lines[:split]
+        visible_lines = lines[split:]
+        sample = normal.buffer[0]
+        normal.buffer.clear()
+        rows_by_index = {}
+        for index, cells in enumerate(visible_lines):
+            row = self._make_row(sample, cells)
+            normal.buffer[index] = row
+            rows_by_index[split + index] = row
+        if history is not None:
+            new_top = [self._make_row(sample, cells) for cells in lines[:split]]
+            for index, row in enumerate(new_top):
+                rows_by_index[index] = row
+            history.top.clear()
+            history.top.extend(older)
+            history.top.extend(new_top)
+        normal._shelldeck_softwrap_rows = {
+            id(rows_by_index[i]): rows_by_index[i] for i in soft_indices
+            if i in rows_by_index
+        }
+        normal._shelldeck_resize_tails = {}
+        if cursor is not None:
+            y, x = cursor
+            normal.cursor.y = max(0, min(rows - 1, y - split))
+            normal.cursor.x = max(0, min(normal.columns, x))
+        normal.dirty.update(range(rows))
+
     def resize(self, rows: int, cols: int) -> bool:
         """Ändert die Gittergröße. Gibt True zurück, wenn sich etwas geändert hat."""
         rows = max(1, int(rows))
         cols = max(1, int(cols))
         if rows == self._rows and cols == self._cols:
             return False
+        # Reflow uses original cell objects. pyte.Screen.resize would clip
+        # them irretrievably before we could split the logical text lines.
+        reflow = self._reflow_main_screen(rows, cols) if cols != self._cols else None
         self._rows, self._cols = rows, cols
         # pyte.Screen.resize erwartet (lines, columns) — andere Reihenfolge als
         # der Konstruktor (columns, lines).
         self.screen.resize(rows, cols)
+        if reflow is not None:
+            self._apply_main_reflow(reflow, rows)
         try:
             self.screen.dirty.update(range(rows))
         except Exception:

@@ -34,6 +34,7 @@ import codecs
 import urllib.error
 import urllib.request
 from pathlib import Path
+from shelldeck_resize_audit_288 import ResizeAudit
 from shelldeck_ollama import build_generate_payload, extract_generate_response, ollama_api_error_message, normalize_system_prompt
 from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
 
@@ -1435,6 +1436,27 @@ class TerminalOutputArea(QTextEdit):
     def __init__(self, tab):
         super().__init__()
         self._terminal_tab = tab
+        self._resize_audit = ResizeAudit.from_environment()
+        if self._resize_audit.enabled:
+            # This signal distinguishes actual document deletion from a Qt
+            # repaint/viewport problem without recording text or commands.
+            self.document().contentsChange.connect(self._audit_document_change)
+
+    def _audit_document_change(self, position, removed, added):
+        audit = self._resize_audit
+        if audit.enabled:
+            document = self.document()
+            audit.record("document_change", position=int(position),
+                         removed=int(removed), added=int(added),
+                         chars=document.characterCount(),
+                         blocks=document.blockCount())
+
+    def clear(self):
+        audit = self._resize_audit
+        if audit.enabled:
+            audit.record("explicit_clear", chars=self.document().characterCount(),
+                         blocks=self.document().blockCount())
+        return super().clear()
 
     def append(self, text):
         getter = getattr(self._terminal_tab, "inline_output_insert_position", None)
@@ -4196,12 +4218,27 @@ class ShellDeckTerminalWidget(QWidget):
             if callable(recorder):
                 recorder(event, **fields)
 
+    def _audit_host_resize(self, event_name):
+        area = getattr(self, "output_area", None)
+        audit = getattr(area, "_resize_audit", None)
+        if audit is None or not audit.enabled:
+            return
+        document = area.document()
+        audit.record(event_name, width=self.width(), height=self.height(),
+                     chars=document.characterCount(),
+                     blocks=document.blockCount(),
+                     vt_mode=bool(getattr(self, "real_terminal_active", False)))
+
     def resizeEvent(self, event):
         getattr(self, "_vt_trace_event", lambda *_a, **_kw: None)("terminal_host_resize", width=self.width(), height=self.height())
+        self._audit_host_resize("host_resize")
         # Groessenaenderungen zusammenfassen: bei Ziehen des Fensterrands
         # darf keine unbeschraenkte Folge von 0-ms-Timern/SIGWINCH entstehen.
         super().resizeEvent(event)
         self._schedule_terminal_size_update()
+        audit = getattr(getattr(self, "output_area", None), "_resize_audit", None)
+        if audit is not None and audit.enabled:
+            QTimer.singleShot(0, lambda: self._audit_host_resize("host_resize_settled"))
 
     def _schedule_terminal_size_update(self):
         """Melde erst die letzte Fenstergroesse nach einer kurzen Ruhephase."""

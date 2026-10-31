@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from shelldeck_scrollback import normalize_vt_scrollback_lines
+from shelldeck_resize_audit_288 import ResizeAudit
 from shelldeck_prompt import PROMPT_ROLE_RGB, ENVIRONMENT_ROLE_RGB
 
 import shelldeck_key_encoding as keyenc
@@ -118,6 +119,7 @@ class TerminalGridView(QWidget):
         self._model = vt.VtScreen(rows=rows, cols=cols,
                                   enable_history=enable_history, history=history) \
             if vt.is_available() else None
+        self._resize_audit = ResizeAudit.from_environment()
 
         base_font = font or QFont("Monospace", 11)
         base_font.setStyleHint(QFont.StyleHint.TypeWriter)
@@ -436,6 +438,22 @@ class TerminalGridView(QWidget):
         rows = max(1, int(height // self._cell_h))
         return rows, cols
 
+    def _audit_grid_resize(self, event):
+        audit = getattr(self, "_resize_audit", None)
+        if audit is None or not audit.enabled or self._model is None:
+            return
+        screen = self._model.screen.normal
+        history = getattr(screen, "history", None)
+        visible = [screen.buffer.get(y) for y in range(self._model.rows)]
+        cursor = self._model.cursor
+        audit.record(event, width=self.width(), height=self.height(),
+                     rows=self._model.rows, cols=self._model.cols,
+                     visible_lines=sum(bool(line) for line in visible),
+                     visible_cells=sum(len(line) for line in visible if line),
+                     history_lines=(len(history.top) + len(history.bottom))
+                     if history is not None else 0,
+                     cursor_x=int(cursor["x"]), cursor_y=int(cursor["y"]))
+
     def _apply_grid_from_size(self) -> None:
         if self._model is None:
             return
@@ -443,7 +461,10 @@ class TerminalGridView(QWidget):
         old_rows, old_cols = self._model.rows, self._model.cols
         old_cursor = self._model.cursor
         before_position = (int(old_cursor.get("x", 0)), int(old_cursor.get("y", 0)))
+        if (rows, cols) != (old_rows, old_cols):
+            self._audit_grid_resize("vt_resize_before")
         if self._model.resize(rows, cols):
+            self._audit_grid_resize("vt_resize_after")
             self._record_cursor_transition("grid_resize", before_position,
                                            old_rows=old_rows, old_cols=old_cols)
             self.trace_event("grid_cells_changed", old_rows=old_rows, old_cols=old_cols,
