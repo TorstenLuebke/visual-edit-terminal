@@ -30,7 +30,14 @@ if __name__ == "__main__" and os.name == "posix":
         raise SystemExit(_session_result)
 
 from shelldeck_version import APP_VERSION
+from shelldeck_qt_logging import configure_wayland_textinput_logging
+from shelldeck_quick_commands import (
+    load_quick_commands, save_quick_commands, normalized_command, resolved_command,
+)
+from shelldeck_quick_commands_ui import QuickCommandsDock, QuickCommandDialog
+from shelldeck_quick_shortcuts import shortcut_identity, system_shortcut_conflict
 from shelldeck_vt_diagnostics_help_283 import vt_diagnostics_help_section
+from shelldeck_help_dialog import ShellDeckHelpDialog
 from shelldeck_profiles import normalize_profile, normalize_profiles, profile_display_label, profile_from_tab
 from shelldeck_workspaces import normalize_workspace, normalize_workspaces, workspace_display_label, workspace_from_tabs
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
@@ -56,7 +63,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer, QByteArray
 from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor, QSyntaxHighlighter,
-    QAction, QShortcut, QPalette, QTextOption
+    QAction, QActionGroup, QShortcut, QKeySequence, QPalette, QTextOption
 )
 
 
@@ -156,6 +163,8 @@ class TerminalWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.history = []
         self.default_command = ""
+        # Wiederverwendbares, nicht-modales Handbuch (F1).
+        self._help_window = None
         self.color_scheme_name = "Dunkel"
         self.theme_mode = "dark"
         self.window_opacity = 100
@@ -202,6 +211,9 @@ class TerminalWindow(QMainWindow):
         self.terminal_engine_store_file = workspace_config_base / "terminal_engine.json"
         self.theme_store_file = workspace_config_base / "theme.json"
         self.command_history_store_file = workspace_config_base / "command_history.json"
+        self.quick_commands_store_file = workspace_config_base / "quick_commands.json"
+        self.quick_commands_data = load_quick_commands(self.quick_commands_store_file)
+        self.quick_command_shortcuts = []
         self.load_history()
         self.load_command_history()
 
@@ -257,6 +269,48 @@ class TerminalWindow(QMainWindow):
         self.pre_command_bar_action.setChecked(True)
         self.pre_command_bar_action.triggered.connect(self.set_pre_command_bar_visible)
         self.view_menu.addAction(self.pre_command_bar_action)
+
+        # Alle Befehle der Leiste liegen gesammelt in EINEM Untermenü.
+        self.quick_commands_menu = self.view_menu.addMenu("Schnellbefehle")
+        self.quick_commands_menu.setToolTipsVisible(True)
+        self.quick_commands_action = QAction("Leiste anzeigen", self)
+        self.quick_commands_action.setCheckable(True)
+        self.quick_commands_action.triggered.connect(self.set_quick_commands_visible)
+        self.quick_commands_menu.addAction(self.quick_commands_action)
+
+        self.quick_commands_toggle_action = QAction("Leiste öffnen/einklappen", self)
+        self.quick_commands_toggle_action.setShortcut("F8")
+        self.quick_commands_toggle_action.triggered.connect(self.toggle_quick_commands)
+        self.quick_commands_menu.addAction(self.quick_commands_toggle_action)
+
+        self.quick_commands_menu.addSeparator()
+        self.quick_commands_pin_action = QAction("Dauerhaft anheften (📌)", self)
+        self.quick_commands_pin_action.setCheckable(True)
+        self.quick_commands_pin_action.triggered.connect(self.pin_quick_commands)
+        self.quick_commands_menu.addAction(self.quick_commands_pin_action)
+        self.quick_commands_position_menu = self.quick_commands_menu.addMenu("Position")
+        self.quick_commands_side_group = QActionGroup(self)
+        self.quick_commands_side_group.setExclusive(True)
+
+        self.quick_commands_left_action = QAction("Links", self)
+        self.quick_commands_left_action.setCheckable(True)
+        self.quick_commands_side_group.addAction(self.quick_commands_left_action)
+        self.quick_commands_left_action.triggered.connect(lambda: self.set_quick_commands_side("left"))
+        self.quick_commands_position_menu.addAction(self.quick_commands_left_action)
+        self.quick_commands_right_action = QAction("Rechts", self)
+        self.quick_commands_right_action.setCheckable(True)
+        self.quick_commands_side_group.addAction(self.quick_commands_right_action)
+        self.quick_commands_right_action.triggered.connect(lambda: self.set_quick_commands_side("right"))
+        self.quick_commands_position_menu.addAction(self.quick_commands_right_action)
+
+        self.quick_commands_compact_action = QAction("Schmale Buttons", self)
+        self.quick_commands_compact_action.setCheckable(True)
+        self.quick_commands_compact_action.triggered.connect(self.set_quick_commands_compact)
+        self.quick_commands_menu.addAction(self.quick_commands_compact_action)
+        self.quick_commands_menu.addSeparator()
+        self.quick_commands_settings_action = QAction("Buttons verwalten…", self)
+        self.quick_commands_settings_action.triggered.connect(self.show_quick_commands_manager)
+        self.quick_commands_menu.addAction(self.quick_commands_settings_action)
 
         self.command_task_panel_action = QAction("Letzte Befehle anzeigen", self)
         self.command_task_panel_action.setToolTip("Blendet die komplette Tabelle der letzten Befehle im aktuellen Tab ein oder aus.")
@@ -445,7 +499,7 @@ class TerminalWindow(QMainWindow):
 
         help_menu = menubar.addMenu("&Hilfe")
 
-        help_action = QAction("Funktionen und Tastenkürzel", self)
+        help_action = QAction("Hilfe und Handbuch (eigenes Fenster)", self)
         help_action.setShortcut("F1")
         help_action.triggered.connect(self.show_help_dialog)
         help_menu.addAction(help_action)
@@ -538,6 +592,23 @@ class TerminalWindow(QMainWindow):
         self.split_view_enabled = False
         layout.addWidget(self.view_container)
 
+        # Eigene Qt-Dock-Spalte; nur Geometrie, niemals Terminaltext neu laden.
+        self.quick_commands_dock = QuickCommandsDock(self)
+        side = self.quick_commands_data["side"]
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea if side == "right"
+                           else Qt.DockWidgetArea.LeftDockWidgetArea, self.quick_commands_dock)
+        self.quick_commands_dock.set_compact(self.quick_commands_data["compact"])
+        self.quick_commands_dock.set_pinned(self.quick_commands_data["pinned"], emit=False)
+        self.quick_commands_dock.handle.setText("❮" if side == "right" else "❯")
+        if not self.quick_commands_data["pinned"]:
+            self.quick_commands_dock.collapse()
+        self.quick_commands_dock.populate(self.quick_commands_data["commands"], self.shell_type)
+        self.quick_commands_dock.commandRequested.connect(self.run_quick_command)
+        self.quick_commands_dock.commandsReordered.connect(self.reorder_quick_commands)
+        self.quick_commands_dock.changed.connect(self.persist_quick_commands)
+        if not self.quick_commands_data["visible"]:
+            self.quick_commands_dock.hide()
+
         self.load_settings()
         self.update_qprocess_bash_ui()
         self.update_terminal_engine_ui()
@@ -552,6 +623,8 @@ class TerminalWindow(QMainWindow):
         # Die wiederhergestellten Tabs bestimmen erst jetzt die aktive Engine.
         self.update_terminal_engine_ui()
         self.update_qprocess_bash_ui()
+        self.refresh_quick_commands()
+        self.refresh_quick_command_shortcuts()
 
         self.shortcut_stop = QShortcut("Ctrl+C", self)
         self.shortcut_stop.activated.connect(self.interrupt_current_command)
@@ -835,6 +908,258 @@ class TerminalWindow(QMainWindow):
             f"Terminal-Engine des aktuellen Tabs: {self.terminal_engine_label(engine)}. "
             "Der Wechsel startet den Tab neu und ist während laufender Befehle gesperrt."
         )
+
+    # --- Schnellbefehle (unabhängig vom Vorbefehl, pro Button optional) ---
+    def persist_quick_commands(self):
+        dock = getattr(self, "quick_commands_dock", None)
+        if dock is not None:
+            self.quick_commands_data["visible"] = bool(dock.isVisible())
+            self.quick_commands_data["pinned"] = bool(dock._pinned)
+            self.quick_commands_data["compact"] = bool(dock._compact)
+        try:
+            save_quick_commands(self.quick_commands_store_file, self.quick_commands_data)
+        except OSError as exc:
+            self.show_status(f"Schnellbefehle konnten nicht gespeichert werden: {exc}")
+
+    def refresh_quick_commands(self):
+        dock = getattr(self, "quick_commands_dock", None)
+        if dock is None:
+            return
+        tab = self.current_terminal()
+        shell = tab.shell_type if isinstance(tab, TerminalTab) else self.shell_type
+        dock.populate(self.quick_commands_data["commands"], shell)
+
+    def refresh_quick_command_shortcuts(self):
+        for old in self.quick_command_shortcuts:
+            old.setEnabled(False)
+            old.deleteLater()
+        self.quick_command_shortcuts = []
+        used = set()
+        for item in self.quick_commands_data["commands"]:
+            key = str(item.get("shortcut", "") or "").strip()
+            identity = shortcut_identity(key)
+            if not identity or identity in used or self.validate_quick_command_shortcut(key, item["id"]):
+                continue
+            sequence = QKeySequence(key)
+            if sequence.isEmpty() or sequence.count() != 1:
+                continue
+            used.add(identity)
+            shortcut = QShortcut(sequence, self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(lambda cid=item["id"]: self.run_quick_command(cid))
+            self.quick_command_shortcuts.append(shortcut)
+
+    def validate_quick_command_shortcut(self, key, editing_id=""):
+        """Verhindert Doppelbelegung; OS-Reservierungen nur soweit erkennbar.
+
+        Desktop-Shortcuts anderer Anwendungen können nicht vollständig per Qt
+        abgefragt werden. Bekannte Systemkürzel und GNOME-Settings werden geprüft.
+        """
+        identity = shortcut_identity(key)
+        if not identity:
+            return "Die Tastenkombination ist ungültig."
+        if identity in {"CTRL+C", "CTRL+V", "CTRL+X", "CTRL+A", "CTRL+Z",
+                        "CTRL+L", "CTRL+R", "CTRL+D", "CTRL+SHIFT+C", "CTRL+SHIFT+V"}:
+            return "Diese Kombination wird für die Terminalbedienung oder die Zwischenablage benötigt."
+        for entry in self.quick_commands_data["commands"]:
+            if entry["id"] != editing_id and shortcut_identity(entry.get("shortcut", "")) == identity:
+                return f"Diese Tastenkombination ist bereits dem Schnellbefehl ‚{entry.get('name') or 'Befehl'}‘ zugeordnet."
+        # Alle bekannten Fensteraktionen, auch die anderer Untermenüs.
+        for action in self.findChildren(QAction):
+            if not action.isEnabled():
+                continue
+            sequences = list(action.shortcuts())
+            if action.shortcut() and not action.shortcut().isEmpty():
+                sequences.append(action.shortcut())
+            if any(shortcut_identity(seq.toString(QKeySequence.SequenceFormat.PortableText)) == identity
+                   for seq in sequences):
+                return f"Bereits in ShellDeck belegt: {action.text().replace('&', '')}."
+        # Auch separat registrierte QShortcuts berücksichtigen.
+        for shortcut in self.findChildren(QShortcut):
+            if shortcut in self.quick_command_shortcuts or not shortcut.isEnabled():
+                continue
+            if shortcut_identity(shortcut.key().toString(QKeySequence.SequenceFormat.PortableText)) == identity:
+                return "Diese Kombination ist bereits für eine andere ShellDeck-Funktion reserviert."
+        return system_shortcut_conflict(key)
+
+    def set_quick_commands_visible(self, visible):
+        dock = self.quick_commands_dock
+        dock.setVisible(bool(visible))
+        if visible:
+            dock.expand()
+        self.persist_quick_commands()
+
+    def toggle_quick_commands(self):
+        dock = self.quick_commands_dock
+        if not dock.isVisible():
+            self.set_quick_commands_visible(True)
+        elif not dock._expanded:
+            dock.expand()
+        else:
+            # Bei angehefteter Leiste: explizit ausblenden; ansonsten einklappen.
+            if dock._pinned:
+                self.set_quick_commands_visible(False)
+            else:
+                dock.collapse()
+
+    def pin_quick_commands(self, pinned):
+        self.quick_commands_dock.set_pinned(bool(pinned))
+        self.persist_quick_commands()
+
+    def set_quick_commands_side(self, side):
+        side = "right" if side == "right" else "left"
+        self.quick_commands_data["side"] = side
+        self.quick_commands_dock.handle.setText("❮" if side == "right" else "❯")
+        area = Qt.DockWidgetArea.RightDockWidgetArea if side == "right" else Qt.DockWidgetArea.LeftDockWidgetArea
+        self.removeDockWidget(self.quick_commands_dock)
+        self.addDockWidget(area, self.quick_commands_dock)
+        if self.quick_commands_data["visible"]:
+            self.quick_commands_dock.show()
+        self.persist_quick_commands()
+
+    def set_quick_commands_compact(self, compact):
+        self.quick_commands_dock.set_compact(bool(compact))
+        self.persist_quick_commands()
+
+    def show_quick_commands_manager(self):
+        self.set_quick_commands_visible(True)
+        self.quick_commands_dock.expand()
+        self.show_status("Schnellbefehle: Rechtsklick auf einen Button zum Bearbeiten; +/− zum Hinzufügen/Entfernen; Ziehen zum Sortieren.")
+
+    def add_quick_command(self):
+        tab = self.current_terminal()
+        shell = tab.shell_type if isinstance(tab, TerminalTab) else self.shell_type
+        item = normalized_command({"name": f"Befehl {len(self.quick_commands_data['commands']) + 1}",
+                                   "command": "", "confirm": False, "use_precommand": False})
+        dialog = QuickCommandDialog(item, shell, self,
+                                    shortcut_validator=lambda key: self.validate_quick_command_shortcut(key, item["id"]))
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            candidate = dialog.result_command(item)
+            if not candidate["command"].strip():
+                QMessageBox.warning(self, "Schnellbefehl", "Der Befehl darf nicht leer sein.")
+                return
+            self.quick_commands_data["commands"].append(candidate)
+            self._quick_commands_updated()
+
+    def edit_quick_command(self, command_id):
+        item = next((entry for entry in self.quick_commands_data["commands"]
+                     if entry["id"] == command_id), None)
+        if item is None:
+            return
+        tab = self.current_terminal()
+        shell = tab.shell_type if isinstance(tab, TerminalTab) else self.shell_type
+        dialog = QuickCommandDialog(item, shell, self,
+                                    shortcut_validator=lambda key: self.validate_quick_command_shortcut(key, item["id"]))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        candidate = dialog.result_command(item)
+        if not resolved_command(candidate, shell):
+            QMessageBox.warning(self, "Schnellbefehl", "Der Befehl darf nicht leer sein.")
+            return
+        self.quick_commands_data["commands"][self.quick_commands_data["commands"].index(item)] = candidate
+        self._quick_commands_updated()
+
+    def duplicate_quick_command(self, command_id):
+        from uuid import uuid4
+        item = next((entry for entry in self.quick_commands_data["commands"]
+                     if entry["id"] == command_id), None)
+        if item is None:
+            return
+        copy = dict(item)
+        copy["id"] = uuid4().hex
+        # Eine Kopie darf den ursprünglichen Shortcut nicht unbemerkt doppelt belegen.
+        copy["shortcut"] = ""
+        copy["name"] = (copy.get("name") or "Befehl") + " Kopie"
+        self.quick_commands_data["commands"].insert(
+            self.quick_commands_data["commands"].index(item) + 1, copy)
+        self._quick_commands_updated()
+
+    def remove_quick_command(self, command_id):
+        commands = self.quick_commands_data["commands"]
+        item = next((entry for entry in commands if entry["id"] == command_id), None)
+        if item is None and commands:
+            item = commands[-1]  # Minus ohne Auswahl entfernt den letzten Button.
+        if item is None:
+            return
+        if QMessageBox.question(self, "Schnellbefehl entfernen",
+                                f"‚{item.get('name') or 'Befehl'}‘ wirklich entfernen?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            commands.remove(item)
+            self._quick_commands_updated()
+
+    def reorder_quick_commands(self, ids):
+        commands = self.quick_commands_data["commands"]
+        mapping = {entry["id"]: entry for entry in commands}
+        if set(ids) == set(mapping) and len(ids) == len(commands):
+            self.quick_commands_data["commands"] = [mapping[key] for key in ids]
+            self._quick_commands_updated()
+
+    def _quick_commands_updated(self):
+        self.refresh_quick_commands()
+        self.refresh_quick_command_shortcuts()
+        self.persist_quick_commands()
+
+    def run_quick_command(self, command_id):
+        item = next((entry for entry in self.quick_commands_data["commands"]
+                     if entry["id"] == command_id), None)
+        if item is None:
+            return
+        tab = self.current_terminal()
+        if not isinstance(tab, TerminalTab):
+            self.show_status("Kein aktiver Terminal-Tab für Schnellbefehl")
+            return
+        command = resolved_command(item, tab.shell_type)
+        if not command:
+            self.show_status("Schnellbefehl ist leer")
+            return
+        if item.get("confirm"):
+            result = QMessageBox.question(self, "Schnellbefehl ausführen?",
+                f"{item.get('name') or 'Schnellbefehl'}\n\n{command}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if result != QMessageBox.StandardButton.Yes:
+                return
+
+        # Schnellbefehle wirken standardmäßig auf die aktuelle Sitzung.
+        # Besonders source/cd/export müssen in DIESER Shell laufen, damit
+        # deren Zustandsänderungen nicht in einem wegwerfbaren Tab landen.
+        # Nur die ausdrücklich gespeicherte Option new_tab eröffnet einen Tab.
+        use_new_tab = bool(item.get("new_tab"))
+        if use_new_tab:
+            tab = self.new_tab(shell_type=tab.shell_type, start_directory=
+                               str(getattr(tab, "current_working_directory", "") or ""),
+                               terminal_engine=getattr(tab, "terminal_engine", None))
+        self._dispatch_quick_command(tab, command, bool(item.get("use_precommand")),
+                                     remaining=60 if use_new_tab else 0, fresh_tab=use_new_tab,
+                                     starting_generation=getattr(tab, "_shell_generation", 0))
+
+    def _dispatch_quick_command(self, tab, command, use_precommand, *, remaining=0,
+                                fresh_tab=False, starting_generation=None):
+        from PySide6.QtCore import QProcess
+        # Der erste POSIX-VT-Start beginnt absichtlich erst nach dem ersten
+        # Layout. Genau ein Generationswechsel ist bei diesem Start erlaubt.
+        generation = getattr(tab, "_shell_generation", 0)
+        if starting_generation is not None and generation not in (starting_generation, starting_generation + 1):
+            return
+        if getattr(tab, "_terminal_cleaned_up", False):
+            return
+        if tab.process.state() != QProcess.ProcessState.Running and remaining > 0:
+            process = tab.process
+            def retry():
+                if getattr(tab, "_terminal_cleaned_up", False) or tab.process is not process:
+                    return
+                self._dispatch_quick_command(tab, command, use_precommand,
+                    remaining=remaining-1, fresh_tab=fresh_tab,
+                    starting_generation=starting_generation)
+            QTimer.singleShot(100, retry)
+            return
+        result, reason = tab.execute_saved_shell_command(command, use_precommand=use_precommand, fresh_tab=fresh_tab)
+        if not result:
+            # Kein automatischer neuer Tab; keine unkontrollierte Eingabe.
+            QMessageBox.information(self, "Schnellbefehl nicht ausgeführt", reason)
+        else:
+            self.show_status("Schnellbefehl an aktuellen Terminal-Tab übergeben")
 
     def normalize_pre_command_text(self, text):
         return str(text or "").strip()
@@ -1762,17 +2087,20 @@ class TerminalWindow(QMainWindow):
         title = profile.get("title") or profile.get("name") or self.shell_backend_label(shell_type)
         working_directory = profile.get("working_directory") or None
 
+        ollama_model = str(profile.get("ollama_model", "") or "").strip()
         tab = self.new_tab(
             shell_type=shell_type,
             title=title,
             start_directory=working_directory,
-            terminal_engine=profile.get("terminal_engine", self.terminal_engine),
+            # API-Clients benoetigen die klassische Eingabe-/Ausgabeansicht.
+            # Ein gespeichertes VT-Profil darf dieses Eingabefeld nicht verstecken.
+            terminal_engine=("qprocess" if ollama_model and self.ai_features_enabled
+                             else profile.get("terminal_engine", self.terminal_engine)),
         )
         if not isinstance(tab, TerminalTab):
             return
         tab.source_profile_name = str(profile.get("name", "") or "").strip()
 
-        ollama_model = str(profile.get("ollama_model", "") or "").strip()
         startup_command = str(profile.get("startup_command", "") or "").strip()
 
         if ollama_model and self.ai_features_enabled:
@@ -2252,6 +2580,7 @@ class TerminalWindow(QMainWindow):
         menu.exec(tab_widget.tabBar().mapToGlobal(pos))
 
     def current_tab_changed(self, index, tab_widget=None):
+        QTimer.singleShot(0, self.refresh_quick_commands)
         if tab_widget is not None and index >= 0:
             self.active_tab_widget = tab_widget
         tab = self.current_terminal()
@@ -2284,6 +2613,13 @@ class TerminalWindow(QMainWindow):
             self.show_status("Ausgabe geleert")
 
     def update_view_menu_state(self):
+        dock = getattr(self, "quick_commands_dock", None)
+        if dock is not None:
+            self.quick_commands_action.setChecked(dock.isVisible())
+            self.quick_commands_pin_action.setChecked(dock._pinned)
+            self.quick_commands_left_action.setChecked(self.quick_commands_data.get("side") == "left")
+            self.quick_commands_right_action.setChecked(self.quick_commands_data.get("side") == "right")
+            self.quick_commands_compact_action.setChecked(dock._compact)
         tab = self.current_terminal()
         is_terminal = isinstance(tab, TerminalTab)
         classic_history = bool(is_terminal and not tab.process_uses_pty_engine())
@@ -2375,6 +2711,12 @@ class TerminalWindow(QMainWindow):
             ("Workspace: Laden", self.load_workspace_dialog),
             ("Workspace: Löschen", self.delete_workspace_dialog),
         ]
+
+        entries.append(("Schnellbefehle anzeigen", self.show_quick_commands_manager))
+        for quick_item in self.quick_commands_data["commands"]:
+            label = quick_item.get("name") or "Schnellbefehl"
+            entries.append((f"Schnellbefehl: {label}",
+                            lambda cid=quick_item["id"]: self.run_quick_command(cid)))
 
         if self.ai_features_enabled:
             entries.extend([
@@ -4035,7 +4377,9 @@ class TerminalWindow(QMainWindow):
         if not model:
             return
         self.selected_ollama_model = model
-        tab = self.new_tab(title=f"Ollama {model}")
+        # Die API-Chatoberflaeche nutzt QTextEdit und eine eigene Eingabezeile.
+        # Mit globaler VT-Voreinstellung waere sie sonst verborgen.
+        tab = self.new_tab(title=f"Ollama {model}", terminal_engine="qprocess")
         if isinstance(tab, TerminalTab):
             tab.start_ollama_prompt_mode(model)
             tab.input_line.setFocus()
@@ -4235,6 +4579,9 @@ class TerminalWindow(QMainWindow):
 - Jeder Terminal-Tab besitzt einen eigenen Shell-Prozess, eine eigene Befehlshistorie, einen erkannten Arbeitsordner und optional einen eigenen Client-/Ollama-Modus.
 - Einstellungen wie Fenstergröße, Design, Schrift, Farben, Tabs, Workspaces, gespeicherte Pfade, Profile, KI-Menü, Vorbefehl-Leiste und History werden beim Beenden gespeichert und beim nächsten Start wiederhergestellt.
 - Die App bleibt bewusst kontrolliert: Befehle werden erst ausgeführt, wenn du Enter, den Button oder „Einfügen + Ausführen“ verwendest.
+- Die Hilfe (F1) oeffnet als eigenes, nicht-modales Fenster. Terminal und Handbuch lassen sich gleichzeitig bedienen, mit Themenindex, Suche und Zurueck-/Vorwaerts-Navigation.
+- Mit "Nebeneinander" im Handbuch werden beide Fenster auf Wunsch nebeneinander angeordnet (das Terminal wird dabei normal vergroessert/verkleinert, ohne Ausgaben zu loeschen). Die Hilfe kann auch von Hand verschoben werden.
+- Das Schliessen des Handbuchs beendet ShellDeck nicht. F1 blendet dasselbe Fenster mit der aktuellen Seite und Suche erneut ein.
 
 Grundbedienung
 - Gib unten im Eingabefeld einen Befehl ein und starte ihn mit Enter oder dem Button „Befehl ausführen“.
@@ -4244,6 +4591,19 @@ Grundbedienung
 - cls oder clear leert zusätzlich direkt die sichtbare Terminal-Ausgabe.
 - Ctrl+C unterbricht den laufenden Shell-Befehl oder beendet/unterbricht den aktiven Client-Modus.
 - Reines Terminal: Ctrl+Shift+E (oder Rechtsklick in die Ausgabe) schaltet pro Tab um, sodass Befehle direkt im Ausgabebereich hinter dem Prompt eingegeben werden – wie in einer klassischen Konsole. Erneutes Umschalten bringt das separate Eingabefeld zurück; alle Befehle, Modi und die History funktionieren in beiden Ansichten gleich.
+
+Schnellbefehle (Ansicht → Schnellbefehle → Leiste anzeigen / Buttons verwalten…)
+- Bei der ersten Einrichtung werden zehn frei änderbare Befehlsbuttons angeboten.
+- Für Linux, macOS, Windows-PowerShell und Windows-CMD werden die Standardbefehle entsprechend der aktiven Shell aufgelöst.
+- Klick führt den gespeicherten Befehl aus. Rechtsklick bietet Bearbeiten, Duplizieren und Entfernen; +/− ergänzen/entfernen Buttons. Ziehen sortiert die Buttons um.
+- Vollständiger Befehl im Tooltip; kurze Namen oder automatische Nummerierung; kompakte oder breite Beschriftung.
+- Alle Einstellungen sind unter Ansicht → Schnellbefehle zusammengefasst: anzeigen, F8 ein-/ausklappen, Stecknadel, Position links/rechts, schmale Buttons und Verwaltung.
+- Die Stecknadel 📌 hält die Leiste offen. Ohne Stecknadel wird sie nach Fokus-/Mausverlust eingeklappt; der schmale Randknopf oder F8 öffnet sie wieder.
+- Für jeden Button lassen sich Vorbefehl und Ausführungsbestätigung unabhängig aktivieren. Standardmäßig sind beide deaktiviert.
+- Für jeden Button kann optional die Ausführung in einem neuen Tab und ein eigener Shortcut gewählt werden. Die Kombination wird beim Drücken aufgenommen und auf doppelte/ bekannte reservierte Kürzel geprüft. Globale Kürzel fremder Anwendungen können je nach Betriebssystem/Desktop unbekannt bleiben.
+- Laufende Programme, Passwortprompts und vorbereitete Eingaben bleiben geschützt. Schnellbefehle werden standardmäßig im aktuellen Tab ausgeführt. Im echten Bash-VT-Terminal wird der Befehl über die originale Readline-Eingabe bestätigt (einschließlich normalem Bash-Befehlsverlauf); cd, source und export bleiben in derselben Shell wirksam. Ein neuer Tab wird nur durch die eigene Button-Einstellung erstellt. Der frühere Sicherheitshinweis zum automatischen neuen Tab und sein Menüeintrag entfallen.
+- Die Leiste ändert ausschließlich das Fensterlayout. PTY-Größenanpassung und VT-Reflow arbeiten unverändert; bereits ausgegebener Text darf bei Änderungen nicht verloren gehen.
+- Konfiguration liegt dauerhaft in ShellDeckTerminal/quick_commands.json und wird bei Updates nicht überschrieben.
 
 Vorbefehl-Leiste oben rechts
 - Die Vorbefehl-Leiste sitzt rechts in der Menüleiste.
@@ -4340,6 +4700,92 @@ Interaktiver Client-Modus
 - /bye, /exit, exit, quit oder .exit beenden den Client-Modus, je nach Client.
 - Semikolon-Aufteilung, cls/clear-Sonderbehandlung und Vorbefehl werden im Client-Modus nicht angewendet.
 
+
+Ollama – erster Chat (Schritt für Schritt)
+## Vorbereitung
+1. Prüfe in einem normalen Terminal-Tab mit `ollama --version`, ob Ollama installiert und im PATH ist. Fehlermeldung 'Befehl nicht gefunden' bedeutet: Ollama erst installieren oder PATH korrigieren.
+2. Prüfe mit `ollama list`, welche Modelle lokal vorhanden sind. Die Modellnamen mitsamt Tag (z. B. `gemma3:1b`) sind für ShellDeck wichtig.
+3. Falls die Liste leer ist, lade in einem normalen Shell-Tab ein für dein System geeignetes Modell, z. B. mit `ollama pull gemma3:1b`. Die Verfügbarkeit des Modells hängt von deiner Ollama-Installation ab.
+4. Stelle sicher, dass der lokale Ollama-Dienst läuft. ShellDeck verbindet sich für den eingebauten Chat mit `http://127.0.0.1:11434/api/generate` (lokale API). Auf Systemen ohne laufenden Dienst kann `ollama serve` nötig sein. Nicht doppelt starten, wenn der Dienst bereits läuft.
+## In ShellDeck
+5. Öffne `Einstellungen → KI-Menü / Ollama aktivieren` und aktiviere den Eintrag. Danach erscheint das Menü `KI`.
+6. Wähle `KI → Neuer Ollama-Chat`, dann ein lokal installiertes Modell. Es öffnet sich ein eigener Chat-Tab mit klassischem Eingabefeld, unabhängig davon, welche Terminal-Engine normale Tabs nutzen.
+7. Schreibe unten eine Frage, zum Beispiel `Erkläre mir den Unterschied zwischen cd und pwd.`; sende sie mit Enter oder `An Ollama senden`.
+8. Im Chat-Tab werden weitere Eingaben als Fragen an Ollama geschickt, nicht als Shell-Befehle. Zum Beenden ` /bye` (ohne das führende Leerzeichen), `exit` oder `quit` senden oder den Tab schließen.
+## Zwei verschiedene Arbeitsweisen
+- `KI → Neuer Ollama-Chat` nutzt die ShellDeck-eigene lokale HTTP-API mit Gesprächskontext, Systemprompt, Datei-Kontext und Chat-Export. Die Modellantwort erscheint formatiert im Chat-Tab.
+- `ollama run <modell>` ist ein Konsolenbefehl: In einem echten PTY-/VT-Terminal läuft er als normales interaktives Shell-Programm. Das ist nicht automatisch derselbe Modus wie der eingebaute KI-Chat.
+- Im klassischen ShellDeck-Befehlsfeld kann `ollama run <modell>` als ShellDeck-API-Client erkannt werden. Verwende für den eindeutig nachvollziehbaren Einstieg bevorzugt `KI → Neuer Ollama-Chat`.
+
+Ollama – Modelle, Kontext und Systemprompt
+## Modellwechsel und Diagnose
+- `KI → Ollama-Modell wählen` liest die lokal installierten Modelle über `ollama list`. Das ausgewählte Modell gilt für neue Chats; ein bereits geöffneter Chat verwendet weiterhin sein beim Start gewähltes Modell.
+- Wird kein Modell aufgelistet, prüfe `ollama list` in einem Shell-Tab. ShellDeck kann einen Namen manuell abfragen, lädt dadurch aber kein Modell herunter.
+- `KI → Neuer Ollama-Chat` eröffnet einen neuen Dialogverlauf. Ein anderes Modell erhält einen eigenen Tab.
+## Gedächtnis und Verhalten
+- `KI → Ollama-Kontext löschen` leert nur den bisher an das Modell übergebenen Gesprächskontext im aktuellen Ollama-Tab; die sichtbaren Antworten bleiben stehen.
+- `KI → Ollama-Gespräch löschen` leert Kontext und sichtbare Chat-Ausgabe des aktuellen Ollama-Tabs. Vorher gegebenenfalls als Markdown speichern.
+- `KI → Ollama-Systemprompt setzen` legt eine Verhaltensanweisung für den aktuellen Ollama-Tab fest, z. B. `Antworte knapp auf Deutsch und gib Befehle nur mit Erklärung aus.` Danach wird der bisherige Modellkontext zurückgesetzt.
+- Der Systemprompt steuert das Modell, ist aber keine technische Garantie gegen fehlerhafte oder riskante Antworten.
+- `KI → Ollama-Antwort stoppen` beendet eine laufende Anfrage; danach kann erneut eine Frage gestellt werden.
+
+Ollama – Dateien und Code im Chat
+## Textdatei als Kontext
+1. Wechsle in einen Ollama-API-Chat-Tab. Im klassischen Eingabefeld kann bereits eine Frage stehen, etwa `Erkläre mögliche Fehler in dieser Datei.`
+2. Wähle `Datei → Datei an aktuellen Prompt anhängen` und suche eine Textdatei aus. Unterstützt sind unter anderem `.py`, `.txt`, `.md`, `.json`, `.sql` und `.csv`.
+3. Die Datei wird als Textblock in das Eingabefeld übernommen; kontrolliere die Frage oberhalb des eingefügten Textes und sende den gesamten Prompt.
+- ShellDeck hängt für diese Funktion reine Textdateien bis 200.000 Bytes an. Binärdateien und größere Dateien werden abgelehnt; diese Grenze ist nicht die Kontextfenstergröße des Modells.
+- Vor dem Senden sensible Informationen (z. B. Zugangsdaten, private Schlüssel und personenbezogene Daten) aus dem Text entfernen. Auch ein lokal laufendes Modell benötigt sorgfältig gewählte Eingaben.
+## Antworten verwenden
+- Markdown-Codeblöcke erscheinen im Ollama-Chat als kopierbare Codekarten. Über das Kontextmenü der Ausgabe kann außerdem der letzte Codeblock kopiert werden.
+- `KI → Ollama-Chat als Markdown speichern` exportiert sichtbaren Verlauf, Modellname und Systemprompt. Das speichert nicht zwangsläufig den internen Modellkontext.
+- Von Ollama vorgeschlagene Shell-Befehle werden nicht automatisch ausgeführt. Prüfe sie, bevor du sie in einem Shell-Tab verwendest.
+
+Ollama – häufige Fehler und Lösungen
+## Problem: KI-Menü fehlt
+- Öffne `Einstellungen → KI-Menü / Ollama aktivieren`. Das Menü ist standardmäßig ausblendbar. Das Aktivieren installiert weder Ollama noch ein Modell.
+## Problem: Kein Modell zur Auswahl
+- Prüfe in einem Shell-Tab `ollama --version` und `ollama list`. Falls nichts installiert ist, lade ein passendes Modell mit `ollama pull <modell>` und öffne die Modellauswahl erneut.
+- ShellDeck liest `ollama list` über das ausführbare Programm im PATH. Die Auswahlliste kann leer sein, obwohl ein anderer Ollama-Dienst auf einem anderen Rechner existiert.
+## Problem: API nicht erreichbar / Verbindung verweigert
+- Der eingebaute Chat spricht fest `127.0.0.1:11434` an. Prüfe, ob der Ollama-Dienst auf diesem Rechner läuft. `ollama list` allein garantiert nicht, dass der Server erreichbar ist.
+- Wird Ollama in einem Container, über SSH oder auf einem anderen Port betrieben, erreicht die eingebaute ShellDeck-API diesen Dienst ohne entsprechende lokale Konfiguration nicht.
+## Problem: Modell nicht gefunden
+- Verwende exakt den Namen aus `ollama list`, einschließlich Tag (Beispiel: `gemma3:1b`). Ein Name im Auswahlfenster installiert das Modell nicht.
+## Problem: Eingabefeld fehlt oder Eingaben gehen ans Terminal
+- Ein normaler Tab im echten VT-Modus ist ein Terminal, kein Ollama-API-Chat. Öffne `KI → Neuer Ollama-Chat`; die API-Chat-Oberfläche nutzt ein sichtbares klassisches Eingabefeld.
+## Problem: Antwort dauert lange, Abbruch oder leere Antwort
+- Prüfe Modellgröße, verfügbare Ressourcen und ob Ollama gerade beschäftigt ist. ShellDeck wartet bei der API auf eine Antwort und bricht die Anfrage nach 180 Sekunden Timeout ab.
+- Eine zweite Chatfrage wird im selben Tab erst angenommen, wenn die laufende Anfrage abgeschlossen oder gestoppt wurde. Verwende `KI → Ollama-Antwort stoppen` bei Bedarf.
+
+Clients – Python, Node.js und Datenbanken
+## Was bedeutet Client-Modus?
+- ShellDeck kann interaktive Programme im klassischen Eingabemodus als eigenen Client-Prozess im aktuellen Tab starten. Danach wird das untere Eingabefeld an das Programm statt an die Shell gesendet. Der Vorbefehl bleibt für solche Client-Eingaben absichtlich deaktiviert.
+- Im echten PTY/VT-Terminal werden interaktive Programme wie in einem normalen Terminal bedient. ShellDeck benötigt dort keinen zusätzlichen Client-Eingabedialog. Der Zustand der laufenden Shell bleibt von einem separat gestarteten Client zu unterscheiden.
+## Python-REPL
+1. Öffne einen normalen Shell-Tab mit klassischem Eingabefeld und gib `python3` ein (unter Windows z. B. `py` oder `python`, sofern installiert).
+2. ShellDeck erkennt den direkten Python-Client, wenn die passende ausführbare Datei im PATH liegt; das Eingabefeld wird zu `An Python senden`.
+3. Sende `print(1 + 1)` und kontrolliere die Ausgabe `2`. Mit `exit()` kannst du die Python-REPL beenden; auch die ShellDeck-Client-Beenden-Aktion ist verfügbar.
+## Node.js-REPL
+1. Starte mit `node`, falls Node.js installiert ist, und prüfe die Erkennung im Eingabebereich.
+2. Gib `1 + 1` ein. Mit `.exit` beendest du den Node-Client.
+## SQLite und Datenbanken
+1. Starte für einen gefahrlosen Test `sqlite3 :memory:` (das sqlite3-Kommandozeilenprogramm muss installiert sein).
+2. Gib `SELECT sqlite_version();` ein. Mit `.exit` verlässt du SQLite.
+- Für PostgreSQL (`psql`), MySQL/MariaDB (`mysql`, `mariadb`) oder SQL Server (`sqlcmd`) sind die jeweiligen Programme, gültige Verbindungsdaten und eventuell Zugangsdaten nötig. ShellDeck richtet keine Datenbank ein.
+- Nutze bei Datenbank-Clients die vorgesehenen Passwortabfragen; gib Passwörter möglichst nicht direkt in gespeicherten Shell-Befehlen oder Profilnamen an.
+## Client verlassen
+- Unterstützte direkte Clients können über `Client-Modus beenden` im Kontextmenü verlassen werden. In vielen Clients funktionieren zusätzlich `exit`, `quit` oder die programmeigene Beenden-Syntax (`exit()`, `.exit`, `\\q`).
+- Nach dem Verlassen des Clients werden Eingaben wieder als Shell-Befehle behandelt. Im normalen Terminal-VT-Modus kehrt nach Ende des Programms ebenfalls die ursprüngliche Shell zurück.
+
+Clients – typische Stolperfallen
+- `python datei.py` ist die einmalige Ausführung eines Skripts und kein Python-REPL. Für eine interaktive Sitzung `python3`, `python` oder `python -i` verwenden.
+- `node datei.js` ist keine interaktive Node-Konsole. Für die REPL `node` verwenden.
+- Ein Client startet nur, wenn das entsprechende Programm verfügbar ist; prüfe zum Beispiel `python3 --version`, `node --version` und `sqlite3 -version` in einem Shell-Tab.
+- Wenn Befehle im Client wie gewöhnliche Shell-Befehle aussehen, können sie trotzdem Client-Eingaben sein. Erst den Client beenden, dann `cd`, `ls`, `git` oder `source` wieder in der Shell verwenden.
+- Ollama, Python und SQL haben unterschiedliche Beenden-Befehle und Kontextregeln. Der Vorbefehl der normalen Shell wird in Client-Eingaben bewusst nicht eingeschoben.
+- `source .venv/bin/activate` gehört zur Shell und nicht in die Python-REPL. Führe die Aktivierung im aktuellen Shell-Tab vor dem Start von `python3` aus.
+
 Kontextmenüs
 - Rechtsklick im unteren Eingabefeld: Kopieren, Einfügen, Einfügen + Ausführen, Ausschneiden, Alles auswählen, Datei anhängen, Neuer Tab, Tab duplizieren, Tab umbenennen, Befehlspalette, Tab-Ordner aktualisieren, Client-Modus beenden und aktuellen Tab schließen.
 - Einfügen + Ausführen übernimmt den Text aus der Zwischenablage in das Eingabefeld und startet ihn sofort. Ist der Vorbefehl sichtbar und aktiv, läuft er vorher.
@@ -4368,8 +4814,9 @@ Backends und Terminal-Engine
 - Nicht installierte Backends werden nicht oder nur eingeschränkt angeboten.
 - Das Backend kann pro neuem Tab gewählt werden.
 - Einstellungen → Terminal-Engine wählt die interne Ausführungsart für neu gestartete Tabs.
-- Standard QProcess bleibt der stabile Standard und verhält sich wie bisher.
-- PTY/ConPTY experimentell nutzt unter Windows pywinpty, wenn es installiert ist; fehlt pywinpty, fällt ShellDeck kontrolliert auf QProcess zurück.
+- Automatisch – empfohlen: nutzt nach Moeglichkeit unter Linux/macOS POSIX-PTY und unter Windows ConPTY. Nur wenn die Voraussetzungen fehlen, nutzt ShellDeck den QProcess-Kompatibilitaetsmodus.
+- PTY/ConPTY – interaktiv: echte Shell-Sitzungen mit Terminalsteuerung, geeignet auch fuer Vollbildprogramme wie vim, nano und htop. Die Verfuegbarkeit richtet sich nach dem Betriebssystem und den installierten Komponenten (unter Windows unter anderem pywinpty, fuer VT-Darstellung pyte). Nicht jede Shell und jedes fremde Programm wurde auf jeder Plattform vollstaendig geprueft.
+- QProcess – kompatibel: alternative, zeilenorientierte Befehlsausfuehrung, wenn eine PTY/ConPTY-Sitzung nicht moeglich oder nicht erwuenscht ist. Vollbild-Terminalprogramme sind hier eingeschraenkt.
 - Beim Öffnen gespeicherter Pfade wird der passende cd-Befehl für das jeweilige Backend erzeugt.
 
 Virtuelle Umgebungen und Restore
@@ -4385,7 +4832,8 @@ Gespeicherte Daten
 - Gespeichert werden unter anderem Fensterzustand, Design, Tabs, Tab-History, Pfade, Profile, Workspaces, KI-Menü-Zustand, Vorbefehl-Sichtbarkeit, Vorbefehl-Aktivierung und Vorbefehl-Historie.
 
 Tastenkürzel
-- F1: Hilfe öffnen.
+- F8: Schnellbefehlsleiste öffnen oder schließen. Weitere Einstellungen unter Ansicht → Schnellbefehle.
+- F1: Hilfe als eigenstaendiges Fenster oeffnen oder wieder anzeigen (ohne das Terminal zu sperren).
 - Ctrl+T: Neuer Tab.
 - Ctrl+W: Aktuellen Tab schließen.
 - Ctrl+D: Aktuellen Tab duplizieren.
@@ -4441,8 +4889,7 @@ Echtes Terminal (VT)
 
 {vt_diagnostics_help_section()}
 Hinweise
-- Standard QProcess ist der stabile Kompatibilitätsmodus. Normale Shell-Befehle funktionieren gut; Programme mit Vollbild-Terminalsteuerung können eingeschränkt sein.
-- PTY/ConPTY experimentell ist zum Testen echterer Terminal-Interaktion gedacht und sollte erst nach einem gesicherten Git-Stand genutzt werden.
+- Fuer die normale Terminalnutzung ist die automatische PTY/ConPTY-Auswahl empfohlen. QProcess bleibt fuer kompatible, zeilenorientierte Ausfuehrung verfuegbar. Bei nicht unterstuetzten Terminalfunktionen oder fehlenden Komponenten kann der Funktionsumfang abweichen.
 - Welche Backends, Clients und Ollama-Modelle nutzbar sind, hängt davon ab, was auf dem System installiert ist.
 - Befehle werden nur dann zum Rückgängig-Machen angeboten, wenn ShellDeck einen einfachen sicheren Fall erkennt, z.B. mkdir für einen Ordner. Ist der Ordner nicht mehr leer, fragt ShellDeck vor dem Löschen ausdrücklich nach.
 - Unter Linux funktioniert die App grundsätzlich mit PySide6 und verfügbaren Shells wie bash, zsh, fish oder sh.
@@ -4467,7 +4914,15 @@ Hinweise
         dialog.exec()
 
     def show_help_dialog(self):
-        self._show_read_only_help_dialog(f"Hilfe — {APP_NAME}", self.help_text())
+        """F1: Handbuch separat zeigen, ohne die laufende Shell zu blockieren."""
+        if self._help_window is None:
+            self._help_window = ShellDeckHelpDialog(self.help_text(), self)
+        dialog = self._help_window
+        if dialog.isMinimized():
+            dialog.showNormal()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def show_vt_diagnostics_help_dialog(self):
         self._show_read_only_help_dialog(
@@ -4485,7 +4940,7 @@ Hinweise
             f"<p><b>Version:</b> {APP_VERSION}</p>"
             "<p>Tabbed Terminal mit Design-Anpassungen, mehreren Shell-Backends, "
             "gespeicherten Ordnerpfaden, Tab-Profilen, Workspaces, Befehlspalette "
-            "flexiblen Split-/Raster-Ansichten, optionaler experimenteller PTY/ConPTY-Engine "
+            "flexiblen Split-/Raster-Ansichten, interaktiver PTY/ConPTY-Engine "
             "und verbessertem Ollama-Client-Modus mit Datei-Kontext für Prompts und Chat-artigen Codeblöcken.</p>"
             "<p>Die App stellt die Oberfläche bereit; Befehle werden über das "
             "jeweils ausgewählte Shell-Backend ausgeführt.</p>"
@@ -4783,6 +5238,10 @@ Hinweise
 
 
     def closeEvent(self, event):
+        # Ein eigenstaendiges Handbuch darf ShellDeck nicht am Beenden hindern.
+        if self._help_window is not None:
+            self._help_window.close()
+        self.persist_quick_commands()
         self._closing_app = True
         self.carry_over_workspace_on_exit()
         self.carry_over_profiles_on_exit_confirmed()
@@ -4801,6 +5260,8 @@ def main(argv=None) -> int:
     if argv is None:
         argv = sys.argv
     install_crash_logging()
+    # Suppress only the repeated QtWayland textinput warning; keep PTY output.
+    configure_wayland_textinput_logging()
     launch_options = parse_launch_arguments(list(argv[1:]))
     app = QApplication(sys.argv)
     # Optional Qt-Wayland focus diagnostics; disabled unless explicitly requested.

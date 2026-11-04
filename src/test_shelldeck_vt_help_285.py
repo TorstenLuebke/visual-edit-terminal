@@ -69,13 +69,34 @@ def test_dedicated_help_action_calls_own_read_only_dialog():
     )
 
 
-def test_existing_f1_action_keeps_same_destination():
-    fake = SimpleNamespace(help_text=Mock(return_value="old help"),
-                           _show_read_only_help_dialog=Mock())
-    _load_method("show_help_dialog")(fake)
-    fake._show_read_only_help_dialog.assert_called_once_with(
-        "Hilfe — ShellDeck Terminal", "old help"
-    )
+def test_existing_f1_action_opens_offline_help_center(monkeypatch):
+    fake = SimpleNamespace(help_text=Mock(return_value="old help"), _help_window=None)
+    shown = SimpleNamespace(show=Mock(), raise_=Mock(), activateWindow=Mock())
+    created = []
+    class FakeHelpDialog:
+        def __init__(self, source, parent):
+            assert source == "old help"
+            assert parent is fake
+            created.append(self)
+        def isMinimized(self):
+            return False
+        def show(self):
+            shown.show()
+        def raise_(self):
+            shown.raise_()
+        def activateWindow(self):
+            shown.activateWindow()
+        def exec(self):
+            raise AssertionError("Das Handbuch darf das Terminal nicht blockieren")
+    function = _load_method("show_help_dialog")
+    function.__globals__["ShellDeckHelpDialog"] = FakeHelpDialog
+    function(fake)
+    function(fake)
+    assert len(created) == 1
+    assert shown.show.call_count == 2
+    assert shown.raise_.call_count == 2
+    assert shown.activateWindow.call_count == 2
+    fake.help_text.assert_called_once()
 
 
 def test_menu_wiring_is_action_not_just_text():

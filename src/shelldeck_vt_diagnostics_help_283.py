@@ -15,4 +15,5 @@ def vt_diagnostics_help_section() -> str:
 - Bei Cursor-/Startfehlern zuerst mit Startaufzeichnung neu starten, den Fehler beobachten, nach Bedarf Zeichen ohne Enter eingeben und ueber ■ Stopp sichern. Bei Problemen waehrend eines laufenden Programms hingegen die manuelle Aufnahme vor dem Start dieses Programms einschalten.
 - Datenschutz: Rohbytes, Bildschirmbilder und Modelltexte koennen Passwoerter, Befehle, Ausgaben, Pfade oder andere sensible Inhalte enthalten. Vor dem Weitergeben pruefen; nicht automatisch an VisualEdit oder fremde Dienste uebertragen. Die Aufnahme ist standardmaessig ausgeschaltet.
 - Eine Diagnose allein behebt den Fehler nicht. Zum Nachweis einer Korrektur denselben Fall nach der Aenderung erneut ausfuehren und die Ergebnisse vergleichen.
+- Qt/Wayland: Wiederholte Meldungen von qt.qpa.wayland.textinput werden im normalen Linux/Wayland-Betrieb ausgeblendet. Fuer eine gezielte Diagnose ShellDeck mit SHELLDECK_QT_WAYLAND_TEXTINPUT_LOG=1 starten; SHELLDECK_FOCUS_TRACE_PATH aktiviert ebenfalls die Meldungen. Andere Warnungen und Terminalausgaben bleiben sichtbar.
 """

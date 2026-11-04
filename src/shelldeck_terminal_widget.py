@@ -4055,6 +4055,230 @@ class ShellDeckTerminalWidget(QWidget):
             return None
         return separator.join(values)
 
+    def _vt_grid_at_empty_bash_prompt(self):
+        """Conservative visual check of the *current* VT cursor line.
+
+        This is an additional check, not a substitute for Bash/Readline guards
+        or the foreground process group. Fails closed on custom/unknown prompts.
+        """
+        grid = getattr(self, "terminal_grid", None)
+        model = getattr(grid, "_model", None)
+        if model is None:
+            return False
+        try:
+            if model.screen.alternate_active:
+                return False
+            cursor = model.cursor
+            if cursor.get("hidden", False):
+                return False
+            y, x = int(cursor["y"]), int(cursor["x"])
+            lines = model.display()
+            if not (0 <= y < len(lines) and 0 <= x <= len(lines[y])):
+                return False
+            line = lines[y]
+            if line[x:].strip():
+                return False
+            # ShellDeck's own default PS1 is: (venv) bash-5.3$ .
+            # No user input must appear after the dollar/hash prompt.
+            return bool(re.search(r"(?:^|\s)bash-[0-9]+(?:\.[0-9]+)*[#$]\s*$", line[:x]))
+        except (AttributeError, ValueError, IndexError, TypeError):
+            return False
+
+    def _quick_command_ack_check(self, token, process, rc_generation, attempt=0):
+        """Wait asynchronously for Readline; submit only its matching ACK.
+
+        A typed line or foreground app can never be force-accepted. The
+        pending state also prevents overlapping quick-button activations.
+        """
+        pending = getattr(self, "_shelldeck_grid_quick_pending", None)
+        if pending != token:
+            return
+        if (getattr(self, "_terminal_cleaned_up", False)
+                or process is not self.process
+                or rc_generation != getattr(self, "_shell_generation", 0)):
+            self._shelldeck_grid_quick_pending = None
+            return
+        ack = Path(self._shelldeck_grid_quick_ack_file)
+        try:
+            result = ack.read_text(encoding="ascii").strip()
+        except OSError:
+            result = ""
+        if result == "ready:" + token:
+            self._shelldeck_grid_quick_pending = None
+            try:
+                ack.write_text("", encoding="ascii")
+            except OSError:
+                pass
+            # Readline accept-line: exactly what a manual Enter does, without
+            # re-running the optional precommand via ShellDeck's Enter macro.
+            if self._posix_shell_owns_pty_foreground():
+                self.process.write(b"\x18\x1e")
+            return
+        if result == "busy:" + token:
+            self._shelldeck_grid_quick_pending = None
+            self.window.show_status("Schnellbefehl nicht ausgeführt: Die Eingabezeile ist bereits belegt.")
+            return
+        if attempt >= 80:
+            self._shelldeck_grid_quick_pending = None
+            self.window.show_status("Schnellbefehl nicht bestätigt; Eingabe nicht automatisch abgeschickt.")
+            # Never send Enter after a missing acknowledgement.
+            return
+        QTimer.singleShot(25, lambda: self._quick_command_ack_check(
+            token, process, rc_generation, attempt + 1))
+
+    def _vt_grid_at_empty_native_prompt(self):
+        """Best-effort empty prompt recognition for Win ConPTY and POSIX zsh.
+
+        Never submit to an unknown prompt: in that case the command can be
+        explicitly configured for a new tab. This does not claim to detect
+        every third-party program or custom PS1.
+        """
+        model = getattr(getattr(self, "terminal_grid", None), "_model", None)
+        if model is None:
+            return False
+        try:
+            if model.screen.alternate_active:
+                return False
+            cursor = model.cursor
+            if cursor.get("hidden", False):
+                return False
+            y, x = int(cursor["y"]), int(cursor["x"])
+            rows = model.display()
+            if not (0 <= y < len(rows) and 0 <= x <= len(rows[y])):
+                return False
+            line = rows[y]
+            if line[x:].strip():
+                return False
+            left = line[:x]
+            shell = str(self.shell_type or "").lower()
+            if shell in {"powershell", "pwsh", "powershell7"}:
+                return bool(re.search(r"^PS (?:[^>\r\n]+)>\s*$", left))
+            if shell in {"cmd", "cmd.exe"}:
+                return bool(re.search(r"^[a-zA-Z]:[^>\r\n]*>\s*$", left))
+            if os.name == "posix" and shell in {"zsh", "sh", "fish"}:
+                if not self._posix_shell_owns_pty_foreground():
+                    return False
+                return bool(re.search(r"(?:^|\s)[^\r\n]*[%#$>]\s*$", left))
+            return False
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return False
+
+    def _run_quick_command_in_current_native_vt(self, command, use_precommand):
+        """Send keystrokes through the same PTY path as manual grid input.
+
+        Unlike Bash with a private Readline bridge, Windows shells and zsh
+        have no guaranteed empty-line callback here. Fail closed on unknown
+        prompt geometry and never infer readiness merely from process.running.
+        """
+        if not self._vt_grid_at_empty_native_prompt():
+            return False, "Kein leerer Shell-Prompt sicher erkannt; Schnellbefehl nicht übertragen."
+        if "\x00" in command or "\r" in command:
+            return False, "Der Schnellbefehl enthält nicht unterstützte Steuerzeichen."
+        prefix = str(self.window.active_pre_command_text() or "") if use_precommand else ""
+        parts = [part for part in (prefix, command) if part.strip()]
+        # Dispatch with a normal line submit on the exact active PTY; native
+        # shells own their history and state, just as for typed input.
+        text = "\r".join(part.replace("\n", "\r") for part in parts) + "\r"
+        raw = self.encode_process_input(text)
+        try:
+            written = self.process.write(raw)
+            if isinstance(written, int) and written != len(raw):
+                return False, "Die Schnellbefehls-Eingabe konnte nicht vollständig übertragen werden."
+            return True, ""
+        except (OSError, RuntimeError):
+            return False, "Die Eingabe in das Terminal ist fehlgeschlagen."
+
+    def _run_quick_command_in_current_vt_bash(self, command, use_precommand):
+        """Insert into the active Bash Readline line, then accept normally.
+
+        Uses a private per-shell request/ack pair, never ``eval`` of the quick
+        command or an additional shell subprocess. `source`, `cd` and `export`
+        therefore change the existing tab, and Bash adds normal history.
+        """
+        import secrets
+        if str(getattr(self, "shell_type", "")).lower() != "bash":
+            return False, "Diese Shell unterstützt die geschützte Readline-Übergabe nicht."
+        path = getattr(self, "_shelldeck_grid_quick_command_file", None)
+        ack_path = getattr(self, "_shelldeck_grid_quick_ack_file", None)
+        if not path or not ack_path or not self.process_uses_pty_engine():
+            return False, "Die Bash-Schnellbefehlsbrücke ist nicht verfügbar."
+        if getattr(self, "_shelldeck_grid_quick_pending", None):
+            return False, "Ein Schnellbefehl wartet noch auf Bestätigung durch Bash."
+        if not self._posix_shell_owns_pty_foreground():
+            return False, "Ein Programm besitzt das Terminal oder der Shell-Zustand ist nicht sicher bestimmbar."
+        if not self._vt_grid_at_empty_bash_prompt():
+            return False, "Ein leerer Bash-Prompt ist nicht sicher erkennbar. Bitte Eingabe zunächst abschließen."
+        if "\x00" in command or "\r" in command:
+            return False, "Dieser Befehl enthält nicht unterstützte Steuerzeichen."
+        token = secrets.token_hex(12)
+        try:
+            request = Path(path)
+            if request.stat().st_size:
+                return False, "Ein vorheriger Schnellbefehl wartet noch auf Verarbeitung."
+            Path(ack_path).write_text("", encoding="ascii")
+            # Sync the *current* global precommand to the Bash-local rc bridge.
+            self.sync_grid_precommand_file()
+            request.write_text(token + "\n" + ("1" if use_precommand else "0") + "\n" + command,
+                               encoding="utf-8")
+            self._shelldeck_grid_quick_pending = token
+            process = self.process
+            generation = getattr(self, "_shell_generation", 0)
+            if process.write(b"\x18\x07") != 2:
+                self._shelldeck_grid_quick_pending = None
+                request.write_text("", encoding="utf-8")
+                return False, "Die Befehlsübergabe an Bash ist fehlgeschlagen."
+            QTimer.singleShot(25, lambda: self._quick_command_ack_check(token, process, generation))
+            return True, ""
+        except OSError:
+            self._shelldeck_grid_quick_pending = None
+            return False, "Schnellbefehl konnte nicht an Bash übergeben werden."
+
+    def execute_saved_shell_command(self, command, *, use_precommand=False, fresh_tab=False):
+        """Führt einen Schnellbefehl über den normalen Befehlsweg aus.
+
+        Vorhandene Eingaben, Dialoge und laufende Programme dürfen nicht als
+        Shell-Kommando überschrieben werden. Ein brandneuer Tab kann dagegen
+        sicher über die klassische Eingaberoute auch im VT-Grid gestartet
+        werden. Kein direkter PTY-Write am regulären Befehlsweg vorbei.
+        """
+        text = str(command or "").strip()
+        if not text:
+            return False, "Der Schnellbefehl ist leer."
+        if getattr(self, "_terminal_cleaned_up", False):
+            return False, "Der Terminal-Tab wurde bereits geschlossen."
+        if self.process.state() != QProcess.ProcessState.Running:
+            return False, "Die Shell ist nicht aktiv."
+        if getattr(self, "client_mode_active", False):
+            return False, "Im aktiven Client-Modus darf kein Shell-Befehl eingeschoben werden."
+        if getattr(self, "password_prompt_active", False) or self.visible_output_waits_for_password():
+            return False, "Die Shell erwartet eine Passworteingabe."
+        if (getattr(self, "_bash_completion_pending", False)
+                or getattr(self, "interaction_prompt_active", False)
+                or self.visible_output_waits_for_interaction()
+                or self.command_appears_to_be_running()):
+            return False, "Ein Programm läuft oder erwartet eine Antwort. Bitte zuerst beenden."
+        if str(self.input_line.toPlainText() or "").strip():
+            return False, "Im Terminal ist bereits ein noch nicht ausgeführter Text vorbereitet."
+        if self.inline_mode_active() and str(self.inline_input_text() or "").strip():
+            return False, "Im Terminal ist bereits eine nicht abgeschickte Eingabe vorhanden."
+        if getattr(self, "real_terminal_active", False) and not fresh_tab:
+            if str(getattr(self, "shell_type", "")).lower() == "bash" and os.name == "posix":
+                return self._run_quick_command_in_current_vt_bash(text, use_precommand)
+            return self._run_quick_command_in_current_native_vt(text, use_precommand)
+        # Im echten Bash-Grid sitzt der native Vorbefehl in einer Datei, die
+        # beim nächsten ENTER von Readline gelesen wird. Für Schnellbefehle
+        # ohne Vorbefehl muss sie bis zum nächsten manuellen Tastendruck leer
+        # bleiben; _write_terminal_grid_input synchronisiert sie erneut.
+        previous = getattr(self, "_quick_command_apply_precommand", True)
+        self._quick_command_apply_precommand = bool(use_precommand)
+        try:
+            self.sync_grid_precommand_file()
+            self.input_line.setPlainText(text)
+            self.execute_command()
+        finally:
+            self._quick_command_apply_precommand = previous
+        return True, ""
+
     def run_text_command(self, command):
         self.input_line.setPlainText(command)
         self.input_line.moveCursor(QTextCursor.MoveOperation.End)
@@ -4500,6 +4724,9 @@ class ShellDeckTerminalWidget(QWidget):
         self._shelldeck_prompt_rc = None
         self._shelldeck_grid_precommand_file = None
         self._shelldeck_grid_precommand_last = None
+        self._shelldeck_grid_quick_command_file = None
+        self._shelldeck_grid_quick_ack_file = None
+        self._shelldeck_grid_quick_pending = None
         if (os.name == "posix" and self.process_uses_pty_engine()
                 and str(self.shell_type or "").lower() == "bash"):
             from shelldeck_prompt import create_bash_prompt_rc
@@ -4510,6 +4737,8 @@ class ShellDeckTerminalWidget(QWidget):
                     include_prompt=getattr(self.window, "terminal_prompt_enabled", lambda: True)(),
                 )
                 self._shelldeck_grid_precommand_file = str(Path(rc_path).with_name("grid_precommand"))
+                self._shelldeck_grid_quick_command_file = str(Path(rc_path).with_name("grid_quick_command"))
+                self._shelldeck_grid_quick_ack_file = str(Path(rc_path).with_name("grid_quick_ack"))
                 self.sync_grid_precommand_file()
                 shell_args = ["--noprofile", "--rcfile", rc_path, "-i"]
             except (OSError, ValueError):
@@ -6436,7 +6665,8 @@ class ShellDeckTerminalWidget(QWidget):
         prefix_text = ""
         prefix_commands = []
         if not self.client_mode_active:
-            prefix_text = self.window.active_pre_command_text()
+            prefix_text = (self.window.active_pre_command_text()
+                           if getattr(self, "_quick_command_apply_precommand", True) else "")
             if prefix_text:
                 self.window.remember_pre_command_text(prefix_text)
                 # Bei echter PTY-Bash wird derselbe Vorbefehl bereits vom
@@ -7127,7 +7357,8 @@ class ShellDeckTerminalWidget(QWidget):
         active = (self.process_uses_pty_engine()
                   and getattr(self, "real_terminal_active", False)
                   and str(self.shell_type or "").lower() == "bash")
-        prefix = str(self.window.active_pre_command_text() or "") if active else ""
+        prefix = (str(self.window.active_pre_command_text() or "")
+                  if active and getattr(self, "_quick_command_apply_precommand", True) else "")
         if prefix != getattr(self, "_shelldeck_grid_precommand_last", None):
             try:
                 Path(path).write_text(prefix, encoding="utf-8")

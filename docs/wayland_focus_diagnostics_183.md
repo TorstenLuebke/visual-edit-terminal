@@ -18,9 +18,33 @@ klicken und die Schritte wiederholen, bei denen im Startterminal viele
 Die Datei `~/Downloads/shelldeck_focus.jsonl` enthält die Fokuswechsel.
 
 Das Protokoll darf nur bei ausdrücklicher Aktivierung erstellt werden.
-Die bekannten Qt-Meldungen werden dabei bewusst **nicht** ausgeblendet.
+Seit Patch 293 werden die wiederholten Warnungen der Kategorie
+`qt.qpa.wayland.textinput.warning` beim normalen Start **nur unter Linux/Wayland**
+unterdrueckt. Eine explizit aktivierte Fokusdiagnose laesst diese Warnungen
+weiterhin sichtbar, um den zeitlichen Zusammenhang zu bewahren.
 Eine Korrelation zeitgleicher Ereignisse zeigt, ob ShellDeck oft den Fokus
 wechselt; sie beweist allein noch keine Ursache in ShellDeck.
 
 Nach dem Test die Datei bei Bedarf löschen. Start ohne die Umgebungsvariable
 schaltet die Aufzeichnung wieder aus.
+
+## Qt-Wayland-Warnungen im Normalbetrieb (Patch 293)
+
+Die Meldungen `QWaylandTextInputv3::enableSurface/disableSurface` mit
+`Trying to ... but ... is focused` stammen aus der Qt/Wayland-Texteingabe.
+ShellDeck schaltet standardmaessig **nur die Warnstufe dieser Qt-Kategorie** ab.
+Andere Qt-Warnungen, kritische Meldungen, Python-Fehler und echte Ausgaben der
+Terminalprogramme bleiben erhalten. Die Ursache moeglicher Fokuswechsel wird
+hierdurch **nicht** repariert; bei Fehlfunktionen ist eine Diagnose erforderlich.
+
+Um die Warnungen fuer eine Untersuchung wieder einzuschalten:
+
+```bash
+SHELLDECK_QT_WAYLAND_TEXTINPUT_LOG=1 .venv/bin/python src/main.py
+```
+
+Alternativ bleibt ein vorhandenes `QT_LOGGING_RULES` oder `QT_LOGGING_CONF`
+unveraendert und hat Vorrang vor der ShellDeck-Voreinstellung. Filterregeln
+werden nur im ShellDeck-Qt-Prozess angewendet, **nicht** als Umgebungsvariable
+an gestartete Terminalprogramme vererbt. Andere Betriebssysteme und
+Nicht-Wayland-Sitzungen sind von der Aenderung nicht betroffen.

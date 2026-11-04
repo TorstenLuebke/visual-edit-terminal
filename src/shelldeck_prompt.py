@@ -65,6 +65,39 @@ def bash_prompt_script(colors: dict, *, precommand_file: str | None = None,
             "bind '\"\\C-m\": \"\\C-x\\C-]\\C-x\\C-^\"'\n"
             "bind '\"\\C-j\": \"\\C-x\\C-]\\C-x\\C-^\"'\n"
         )
+    # Quick buttons insert their text into Bash's actual Readline buffer.
+    # The GUI sends accept-line only after Bash acknowledges the insertion;
+    # this preserves normal history and never submits an existing user entry.
+    quick_dispatch = ""
+    if precommand_file is not None:
+        quick_file = str(Path(precommand_file).with_name("grid_quick_command"))
+        quick_ack = str(Path(precommand_file).with_name("grid_quick_ack"))
+        quick_dispatch = (
+            "__shelldeck_grid_quick_file=" + shlex.quote(quick_file) + "\n"
+            "__shelldeck_grid_quick_ack=" + shlex.quote(quick_ack) + "\n"
+            "__shelldeck_grid_insert_quick() {\n"
+            "  [[ -s $__shelldeck_grid_quick_file ]] || return 0\n"
+            "  local __shelldeck_token __shelldeck_want_prefix __shelldeck_command\n"
+            "  { IFS= read -r __shelldeck_token; IFS= read -r __shelldeck_want_prefix; } < \"$__shelldeck_grid_quick_file\"\n"
+            "  __shelldeck_command=$(tail -n +3 \"$__shelldeck_grid_quick_file\")\n"
+            "  : > \"$__shelldeck_grid_quick_file\"\n"
+            "  [[ $__shelldeck_token =~ ^[a-f0-9]{24}$ ]] || return 0\n"
+            "  if [[ -n $READLINE_LINE ]]; then\n"
+            "    printf 'busy:%s\\n' \"$__shelldeck_token\" > \"$__shelldeck_grid_quick_ack\"\n"
+            "    return 0\n"
+            "  fi\n"
+            "  [[ -n $__shelldeck_command ]] || return 0\n"
+            "  READLINE_LINE=$__shelldeck_command\n"
+            "  READLINE_POINT=${#READLINE_LINE}\n"
+            "  if [[ $__shelldeck_want_prefix == 1 ]]; then\n"
+            "    __shelldeck_grid_before_enter\n"
+            "  fi\n"
+            "  printf 'ready:%s\\n' \"$__shelldeck_token\" > \"$__shelldeck_grid_quick_ack\"\n"
+            "}\n"
+            "bind -x '\"\\C-x\\C-g\": __shelldeck_grid_insert_quick'\n"
+            # accept-line skips Enter's precommand macro: it already ran if selected.
+            "bind '\"\\C-x\\C-^\": accept-line'\n"
+        )
     prompt_setup = (
         "# ShellDeck: ausschliesslich lokale PTY-Bash; kein Eingriff in ~/.bashrc\n"
         "__shelldeck_update_prompt() {\n"
@@ -82,6 +115,7 @@ def bash_prompt_script(colors: dict, *, precommand_file: str | None = None,
         (prompt_setup if include_prompt else "# ShellDeck: PTY-Bash ohne eigene Promptfarben\n")
         + "cls() { command clear \"$@\"; }\n"
         + before_enter
+        + quick_dispatch
     )
 
 
@@ -90,9 +124,15 @@ def create_bash_prompt_rc(colors: dict, *, include_prompt: bool = True):
     directory = tempfile.TemporaryDirectory(prefix="shelldeck-prompt-")
     path = Path(directory.name) / "bashrc"
     prefix_file = Path(directory.name) / "grid_precommand"
+    quick_file = Path(directory.name) / "grid_quick_command"
+    ack_file = Path(directory.name) / "grid_quick_ack"
     try:
         prefix_file.write_text("", encoding="utf-8")
         prefix_file.chmod(0o600)
+        quick_file.write_text("", encoding="utf-8")
+        quick_file.chmod(0o600)
+        ack_file.write_text("", encoding="ascii")
+        ack_file.chmod(0o600)
         path.write_text(bash_prompt_script(colors, precommand_file=str(prefix_file),
                                            include_prompt=include_prompt), encoding="utf-8")
         path.chmod(0o600)
