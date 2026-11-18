@@ -60,7 +60,7 @@ ShellDeck.exe -e git status
 
 ## Systemintegration
 
-Direkt in der App unter **Einstellungen → Systemintegration…**. Die Logik liegt
+Direkt in der App unter **Einstellungen → Standardeinstellungen → Systemintegration…**. Die Logik liegt
 UI-frei in `src/shelldeck_system_integration.py`; beim Import werden keine
 Systemänderungen ausgelöst, und nichts geschieht automatisch beim Start.
 
@@ -351,7 +351,7 @@ plattformgleiche Erweiterung ist vorgesehen, nicht bereits implementiert.
   vermeidet wiederholte Verkettungen großer Zeichenketten sowie das lineare
   Entfernen am Listenanfang. Textreihenfolge, Farbgrenzen, Prompt-Erkennung
   und die Ausgabeexport-Funktion bleiben erhalten.
-- **Einstellungen → Scrollback-Größe (klassische Ansicht)…:** Legt die
+- **Einstellungen → Standardeinstellungen → Scrollback-Größe (klassische Ansicht)…:** Legt die
   maximale Anzahl im QTextDocument gespeicherter Textblöcke je Tab fest
   (1.000 bis 100.000, Standard 25.000). Die Einstellung wird gespeichert
   und auf vorhandene, neue, geteilte und entkoppelte Tabs angewandt. Beim
@@ -496,7 +496,7 @@ so ihren Zeilenumbruch und ihre Statuszeile erneut anpassen koennen.
 
 ### VT-Scrollback-Grenze (Etappe 2, Patches 035–036)
 
-Unter **Einstellungen → Scrollback-Größe (echtes VT-Terminal)…** kann die
+Unter **Einstellungen → Standardeinstellungen → Scrollback-Größe (echtes VT-Terminal)…** kann die
 Anzahl der VT-Verlaufszeilen pro Tab separat auf **100 bis 20.000** eingestellt
 werden (Standard **2.000**). Die Einstellung wird gespeichert und gilt auch
 für bereits geöffnete, geteilte und ausgekoppelte VT-Tabs. Ein Tab ohne aktives

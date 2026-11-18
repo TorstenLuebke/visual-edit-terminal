@@ -11,9 +11,11 @@ KNOWN_PROFILE_SHELLS = {
     "zsh",
     "fish",
     "sh",
+    "shelldeck",
 }
 
 KNOWN_TERMINAL_ENGINES = {"qprocess", "pty"}
+KNOWN_TERMINAL_VIEW_MODES = {"classic", "pure", "real"}
 
 
 def normalize_terminal_engine(value):
@@ -42,6 +44,9 @@ def normalize_profile(profile):
     client_mode = str(profile.get("client_mode", "") or "").strip()
     ollama_model = str(profile.get("ollama_model", "") or "").strip()
     terminal_engine = normalize_terminal_engine(profile.get("terminal_engine", "qprocess"))
+    terminal_view_mode = str(profile.get("terminal_view_mode", "") or "").strip().lower()
+    if terminal_view_mode not in KNOWN_TERMINAL_VIEW_MODES:
+        terminal_view_mode = ""
 
     if not name:
         name = title or ollama_model or Path(working_directory).name or shell_type or "Profil"
@@ -55,6 +60,7 @@ def normalize_profile(profile):
         "client_mode": client_mode,
         "ollama_model": ollama_model,
         "terminal_engine": terminal_engine,
+        "terminal_view_mode": terminal_view_mode,
     }
 
 
@@ -131,4 +137,9 @@ def profile_from_tab(tab, *, name="", startup_command=""):
         "client_mode": client_mode,
         "ollama_model": ollama_model,
         "terminal_engine": terminal_engine,
+        "terminal_view_mode": (
+            "real" if bool(getattr(tab, "real_terminal_active", False))
+            else "pure" if bool(getattr(tab, "pure_terminal_mode", False))
+            else "classic"
+        ),
     })

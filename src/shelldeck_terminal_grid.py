@@ -144,6 +144,10 @@ class TerminalGridView(QWidget):
         self._local_mouse_selection = False
         # VT escape sequences can straddle PTY reader chunks.
         self._selection_control_tail = b""
+        # Reedline asks the terminal for the cursor position (CSI 6 n) before
+        # painting its first prompt. Keep a tiny tail so the query is also
+        # recognized when PTY reads split the control sequence.
+        self._cursor_query_tail = b""
 
         self._cell_w = 1.0
         self._cell_h = 1.0
@@ -338,6 +342,8 @@ class TerminalGridView(QWidget):
             self._model.feed(part)
             piece_count += 1
         counters.record(len(data), piece_count)
+        raw = data if isinstance(data, bytes) else str(data).encode("utf-8", "replace")
+        self._reply_to_cursor_position_queries(raw)
         after_cursor = self._model.cursor
         after_position = (int(after_cursor.get("x", 0)), int(after_cursor.get("y", 0)))
         if before_position != after_position or len(self._cursor_diagnostics) < 5:
@@ -346,7 +352,6 @@ class TerminalGridView(QWidget):
         # Readline may erase a longer command with CSI K after moving the
         # cursor. Repaint the whole shell grid for erasure sequences only;
         # ordinary output keeps the fast, sparse dirty-row updates.
-        raw = data if isinstance(data, bytes) else str(data).encode("utf-8", "replace")
         redraw_with_erase = b"\x1b[K" in raw or any(
             b"\x1b[" + n + b"K" in raw for n in (b"0", b"1", b"2")
         )
@@ -367,9 +372,34 @@ class TerminalGridView(QWidget):
         if erase and self.has_selection():
             self.clear_selection()
 
+    def _reply_to_cursor_position_queries(self, raw: bytes) -> None:
+        """Answer terminal CPR queries so line editors can anchor at the cursor.
+
+        Reedline uses CSI 6 n to learn the prompt origin. Without the reply,
+        its safe fallback is the bottom terminal row, which makes a new
+        ShellDeck Shell prompt appear at the bottom of an otherwise empty view.
+        """
+        tail = self._cursor_query_tail
+        combined = tail + raw
+        tail_length = len(tail)
+        matches = [match for match in re.finditer(rb"\x1b\[(\?)?6n", combined)
+                   if match.end() > tail_length]
+        self._cursor_query_tail = combined[-4:]
+        if not matches or self._model is None:
+            return
+
+        cursor = self._model.cursor
+        row = int(cursor.get("y", 0)) + 1
+        col = int(cursor.get("x", 0)) + 1
+        for match in matches:
+            private = b"?" if match.group(1) else b""
+            self.dataReady.emit(b"\x1b[" + private + str(row).encode("ascii")
+                                + b";" + str(col).encode("ascii") + b"R")
+
     def reset(self) -> None:
         self.clear_selection()
         self._selection_control_tail = b""
+        self._cursor_query_tail = b""
         if self._model is not None:
             self._model.reset()
         self.update()
@@ -517,8 +547,10 @@ class TerminalGridView(QWidget):
         # In einem TUI mit aktivierter xterm-Maussteuerung gehoert das Rad
         # dem Programm, nicht dem pyte-Verlauf. Umschalt erzwingt Scrollback.
         delta = event.angleDelta().y()
-        if self._mouse_tracking_level() and not (
-            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        if (
+            self._mouse_tracking_level()
+            and not self._shelldeck_line_editor_active()
+            and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         ):
             if delta:
                 count = min(8, max(1, abs(delta) // 120))
@@ -642,6 +674,17 @@ class TerminalGridView(QWidget):
             return 0
         return self._model.sgr_mouse_tracking_level()
 
+    def _shelldeck_line_editor_active(self) -> bool:
+        """True while Reedline owns the editable ShellDeck prompt."""
+        if self._model is None or self._model.in_alternate_screen():
+            return False
+        host = self.parentWidget()
+        if str(getattr(host, "shell_type", "")).strip().lower() != "shelldeck":
+            return False
+        # Reedline brackets its editable prompt with DECSET 2004. Use that
+        # screen-local signal rather than guessing from the visible prompt.
+        return self._model.bracketed_paste()
+
     @staticmethod
     def _button_name(button):
         if button == Qt.MouseButton.LeftButton:
@@ -686,6 +729,23 @@ class TerminalGridView(QWidget):
         # Shift behält die lokale Auswahl, selbst wenn die TUI Mausberichte
         # aktiviert hat; ein Rechtsklick mit Shift oeffnet das Kontextmenue.
         button = self._button_name(event.button())
+        shell_editor_active = self._shelldeck_line_editor_active()
+        if shell_editor_active and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.clear_selection()
+                self._local_mouse_selection = False
+                self._send_sgr_mouse("press", event, "left")
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self.paste_clipboard(selection=True)
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.RightButton:
+                super().mousePressEvent(event)
+                return
         if button and self._mouse_tracking_level() and not (
             event.modifiers() & Qt.KeyboardModifier.ShiftModifier
         ):
@@ -732,6 +792,17 @@ class TerminalGridView(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         button = self._button_name(event.button())
+        if self._shelldeck_line_editor_active() and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            if event.button() in (
+                Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton
+            ):
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.RightButton:
+                super().mouseReleaseEvent(event)
+                return
         if button and self._mouse_tracking_level() and not self._local_mouse_selection and not (
             event.modifiers() & Qt.KeyboardModifier.ShiftModifier
         ):
@@ -938,9 +1009,13 @@ class TerminalGridView(QWidget):
 
     def contextMenuEvent(self, event) -> None:
         # Rechtsklick ist im Mausmodus eine Eingabe an die Anwendung.
-        # Shift+Rechtsklick bietet weiterhin das ShellDeck-Kontextmenue.
-        if self._mouse_tracking_level() and not (
-            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        # Im eigenen Shell-Prompt bleibt das Kontextmenue auch bei Reedlines
+        # aktivem Mausmodus erreichbar; in Vollbild-TUIs gilt weiter deren
+        # Mausprotokoll. Shift+Rechtsklick erzwingt das Menue immer.
+        if (
+            self._mouse_tracking_level()
+            and not self._shelldeck_line_editor_active()
+            and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         ):
             event.accept()
             return

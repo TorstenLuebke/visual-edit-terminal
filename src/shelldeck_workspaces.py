@@ -21,9 +21,13 @@ def normalize_workspace(value: Any) -> Dict[str, Any]:
         for item in tabs:
             if not isinstance(item, dict):
                 continue
+            terminal_view_mode = _clean_text(item.get("terminal_view_mode")).lower()
+            if terminal_view_mode not in {"classic", "pure", "real"}:
+                terminal_view_mode = "pure" if bool(item.get("pure_terminal_mode")) else ""
             normalized_tabs.append({
                 "shell_type": _clean_text(item.get("shell_type")) or "cmd",
                 "terminal_engine": _clean_terminal_engine(item.get("terminal_engine")),
+                "terminal_view_mode": terminal_view_mode,
                 "title": _clean_text(item.get("title")),
                 "working_directory": _clean_text(item.get("working_directory")),
                 "command_history": [str(value or "").strip() for value in item.get("command_history", []) if str(value or "").strip()] if isinstance(item.get("command_history"), list) else [],

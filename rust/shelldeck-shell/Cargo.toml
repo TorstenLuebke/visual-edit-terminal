@@ -1,0 +1,17 @@
+[package]
+name = "shelldeck-shell"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone, host-agnostic ShellDeck command interpreter"
+
+[dependencies]
+reedline = "0.52.1"
+
+[lib]
+name = "shelldeck_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shelldeck-shell"
+path = "src/main.rs"

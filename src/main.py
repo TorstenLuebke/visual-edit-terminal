@@ -43,7 +43,7 @@ from shelldeck_workspaces import normalize_workspace, normalize_workspaces, work
 from shelldeck_ollama import build_generate_payload, extract_generate_response, list_ollama_models, ollama_api_error_message, markdown_chat_export, normalize_system_prompt
 from shelldeck_file_context import append_file_context_to_prompt, build_file_context_block, read_text_file_context
 from shelldeck_markdown import extract_code_blocks, ollama_answer_to_html
-from shelldeck_backend_manager import missing_backend_packages, start_backend_package_install
+from shelldeck_backend_manager import missing_backend_packages
 from shelldeck_command_history import CommandHistoryDialog
 from shelldeck_cli import parse_launch_arguments, resolve_directory
 from shelldeck_scrollback import (
@@ -55,9 +55,9 @@ from shelldeck_scrollback import (
 import shelldeck_system_integration as system_integration
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget,
-    QPlainTextEdit, QFontDialog, QColorDialog, QInputDialog, QPushButton,
+    QPlainTextEdit, QProgressBar, QFontDialog, QColorDialog, QInputDialog, QPushButton,
     QDialog, QFormLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox, QSlider,
-    QDialogButtonBox, QCheckBox, QScrollArea, QTabWidget, QMenu, QFileDialog,
+    QDialogButtonBox, QCheckBox, QScrollArea, QTabWidget, QMenu, QFileDialog, QGroupBox,
     QLineEdit, QListWidget, QListWidgetItem, QSplitter, QMessageBox
 )
 from PySide6.QtCore import Qt, QProcess, QEvent, QThread, Signal, QTimer, QByteArray
@@ -70,7 +70,7 @@ from PySide6.QtGui import (
 from shelldeck_terminal_widget import (
     ShellDeckTerminalWidget, TerminalTab, DefaultTerminalHost,
     PtyTerminalProcess, TerminalOutputArea, TerminalHighlighter,
-    command_targets_shelldeck,
+    command_targets_shelldeck, find_shelldeck_shell_executable,
 )
 
 LOG_FILE = Path.home() / "TerminalApp.log"
@@ -386,30 +386,41 @@ class TerminalWindow(QMainWindow):
         self.view_menu.addAction(self.reattach_current_tab_action)
 
         settings_menu = menubar.addMenu("&Einstellungen")
+        defaults_menu = settings_menu.addMenu("Standardeinstellungen")
 
         font_action = QAction("Schriftart", self)
         font_action.triggered.connect(self.show_font_dialog)
-        settings_menu.addAction(font_action)
+        defaults_menu.addAction(font_action)
 
         color_action = QAction("Farbschema", self)
         color_action.triggered.connect(self.show_color_dialog)
-        settings_menu.addAction(color_action)
+        defaults_menu.addAction(color_action)
 
         theme_action = QAction("Design anpassen", self)
         theme_action.triggered.connect(self.show_theme_dialog)
-        settings_menu.addAction(theme_action)
+        defaults_menu.addAction(theme_action)
 
         reset_theme_action = QAction("Design auf Standard zurücksetzen", self)
         reset_theme_action.triggered.connect(self.reset_theme_defaults)
-        settings_menu.addAction(reset_theme_action)
+        defaults_menu.addAction(reset_theme_action)
+
+        defaults_menu.addSeparator()
 
         cmd_action = QAction("Standardbefehl", self)
         cmd_action.triggered.connect(self.show_command_dialog)
-        settings_menu.addAction(cmd_action)
+        defaults_menu.addAction(cmd_action)
+
+        start_directory_action = QAction("Standardordner für neue Tabs…", self)
+        start_directory_action.triggered.connect(self.show_default_start_directory_dialog)
+        defaults_menu.addAction(start_directory_action)
+
+        reset_start_directory_action = QAction("Standardordner zurücksetzen", self)
+        reset_start_directory_action.triggered.connect(self.clear_default_start_directory)
+        defaults_menu.addAction(reset_start_directory_action)
 
         history_action = QAction("History-Größe", self)
         history_action.triggered.connect(self.show_history_dialog)
-        settings_menu.addAction(history_action)
+        defaults_menu.addAction(history_action)
 
         scrollback_action = QAction("Scrollback-Größe (klassische Ansicht)…", self)
         scrollback_action.setToolTip(
@@ -417,7 +428,7 @@ class TerminalWindow(QMainWindow):
             "Ansicht. Der echte VT-Modus hat einen eigenen Verlaufspuffer."
         )
         scrollback_action.triggered.connect(self.show_scrollback_dialog)
-        settings_menu.addAction(scrollback_action)
+        defaults_menu.addAction(scrollback_action)
 
         vt_scrollback_action = QAction("Scrollback-Größe (echtes VT-Terminal)…", self)
         vt_scrollback_action.setToolTip(
@@ -425,43 +436,64 @@ class TerminalWindow(QMainWindow):
             "laufende interaktive Programme bleiben beim Ändern erhalten."
         )
         vt_scrollback_action.triggered.connect(self.show_vt_scrollback_dialog)
-        settings_menu.addAction(vt_scrollback_action)
+        defaults_menu.addAction(vt_scrollback_action)
+
+        pre_command_action = QAction("Vorbefehl…", self)
+        pre_command_action.setToolTip(
+            "Legt Vorbefehl, Aktivierung und Sichtbarkeit der Vorbefehl-Leiste dauerhaft fest."
+        )
+        pre_command_action.triggered.connect(self.show_pre_command_settings_dialog)
+        defaults_menu.addAction(pre_command_action)
+
+        defaults_menu.addSeparator()
 
         self.carry_profiles_action = QAction("Profiländerungen beim Beenden übernehmen", self)
         self.carry_profiles_action.setCheckable(True)
         self.carry_profiles_action.triggered.connect(self.set_carry_over_profiles_on_exit)
-        settings_menu.addAction(self.carry_profiles_action)
+        defaults_menu.addAction(self.carry_profiles_action)
 
         self.carry_workspaces_action = QAction("Workspace-Änderungen beim Beenden übernehmen", self)
         self.carry_workspaces_action.setCheckable(True)
         self.carry_workspaces_action.triggered.connect(self.set_carry_over_workspaces_on_exit)
-        settings_menu.addAction(self.carry_workspaces_action)
+        defaults_menu.addAction(self.carry_workspaces_action)
 
-        shell_action = QAction("Shell-Backend", self)
-        shell_action.triggered.connect(self.select_shell)
-        settings_menu.addAction(shell_action)
+        defaults_menu.addSeparator()
 
-        terminal_engine_action = QAction("Terminal-Engine", self)
-        terminal_engine_action.triggered.connect(self.select_terminal_engine)
-        settings_menu.addAction(terminal_engine_action)
+        personal_defaults_action = QAction("Shell, Terminal und Ansicht für neue Tabs…", self)
+        personal_defaults_action.setToolTip(
+            "Legt Shell, Engine, Terminalmodus und Ansicht für neue Tabs fest."
+        )
+        personal_defaults_action.triggered.connect(self.show_personal_defaults_dialog)
+        defaults_menu.addAction(personal_defaults_action)
 
         system_integration_action = QAction("Systemintegration…", self)
-        system_integration_action.setToolTip("ShellDeck als Terminal (Linux) bzw. im Explorer-Kontextmenü (Windows) registrieren.")
+        system_integration_action.setToolTip(
+            "ShellDeck als Terminal (Linux) bzw. im Explorer-Kontextmenü (Windows) registrieren."
+        )
         system_integration_action.triggered.connect(self.show_system_integration_dialog)
-        settings_menu.addAction(system_integration_action)
-
-
-        backend_packages_action = QAction("Fehlende Backend-Pakete installieren…", self)
-        backend_packages_action.triggered.connect(self.install_missing_backend_package)
-        settings_menu.addAction(backend_packages_action)
-
-        settings_menu.addSeparator()
+        defaults_menu.addAction(system_integration_action)
 
         self.ai_features_action = QAction("KI-Menü / Ollama aktivieren", self)
         self.ai_features_action.setCheckable(True)
         self.ai_features_action.setChecked(False)
         self.ai_features_action.triggered.connect(self.set_ai_features_enabled)
-        settings_menu.addAction(self.ai_features_action)
+        defaults_menu.addAction(self.ai_features_action)
+
+        settings_menu.addSeparator()
+        current_tab_menu = settings_menu.addMenu("Aktuellen Tab einstellen")
+
+        shell_action = QAction("Shell-Backend…", self)
+        shell_action.triggered.connect(self.select_shell)
+        current_tab_menu.addAction(shell_action)
+
+        terminal_engine_action = QAction("Terminal-Engine…", self)
+        terminal_engine_action.triggered.connect(self.select_terminal_engine)
+        current_tab_menu.addAction(terminal_engine_action)
+
+        settings_menu.addSeparator()
+        backend_packages_action = QAction("Fehlende Backend-Pakete installieren…", self)
+        backend_packages_action.triggered.connect(self.install_missing_backend_package)
+        settings_menu.addAction(backend_packages_action)
 
         self.ai_menu = menubar.addMenu("&KI")
 
@@ -589,6 +621,13 @@ class TerminalWindow(QMainWindow):
         self.quaternary_tab_widget = self.create_terminal_tab_widget()
         self.active_tab_widget = self.tab_widget
         self.view_layout_mode = "single"
+        self.default_terminal_view_mode = "classic"
+        self.personal_defaults = {
+            "shell_type": self.shell_type,
+            "terminal_engine": self.terminal_engine,
+            "terminal_view_mode": self.default_terminal_view_mode,
+            "view_layout_mode": self.view_layout_mode,
+        }
         self.split_view_enabled = False
         layout.addWidget(self.view_container)
 
@@ -763,6 +802,225 @@ class TerminalWindow(QMainWindow):
     def normalize_terminal_engine(self, engine):
         value = str(engine or "auto").lower().strip()
         return value if value in {"auto", "qprocess", "pty"} else "auto"
+
+    def normalize_terminal_view_mode(self, mode):
+        value = str(mode or "classic").lower().strip()
+        return value if value in {"classic", "pure", "real"} else "classic"
+
+    def terminal_view_mode_for_tab(self, tab):
+        if bool(getattr(tab, "real_terminal_active", False)):
+            return "real"
+        if bool(getattr(tab, "pure_terminal_mode", False)):
+            return "pure"
+        return "classic"
+
+    def normalize_personal_defaults(self, values=None):
+        values = values if isinstance(values, dict) else {}
+        defaults = getattr(self, "personal_defaults", {})
+        shell_type = self.normalize_shell_type(
+            values.get("shell_type", defaults.get("shell_type", self.shell_type))
+        )
+        if not self.system_shell(shell_type):
+            shell_type = self.default_shell_type()
+        layout_mode = str(
+            values.get("view_layout_mode", defaults.get("view_layout_mode", "single")) or "single"
+        )
+        if layout_mode not in {"single", "horizontal", "vertical", "quad"}:
+            layout_mode = "single"
+        return {
+            "shell_type": shell_type,
+            "terminal_engine": self.normalize_terminal_engine(
+                values.get("terminal_engine", defaults.get("terminal_engine", self.terminal_engine))
+            ),
+            "terminal_view_mode": self.normalize_terminal_view_mode(
+                values.get("terminal_view_mode", defaults.get("terminal_view_mode", "classic"))
+            ),
+            "view_layout_mode": layout_mode,
+        }
+
+    def show_personal_defaults_dialog(self):
+        """Edit the persistent defaults used when opening new terminal tabs."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Standardeinstellungen für neue Tabs")
+        dialog.setMinimumWidth(500)
+        layout = QVBoxLayout(dialog)
+
+        intro = QLabel(
+            "Diese Vorgaben werden gespeichert und für neue Tabs verwendet. "
+            "Bereits gespeicherte Tab-, Profil- und Workspace-Einstellungen "
+            "bleiben erhalten."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        terminal_group = QGroupBox("Standard für neue Tabs")
+        terminal_form = QFormLayout(terminal_group)
+
+        shell_combo = QComboBox(terminal_group)
+        for backend in self.available_shell_backends():
+            shell_id = str(backend.get("id", "") or "")
+            if not shell_id:
+                continue
+            shell_combo.addItem(str(backend.get("label", "") or self.shell_backend_label(shell_id)), shell_id)
+        current_shell = self.normalize_personal_defaults().get("shell_type", self.shell_type)
+        if shell_combo.findData(current_shell) < 0:
+            shell_combo.addItem(self.shell_backend_label(current_shell), current_shell)
+        shell_combo.setCurrentIndex(max(0, shell_combo.findData(current_shell)))
+        terminal_form.addRow("Shell", shell_combo)
+
+        engine_combo = QComboBox(terminal_group)
+        for label, engine in (
+            ("Automatisch – empfohlen", "auto"),
+            ("QProcess – kompatibel", "qprocess"),
+            ("PTY/ConPTY – interaktiv", "pty"),
+        ):
+            engine_combo.addItem(label, engine)
+        current_engine = self.normalize_personal_defaults().get("terminal_engine", "auto")
+        engine_combo.setCurrentIndex(max(0, engine_combo.findData(current_engine)))
+        terminal_form.addRow("Terminal-Engine", engine_combo)
+
+        view_combo = QComboBox(terminal_group)
+        for label, mode in (
+            ("Klassische Ansicht", "classic"),
+            ("Reines Terminal", "pure"),
+            ("Echtes Terminal (VT)", "real"),
+        ):
+            view_combo.addItem(label, mode)
+        current_view_mode = self.normalize_terminal_view_mode(
+            self.normalize_personal_defaults().get("terminal_view_mode", "classic")
+        )
+        view_combo.setCurrentIndex(max(0, view_combo.findData(current_view_mode)))
+        terminal_form.addRow("Terminalmodus", view_combo)
+        layout.addWidget(terminal_group)
+
+        layout_group = QGroupBox("Ansicht beim Start")
+        layout_form = QFormLayout(layout_group)
+        layout_combo = QComboBox(layout_group)
+        for label, mode in (
+            ("Einzelansicht", "single"),
+            ("2er horizontal: links | rechts", "horizontal"),
+            ("2er vertikal: oben / unten", "vertical"),
+            ("4er Raster", "quad"),
+        ):
+            layout_combo.addItem(label, mode)
+        current_layout = self.normalize_personal_defaults().get("view_layout_mode", "single")
+        layout_combo.setCurrentIndex(max(0, layout_combo.findData(current_layout)))
+        layout_form.addRow("Terminalbereiche", layout_combo)
+        layout.addWidget(layout_group)
+
+        hint = QLabel(
+            "Das echte VT-Terminal benötigt pyte und verwendet automatisch "
+            "PTY/ConPTY. Die Auswahl gilt für neue Tabs; der aktuelle Tab wird "
+            "über Ansicht bzw. Shell-Backend geändert."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def sync_engine_with_view_mode(*_):
+            needs_pty = view_combo.currentData() == "real"
+            if needs_pty:
+                pty_index = engine_combo.findData("pty")
+                if pty_index >= 0:
+                    engine_combo.setCurrentIndex(pty_index)
+            engine_combo.setEnabled(not needs_pty)
+
+        view_combo.currentIndexChanged.connect(sync_engine_with_view_mode)
+        sync_engine_with_view_mode()
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_shell = str(shell_combo.currentData() or current_shell)
+        default_engine = self.normalize_terminal_engine(engine_combo.currentData())
+        default_view_mode = self.normalize_terminal_view_mode(view_combo.currentData())
+        self.personal_defaults = self.normalize_personal_defaults({
+            "shell_type": selected_shell,
+            "terminal_engine": default_engine,
+            "terminal_view_mode": default_view_mode,
+            "view_layout_mode": layout_combo.currentData(),
+        })
+        self.default_terminal_view_mode = self.personal_defaults["terminal_view_mode"]
+
+        selected_layout = str(layout_combo.currentData() or "single")
+        if selected_layout not in {"single", "horizontal", "vertical", "quad"}:
+            selected_layout = "single"
+        self.personal_defaults["view_layout_mode"] = selected_layout
+        self.view_layout_mode = selected_layout
+        self.apply_view_layout(move_tabs=True)
+        self.save_settings()
+        self.show_status("Standardeinstellungen für neue Tabs gespeichert.")
+
+    def show_default_start_directory_dialog(self):
+        """Choose the persistent start directory used by new tabs."""
+        initial_directory = self.default_start_directory or str(Path.home())
+        selected_directory = QFileDialog.getExistingDirectory(
+            self,
+            "Standardordner für neue Tabs auswählen",
+            initial_directory,
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if selected_directory:
+            self.set_default_start_directory(selected_directory)
+
+    def show_pre_command_settings_dialog(self):
+        """Edit the persistent pre-command defaults in one place."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Vorbefehl-Standardeinstellungen")
+        dialog.setMinimumWidth(480)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        command_edit = QLineEdit(self.current_pre_command_widget_text(), dialog)
+        command_edit.setPlaceholderText("z. B. clear oder cd ..; dir")
+        form.addRow("Vorbefehl(e)", command_edit)
+
+        enabled_check = QCheckBox("Vorbefehl vor normalen Befehlen ausführen", dialog)
+        enabled_check.setChecked(bool(self.pre_command_enabled))
+        form.addRow("Aktivierung", enabled_check)
+
+        visible_check = QCheckBox("Vorbefehl-Leiste anzeigen", dialog)
+        visible_check.setChecked(bool(self.pre_command_visible))
+        form.addRow("Bedienfeld", visible_check)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "Diese Werte werden dauerhaft gespeichert. Die Vorbefehl-Leiste kann "
+            "weiterhin direkt oben in der Menüleiste bedient werden."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        command = self.normalize_pre_command_text(command_edit.text())
+        self.pre_command_input.setEditText(command)
+        self.pre_command_text = command
+        if command:
+            self.pre_command_history = self.normalize_pre_command_history([
+                command, *self.pre_command_history
+            ])
+        self.pre_command_enabled = enabled_check.isChecked()
+        self.pre_command_visible = visible_check.isChecked()
+        self.update_pre_command_ui()
+        self.save_settings()
+        self.show_status("Vorbefehl-Standardeinstellungen gespeichert.")
 
     def terminal_engine_settings_snapshot(self):
         return {"terminal_engine": self.normalize_terminal_engine(getattr(self, "terminal_engine", "auto"))}
@@ -1129,7 +1387,8 @@ class TerminalWindow(QMainWindow):
         if use_new_tab:
             tab = self.new_tab(shell_type=tab.shell_type, start_directory=
                                str(getattr(tab, "current_working_directory", "") or ""),
-                               terminal_engine=getattr(tab, "terminal_engine", None))
+                               terminal_engine=getattr(tab, "terminal_engine", None),
+                               terminal_view_mode=self.terminal_view_mode_for_tab(tab))
         self._dispatch_quick_command(tab, command, bool(item.get("use_precommand")),
                                      remaining=60 if use_new_tab else 0, fresh_tab=use_new_tab,
                                      starting_generation=getattr(tab, "_shell_generation", 0))
@@ -1812,7 +2071,7 @@ class TerminalWindow(QMainWindow):
     def ensure_ai_features_enabled(self):
         if bool(getattr(self, "ai_features_enabled", False)):
             return True
-        self.show_status("KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.")
+        self.show_status("KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → Standardeinstellungen → KI-Menü / Ollama aktivieren.")
         return False
 
     def focus_active_terminal(self):
@@ -1836,7 +2095,7 @@ class TerminalWindow(QMainWindow):
         # override focus assigned to a child while the window is hidden.
         QTimer.singleShot(0, self.focus_active_terminal)
 
-    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path="", terminal_engine=None, startup_capture=False):
+    def new_tab(self, shell_type=None, title=None, start_directory=None, command_history=None, target_tab_widget=None, restore_command="", venv_path="", terminal_engine=None, startup_capture=False, terminal_view_mode=None):
         effective_start_directory = start_directory
         if effective_start_directory is None:
             current_tab = self.current_terminal()
@@ -1844,15 +2103,26 @@ class TerminalWindow(QMainWindow):
                 effective_start_directory = str(getattr(current_tab, "current_working_directory", "") or "")
             if not effective_start_directory:
                 effective_start_directory = self.default_start_directory
+        view_mode = self.normalize_terminal_view_mode(
+            terminal_view_mode if terminal_view_mode is not None
+            else self.normalize_personal_defaults().get("terminal_view_mode", "classic")
+        )
+        defaults = self.normalize_personal_defaults()
+        effective_shell = shell_type or defaults["shell_type"]
+        effective_engine = self.normalize_terminal_engine(
+            terminal_engine if terminal_engine is not None else defaults["terminal_engine"]
+        )
+        if view_mode == "real":
+            effective_engine = "pty"
         tab = TerminalTab(
             self,
-            shell_type=shell_type or self.shell_type,
+            shell_type=effective_shell,
             custom_title=title,
             start_directory=effective_start_directory,
             command_history=command_history,
             restore_command=restore_command,
             venv_path=venv_path,
-            terminal_engine=terminal_engine or self.terminal_engine,
+            terminal_engine=effective_engine,
             startup_capture=startup_capture,
         )
         target = target_tab_widget or getattr(self, "active_tab_widget", None) or self.tab_widget
@@ -1861,9 +2131,16 @@ class TerminalWindow(QMainWindow):
         index = target.addTab(tab, tab.title or f"Terminal {self.total_terminal_tab_count() + 1}")
         target.setCurrentIndex(index)
         self.active_tab_widget = target
+        if view_mode == "pure":
+            tab.set_pure_terminal_mode(True, focus=False, save=False)
+        elif view_mode == "real" and not tab.set_real_terminal_mode(True, focus=False):
+            self.show_status(
+                "Echtes VT-Terminal nicht verfügbar. Prüfe pyte und die PTY/ConPTY-Engine."
+            )
         self.update_terminal_engine_ui()
         self.update_qprocess_bash_ui()
         self.update_pre_command_ui()
+        self.update_view_menu_state()
         self.apply_color_scheme()
         QTimer.singleShot(0, self.focus_active_terminal)
         return tab
@@ -2096,6 +2373,8 @@ class TerminalWindow(QMainWindow):
             # Ein gespeichertes VT-Profil darf dieses Eingabefeld nicht verstecken.
             terminal_engine=("qprocess" if ollama_model and self.ai_features_enabled
                              else profile.get("terminal_engine", self.terminal_engine)),
+            terminal_view_mode=("classic" if ollama_model and self.ai_features_enabled
+                                else profile.get("terminal_view_mode") or self.default_terminal_view_mode),
         )
         if not isinstance(tab, TerminalTab):
             return
@@ -2106,7 +2385,7 @@ class TerminalWindow(QMainWindow):
         if ollama_model and self.ai_features_enabled:
             tab.start_ollama_prompt_mode(ollama_model)
         elif ollama_model and not self.ai_features_enabled:
-            tab.output_area.append("[KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → KI-Menü / Ollama aktivieren.]\n")
+            tab.output_area.append("[KI/Ollama ist deaktiviert. Aktivieren unter Einstellungen → Standardeinstellungen → KI-Menü / Ollama aktivieren.]\n")
         elif startup_command:
             if command_targets_shelldeck(startup_command):
                 tab.append_system_message(
@@ -2325,6 +2604,16 @@ class TerminalWindow(QMainWindow):
             tab_shell = self.normalize_shell_type(item.get("shell_type", self.shell_type) or self.shell_type)
             if not self.system_shell(tab_shell):
                 tab_shell = self.shell_type
+            ollama_model = str(item.get("ollama_model", "") or "").strip()
+            client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
+            terminal_view_mode = item.get("terminal_view_mode")
+            if not terminal_view_mode:
+                terminal_view_mode = (
+                    "pure" if item.get("pure_terminal_mode")
+                    else self.default_terminal_view_mode
+                )
+            if self.ai_features_enabled and (ollama_model or client_kind == "ollama_api"):
+                terminal_view_mode = "classic"
             tab = self.new_tab(
                 shell_type=tab_shell,
                 title=str(item.get("title", "") or ""),
@@ -2333,11 +2622,10 @@ class TerminalWindow(QMainWindow):
                 restore_command=item.get("restore_command", ""),
                 venv_path=item.get("venv_path", ""),
                 terminal_engine=item.get("terminal_engine", self.terminal_engine),
+                terminal_view_mode=terminal_view_mode,
                 target_tab_widget=self.target_widget_for_saved_tab(item),
             )
             if isinstance(tab, TerminalTab):
-                ollama_model = str(item.get("ollama_model", "") or "").strip()
-                client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
                 if self.ai_features_enabled and (ollama_model or client_kind == "ollama_api"):
                     tab.start_ollama_prompt_mode(
                         ollama_model or self.selected_ollama_model,
@@ -2359,7 +2647,11 @@ class TerminalWindow(QMainWindow):
             restored = True
 
         if not restored:
-            self.new_tab()
+            self.new_tab(
+                shell_type=self.shell_type,
+                terminal_engine=self.terminal_engine,
+                terminal_view_mode=self.default_terminal_view_mode,
+            )
 
         self.rebuild_saved_paths_menu()
         self.save_settings()
@@ -2461,7 +2753,7 @@ class TerminalWindow(QMainWindow):
     def open_saved_path_in_new_tab(self, path, shell_type=None):
         clean_path = str(path or "").strip().strip('"')
         tab = self.new_tab(
-            shell_type=shell_type or self.shell_type,
+            shell_type=shell_type or self.normalize_personal_defaults()["shell_type"],
             title=Path(clean_path).name or clean_path or None,
             start_directory=clean_path,
         )
@@ -2670,6 +2962,7 @@ class TerminalWindow(QMainWindow):
         else:
             self.show_status("Klassische Ansicht aktiv.")
         self.update_view_menu_state()
+        self.save_settings()
 
     def set_current_pure_terminal_mode(self, checked):
         tab = self.current_terminal()
@@ -2916,6 +3209,7 @@ class TerminalWindow(QMainWindow):
                 restore_command=tab.current_restore_command(),
                 venv_path=tab.current_venv_path(),
                 terminal_engine=tab.actual_terminal_engine(),
+                terminal_view_mode=self.terminal_view_mode_for_tab(tab),
                 target_tab_widget=source_widget if source_widget is not None else self.active_tab_widget,
             )
 
@@ -2934,6 +3228,16 @@ class TerminalWindow(QMainWindow):
                 shell_type = self.shell_type
             title = str(item.get("title", "") or "")
             working_directory = str(item.get("working_directory", "") or "")
+            ollama_model = str(item.get("ollama_model", "") or "").strip()
+            client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
+            terminal_view_mode = item.get("terminal_view_mode")
+            if not terminal_view_mode:
+                terminal_view_mode = (
+                    "pure" if item.get("pure_terminal_mode")
+                    else self.default_terminal_view_mode
+                )
+            if self.ai_features_enabled and (ollama_model or client_kind == "ollama_api"):
+                terminal_view_mode = "classic"
             tab = self.new_tab(
                 shell_type=shell_type,
                 title=title,
@@ -2942,14 +3246,13 @@ class TerminalWindow(QMainWindow):
                 restore_command=item.get("restore_command", ""),
                 venv_path=item.get("venv_path", ""),
                 terminal_engine=item.get("terminal_engine", self.terminal_engine),
+                terminal_view_mode=terminal_view_mode,
                 target_tab_widget=self.target_widget_for_saved_tab(item),
                 startup_capture=(restore_index == capture_index),
             )
             if restore_index == capture_index:
                 captured_tab = tab
             if isinstance(tab, TerminalTab):
-                ollama_model = str(item.get("ollama_model", "") or "").strip()
-                client_kind = str(item.get("client_mode_kind", "") or item.get("client_mode", "") or "").strip()
                 if self.ai_features_enabled and (ollama_model or client_kind == "ollama_api"):
                     tab.start_ollama_prompt_mode(
                         ollama_model or self.selected_ollama_model,
@@ -2962,7 +3265,7 @@ class TerminalWindow(QMainWindow):
                     tab.set_command_task_panel_visible(bool(item.get("command_task_panel_visible", True)), save=False)
                 if "command_task_panel_expanded" in item:
                     tab.set_command_task_panel_expanded(bool(item.get("command_task_panel_expanded", False)))
-                if item.get("pure_terminal_mode"):
+                if item.get("pure_terminal_mode") and not getattr(tab, "real_terminal_active", False):
                     tab.set_pure_terminal_mode(True, focus=False, save=False)
             restored = True
         if not restored:
@@ -3004,6 +3307,7 @@ class TerminalWindow(QMainWindow):
             "command_task_panel_visible": bool(getattr(tab, "command_task_panel_visible", True)),
             "command_task_panel_expanded": bool(getattr(tab, "command_task_panel_expanded", False)),
             "pure_terminal_mode": bool(getattr(tab, "pure_terminal_mode", False)),
+            "terminal_view_mode": self.terminal_view_mode_for_tab(tab),
             "source_profile_name": str(getattr(tab, "source_profile_name", "") or "").strip(),
         }
         if detached_window is not None:
@@ -3099,7 +3403,7 @@ class TerminalWindow(QMainWindow):
 
     def normalize_shell_type(self, shell_type=None):
         text = str(shell_type or "").strip().lower()
-        known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh"}
+        known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh", "shelldeck"}
         if text not in known_shells:
             return self.default_shell_type()
         if sys.platform != "win32":
@@ -3143,6 +3447,10 @@ class TerminalWindow(QMainWindow):
                     "executable": executable,
                 })
 
+        shelldeck_shell = find_shelldeck_shell_executable()
+        if shelldeck_shell:
+            add("shelldeck", "ShellDeck Shell", shelldeck_shell, None)
+
         if sys.platform == "win32":
             if shutil.which("powershell.exe"):
                 add("powershell", "PowerShell", "powershell.exe", None)
@@ -3184,6 +3492,8 @@ class TerminalWindow(QMainWindow):
     def shell_backend_label(self, shell_name=None) -> str:
         name = str(shell_name or self.shell_type or "Terminal").strip()
         lower = name.lower()
+        if lower == "shelldeck":
+            return "ShellDeck Shell"
         if lower in ("powershell", "powershell.exe"):
             return "PowerShell"
         if lower in ("pwsh", "pwsh.exe"):
@@ -3216,6 +3526,7 @@ class TerminalWindow(QMainWindow):
             "zsh": "🐚",
             "fish": "🐟",
             "sh": "🐚",
+            "shelldeck": "⌘",
         }.get(lower, "▸")
 
     def shell_backend_color(self, shell_type=None) -> str:
@@ -3230,6 +3541,7 @@ class TerminalWindow(QMainWindow):
             "zsh": "#C084FC",
             "fish": "#67E8F9",
             "sh": "#A3A3A3",
+            "shelldeck": "#A78BFA",
         }.get(lower, "#FFFFFF")
 
     def terminal_engine_label(self, engine=None):
@@ -3298,6 +3610,16 @@ class TerminalWindow(QMainWindow):
         )
 
     def install_missing_backend_package(self):
+        active_process = getattr(self, "_backend_install_process", None)
+        if active_process is not None and active_process.state() != QProcess.ProcessState.NotRunning:
+            dialog = getattr(self, "_backend_install_dialog", None)
+            if dialog is not None:
+                dialog.show()
+                dialog.raise_()
+                dialog.activateWindow()
+            self.show_status("Eine Backend-Installation läuft bereits.")
+            return
+
         packages = missing_backend_packages()
         if not packages:
             self.show_status("Alle unterstützten Backend-Pakete sind bereits verfügbar.")
@@ -3314,15 +3636,123 @@ class TerminalWindow(QMainWindow):
         if not ok or not choice:
             return
         package = packages[labels.index(choice)]
-        success, message = start_backend_package_install(package)
-        self.show_status(message)
-        if success:
-            QTimer.singleShot(2500, lambda: self.show_status(
-                "Installation wurde gestartet. Nach Abschluss den betroffenen Tab oder ShellDeck neu starten."
-            ))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{package.label} wird installiert")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+
+        status_label = QLabel(f"{package.label} wird installiert …", dialog)
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        detail_label = QLabel(
+            f"{package.reason}. ShellDeck zeigt den Installationsstatus hier an. "
+            "Bei einer Berechtigungsabfrage bitte bestätigen.",
+            dialog,
+        )
+        detail_label.setWordWrap(True)
+        layout.addWidget(detail_label)
+
+        progress_bar = QProgressBar(dialog)
+        progress_bar.setRange(0, 0)
+        progress_bar.setTextVisible(True)
+        progress_bar.setFormat("Installation läuft …")
+        layout.addWidget(progress_bar)
+
+        output_view = QPlainTextEdit(dialog)
+        output_view.setReadOnly(True)
+        output_view.setMaximumBlockCount(500)
+        output_view.setMinimumHeight(120)
+        output_view.setPlaceholderText("Ausgabe des Paketmanagers erscheint hier.")
+        layout.addWidget(output_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        close_button = buttons.button(QDialogButtonBox.StandardButton.Close)
+        close_button.setEnabled(False)
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._backend_install_dialog = dialog
+
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._backend_install_process = process
+        state = {"finished": False}
+
+        def append_process_output():
+            try:
+                chunk = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+            except (RuntimeError, TypeError):
+                return
+            if not chunk:
+                return
+            output_view.moveCursor(QTextCursor.MoveOperation.End)
+            output_view.insertPlainText(chunk.replace("\r", "\n"))
+            output_view.moveCursor(QTextCursor.MoveOperation.End)
+
+        def finish_installation(success, message):
+            if state["finished"]:
+                return
+            append_process_output()
+            state["finished"] = True
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(100 if success else 0)
+            progress_bar.setFormat("Installation abgeschlossen" if success else "Installation fehlgeschlagen")
+            close_button.setEnabled(True)
+            dialog.setWindowTitle("Backend-Installation abgeschlossen" if success else "Backend-Installation fehlgeschlagen")
+            status_label.setText(f"{package.label} wurde installiert." if success else f"{package.label} konnte nicht installiert werden.")
+            if success:
+                detail_label.setText(
+                    "Die Installation wurde erfolgreich abgeschlossen. Das Backend steht "
+                    "bei neuen Tabs zur Verfügung; falls es noch nicht in der Auswahl erscheint, "
+                    "ShellDeck bitte neu starten."
+                )
+            else:
+                detail_label.setText(message)
+            self.show_status(message)
+            if not dialog.isVisible():
+                dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            if self._backend_install_process is process:
+                self._backend_install_process = None
+            process.deleteLater()
+
+        def process_failed(error):
+            if error == QProcess.ProcessError.FailedToStart:
+                finish_installation(False, f"Installationsprogramm konnte nicht gestartet werden: {process.errorString()}")
+
+        def process_finished(exit_code, exit_status):
+            success = (
+                int(exit_code) == 0
+                and exit_status == QProcess.ExitStatus.NormalExit
+            )
+            if success:
+                message = f"{package.label} wurde erfolgreich installiert."
+            else:
+                message = (
+                    f"Installation von {package.label} fehlgeschlagen "
+                    f"(Exitcode {exit_code}). Die Paketmanager-Ausgabe steht im Fenster."
+                )
+            finish_installation(success, message)
+
+        process.readyReadStandardOutput.connect(append_process_output)
+        process.started.connect(lambda: self.show_status(f"Installation von {package.label} läuft …"))
+        process.errorOccurred.connect(process_failed)
+        process.finished.connect(process_finished)
+        self.show_status(f"Installation von {package.label} wird gestartet …")
+        process.start(str(package.program), list(package.arguments))
 
     def system_shell(self, shell_type=None) -> str:
         shell_type = self.normalize_shell_type(shell_type or self.shell_type)
+        if shell_type == "shelldeck":
+            return find_shelldeck_shell_executable()
         if sys.platform != "win32":
             if shell_type in ("bash", "zsh", "fish", "sh"):
                 return shutil.which(shell_type) or shell_type
@@ -3605,7 +4035,19 @@ class TerminalWindow(QMainWindow):
         saved_tabs = settings.get("tabs", [])
         self.saved_tabs = saved_tabs if isinstance(saved_tabs, list) else []
         layout_mode = str(settings.get("view_layout_mode", self.view_layout_mode) or "single")
-        self.view_layout_mode = layout_mode if layout_mode in {"single", "horizontal", "vertical", "quad"} else "single"
+        legacy_defaults = {
+            "shell_type": self.shell_type,
+            "terminal_engine": self.terminal_engine,
+            "terminal_view_mode": settings.get("default_terminal_view_mode", self.default_terminal_view_mode),
+            "view_layout_mode": layout_mode,
+        }
+        stored_defaults = settings.get("personal_defaults")
+        self.personal_defaults = self.normalize_personal_defaults(
+            {**legacy_defaults, **stored_defaults}
+            if isinstance(stored_defaults, dict) else legacy_defaults
+        )
+        self.default_terminal_view_mode = self.personal_defaults["terminal_view_mode"]
+        self.view_layout_mode = self.personal_defaults["view_layout_mode"]
 
         saved_paths = settings.get("saved_paths", [])
         self.saved_paths = [
@@ -3653,6 +4095,10 @@ class TerminalWindow(QMainWindow):
             **terminal_engine_settings,
             "tabs": self.collect_tab_settings(),
             "view_layout_mode": getattr(self, "view_layout_mode", "single"),
+            "default_terminal_view_mode": self.normalize_terminal_view_mode(
+                getattr(self, "default_terminal_view_mode", "classic")
+            ),
+            "personal_defaults": self.normalize_personal_defaults(),
             "saved_paths": self.saved_paths,
             "default_start_directory": self.default_start_directory,
             "selected_ollama_model": self.selected_ollama_model,
@@ -4379,7 +4825,11 @@ class TerminalWindow(QMainWindow):
         self.selected_ollama_model = model
         # Die API-Chatoberflaeche nutzt QTextEdit und eine eigene Eingabezeile.
         # Mit globaler VT-Voreinstellung waere sie sonst verborgen.
-        tab = self.new_tab(title=f"Ollama {model}", terminal_engine="qprocess")
+        tab = self.new_tab(
+            title=f"Ollama {model}",
+            terminal_engine="qprocess",
+            terminal_view_mode="classic",
+        )
         if isinstance(tab, TerminalTab):
             tab.start_ollama_prompt_mode(model)
             tab.input_line.setFocus()
@@ -4666,20 +5116,16 @@ Ansicht-Menü
 - Aktuellen Tab wieder ins Hauptfenster koppeln: holt einen entkoppelten Tab zurück.
 
 Einstellungen-Menü
-- Schriftart: setzt die Terminal-Schrift für alle Tabs.
-- Farbschema: wechselt zwischen Dunkel, Hell und Hoher Kontrast.
+- Standardeinstellungen bündelt die dauerhaft gespeicherten App-Vorgaben: Schriftart, Farbschema und Design, Standardbefehl und Startordner, History und Scrollback, Vorbefehl, Profil-/Workspace-Übernahme, Systemintegration, KI-Menü sowie Shell, Engine, Terminalmodus und Startansicht für neue Tabs.
+- Die dauerhaft gespeicherten Optionen sind dort durch Trennlinien nach Darstellung, Verhalten und neuen Tabs gruppiert. Der Startordner lässt sich setzen oder zurücksetzen.
 - Design anpassen: bearbeitet Akzent, Hintergrund, Textfarbe, Eingabefeld, Terminal-Farben, Kontrast, Hintergrund-Deckkraft und Fenster-Transparenz.
 - Shell-Prompt und Python-Umgebung besitzen im Design-Dialog eigene Farbwerte sowie eine Vorschau. "Lokalen PTY-Bash-Prompt automatisch faerben" wirkt nur bei neu gestarteten lokalen PTY-Bash-Tabs unter Linux/macOS. QProcess, SSH-Gegenseite, Windows-ConPTY und andere Shells erhalten keine automatische Prompt-Umstellung. ShellDeck-eigene, ab dieser Version neu erzeugte Prompt-Farbrollen werden im PTY-Renderer sofort umgefaerbt, auch im sichtbaren Verlauf; sonstige ANSI-Farben bleiben unveraendert. Die Farbauswahl zeigt eine Live-Vorschau und kann mit Abbrechen zurueckgesetzt werden. Die Bash-Startdatei ist temporaer und veraendert weder ~/.bashrc noch ~/.profile. Die Farbeingabe fuer Befehlsmarker/Fehler-Marker ersetzt keine Exitcode-Erkennung.
-- Design auf Standard zurücksetzen: stellt die Standardfarben wieder her.
-- Standardbefehl: Befehl, der beim Start eines neuen Tabs automatisch ausgeführt wird.
-- History-Größe: maximale Anzahl gespeicherter Befehle.
-- Scrollback-Größe (klassische Ansicht): maximal 1.000 bis 100.000 Textblöcke je Tab (Standard 25.000). Alte Zeilen werden beim Verkleinern gelöscht.
-- Scrollback-Größe (echtes VT-Terminal): separat 100 bis 20.000 Verlaufszeilen je Tab (Standard 2.000), dauerhaft gespeichert. Eine Aenderung wirkt auf bestehende VT-Tabs und behaelt das sichtbare Bild und laufende Programme bei.
-- Shell-Backend: wechselt das Shell-Backend des aktuellen Tabs.
-- KI-Menü / Ollama aktivieren: zeigt oder versteckt das KI-Menü.
+- Shell, Terminal und Ansicht für neue Tabs: speichert Shell-Backend, Engine, Terminalmodus und Standardaufteilung. Gespeicherte Profile, Workspaces und Tab-Einstellungen behalten ihre eigenen Werte.
+- Aktuellen Tab einstellen: ändert nur Shell-Backend oder Engine des aktiven Tabs und damit nicht die persönlichen Vorgaben.
+- Fehlende Backend-Pakete installieren: richtet optionale Backend-Abhängigkeiten ein.
 
 KI-Menü und Ollama
-- Das KI-Menü ist standardmäßig ausblendbar und wird über Einstellungen → KI-Menü / Ollama aktivieren gesteuert.
+- Das KI-Menü ist standardmäßig ausblendbar und wird über Einstellungen → Standardeinstellungen → KI-Menü / Ollama aktivieren gesteuert.
 - Neuer Ollama-Chat: startet einen neuen Ollama-API-Tab mit ausgewähltem Modell.
 - Ollama-Modell wählen: liest verfügbare Modelle über ollama list aus und merkt das bevorzugte Modell.
 - Ollama-Gespräch löschen: leert Ausgabe und Kontext des aktuellen Ollama-Tabs.
@@ -4708,7 +5154,7 @@ Ollama – erster Chat (Schritt für Schritt)
 3. Falls die Liste leer ist, lade in einem normalen Shell-Tab ein für dein System geeignetes Modell, z. B. mit `ollama pull gemma3:1b`. Die Verfügbarkeit des Modells hängt von deiner Ollama-Installation ab.
 4. Stelle sicher, dass der lokale Ollama-Dienst läuft. ShellDeck verbindet sich für den eingebauten Chat mit `http://127.0.0.1:11434/api/generate` (lokale API). Auf Systemen ohne laufenden Dienst kann `ollama serve` nötig sein. Nicht doppelt starten, wenn der Dienst bereits läuft.
 ## In ShellDeck
-5. Öffne `Einstellungen → KI-Menü / Ollama aktivieren` und aktiviere den Eintrag. Danach erscheint das Menü `KI`.
+5. Öffne `Einstellungen → Standardeinstellungen → KI-Menü / Ollama aktivieren` und aktiviere den Eintrag. Danach erscheint das Menü `KI`.
 6. Wähle `KI → Neuer Ollama-Chat`, dann ein lokal installiertes Modell. Es öffnet sich ein eigener Chat-Tab mit klassischem Eingabefeld, unabhängig davon, welche Terminal-Engine normale Tabs nutzen.
 7. Schreibe unten eine Frage, zum Beispiel `Erkläre mir den Unterschied zwischen cd und pwd.`; sende sie mit Enter oder `An Ollama senden`.
 8. Im Chat-Tab werden weitere Eingaben als Fragen an Ollama geschickt, nicht als Shell-Befehle. Zum Beenden ` /bye` (ohne das führende Leerzeichen), `exit` oder `quit` senden oder den Tab schließen.
@@ -4743,7 +5189,7 @@ Ollama – Dateien und Code im Chat
 
 Ollama – häufige Fehler und Lösungen
 ## Problem: KI-Menü fehlt
-- Öffne `Einstellungen → KI-Menü / Ollama aktivieren`. Das Menü ist standardmäßig ausblendbar. Das Aktivieren installiert weder Ollama noch ein Modell.
+- Öffne `Einstellungen → Standardeinstellungen → KI-Menü / Ollama aktivieren`. Das Menü ist standardmäßig ausblendbar. Das Aktivieren installiert weder Ollama noch ein Modell.
 ## Problem: Kein Modell zur Auswahl
 - Prüfe in einem Shell-Tab `ollama --version` und `ollama list`. Falls nichts installiert ist, lade ein passendes Modell mit `ollama pull <modell>` und öffne die Modellauswahl erneut.
 - ShellDeck liest `ollama list` über das ausführbare Programm im PATH. Die Auswahlliste kann leer sein, obwohl ein anderer Ollama-Dienst auf einem anderen Rechner existiert.

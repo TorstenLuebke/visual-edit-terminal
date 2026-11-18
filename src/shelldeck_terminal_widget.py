@@ -31,6 +31,7 @@ import socket
 import getpass
 import threading
 import codecs
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -70,6 +71,36 @@ from PySide6.QtGui import (
     QTextCursor, QTextDocument, QFont, QTextCharFormat, QColor,
     QSyntaxHighlighter, QAction, QTextOption
 )
+
+
+def find_shelldeck_shell_executable():
+    """Find the already-built ShellDeck Rust CLI without invoking Cargo."""
+    executable = "shelldeck-shell.exe" if sys.platform == "win32" else "shelldeck-shell"
+    project_root = Path(__file__).resolve().parents[1]
+    roots = [project_root]
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root:
+        roots.append(Path(bundled_root))
+    custom_target = os.environ.get("CARGO_TARGET_DIR", "").strip()
+    target_dirs = []
+    if custom_target:
+        target = Path(custom_target)
+        if not target.is_absolute():
+            target = project_root / target
+        target_dirs.append(target)
+    target_dirs.append(project_root / "rust" / "shelldeck-shell" / "target")
+    candidates = []
+    for root in roots:
+        candidates.extend((root / "bin" / executable, root / "resources" / "bin" / executable))
+    for target in target_dirs:
+        candidates.extend((target / "release" / executable, target / "debug" / executable))
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate.resolve())
+        except OSError:
+            continue
+    return ""
 
 # Terminal-Ausgaben dürfen den Qt-UI-Thread nicht mit einem einzigen
 # riesigen QTextEdit-Insert blockieren. Der zeitbudgetierte Drain laesst
@@ -334,7 +365,7 @@ class DefaultTerminalHost:
 
     def normalize_shell_type(self, shell_type=None):
         text = str(shell_type or "").strip().lower()
-        known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh"}
+        known_shells = {"cmd", "powershell", "pwsh", "git_bash", "wsl", "bash", "zsh", "fish", "sh", "shelldeck"}
         if text not in known_shells:
             return self.default_shell_type()
         if sys.platform != "win32":
@@ -368,6 +399,8 @@ class DefaultTerminalHost:
 
     def system_shell(self, shell_type=None) -> str:
         shell_type = self.normalize_shell_type(shell_type or self.shell_type)
+        if shell_type == "shelldeck":
+            return find_shelldeck_shell_executable()
         if sys.platform != "win32":
             if shell_type in ("bash", "zsh", "fish", "sh"):
                 return shutil.which(shell_type) or shell_type
@@ -408,6 +441,7 @@ class DefaultTerminalHost:
             "zsh": "Zsh",
             "fish": "Fish",
             "sh": "sh",
+            "shelldeck": "ShellDeck Shell",
         }
         key = str(shell_type or "").strip().lower()
         return labels.get(key, key or "Shell")
@@ -1591,6 +1625,8 @@ class ShellDeckTerminalWidget(QWidget):
         self._bash_completion_decoder = None
         self._bash_completion_pending = False
         self._last_sent_shell_command = ""
+        self._shelldeck_shell_precommand_dir = None
+        self._shelldeck_shell_precommand_skip_file = None
 
         # Selbst-Cleanup: den Terminal-Prozess und den PTY-Reader auch dann
         # deterministisch beenden, wenn dieses Widget in einer Host-App (z.B.
@@ -2471,6 +2507,8 @@ class ShellDeckTerminalWidget(QWidget):
             return text
         first = str(words[0] or "").lower()
         lower_shell = str(self.shell_type or "").lower()
+        if lower_shell == "shelldeck" and first == "cls":
+            return "clear"
         if sys.platform != "win32" and lower_shell in {"bash", "zsh", "fish", "sh"}:
             if first == "cls":
                 return "clear"
@@ -2619,9 +2657,13 @@ class ShellDeckTerminalWidget(QWidget):
         return changed
 
     def shell_supports_context_probe(self):
+        shell_type = str(self.shell_type or "").lower()
+        if shell_type == "shelldeck":
+            # The Rust shell implements printf and exposes PWD, including on Windows.
+            return True
         if sys.platform == "win32":
             return False
-        return str(self.shell_type or "").lower() in {"bash", "zsh", "sh", "fish"}
+        return shell_type in {"bash", "zsh", "sh", "fish"}
 
     def shell_context_probe_command(self):
         # Die Ausgabe wird in consume_shell_context_markers() sofort wieder
@@ -4037,7 +4079,7 @@ class ShellDeckTerminalWidget(QWidget):
             return None
         shell = str(self.shell_type or "").lower()
         separator = " & " if shell == "cmd" else " ; "
-        if shell not in {"bash", "zsh", "sh", "fish", "powershell", "pwsh", "cmd"}:
+        if shell not in {"bash", "zsh", "sh", "fish", "powershell", "pwsh", "cmd", "shelldeck"}:
             return None
         values = []
         for raw, _is_user in commands_with_origin:
@@ -4174,7 +4216,9 @@ class ShellDeckTerminalWidget(QWidget):
             return False, "Kein leerer Shell-Prompt sicher erkannt; Schnellbefehl nicht übertragen."
         if "\x00" in command or "\r" in command:
             return False, "Der Schnellbefehl enthält nicht unterstützte Steuerzeichen."
-        prefix = str(self.window.active_pre_command_text() or "") if use_precommand else ""
+        shell = str(getattr(self, "shell_type", "") or "").strip().lower()
+        prefix = (str(self.window.active_pre_command_text() or "")
+                  if use_precommand and shell != "shelldeck" else "")
         parts = [part for part in (prefix, command) if part.strip()]
         # Dispatch with a normal line submit on the exact active PTY; native
         # shells own their history and state, just as for typed input.
@@ -4264,7 +4308,22 @@ class ShellDeckTerminalWidget(QWidget):
         if getattr(self, "real_terminal_active", False) and not fresh_tab:
             if str(getattr(self, "shell_type", "")).lower() == "bash" and os.name == "posix":
                 return self._run_quick_command_in_current_vt_bash(text, use_precommand)
-            return self._run_quick_command_in_current_native_vt(text, use_precommand)
+            shell = str(getattr(self, "shell_type", "") or "").strip().lower()
+            skip_file = getattr(self, "_shelldeck_shell_precommand_skip_file", None)
+            if shell == "shelldeck":
+                self.sync_grid_precommand_file()
+            if shell == "shelldeck" and not use_precommand and skip_file:
+                try:
+                    Path(skip_file).write_text(f"skip:{int(time.time() * 1000)}", encoding="ascii")
+                except OSError:
+                    return False, "Der Schnellbefehl konnte den Vorbefehl-Status nicht vorbereiten."
+            result = self._run_quick_command_in_current_native_vt(text, use_precommand)
+            if shell == "shelldeck" and not result[0] and skip_file:
+                try:
+                    Path(skip_file).write_text("", encoding="ascii")
+                except OSError:
+                    pass
+            return result
         # Im echten Bash-Grid sitzt der native Vorbefehl in einer Datei, die
         # beim nächsten ENTER von Readline gelesen wird. Für Schnellbefehle
         # ohne Vorbefehl muss sie bis zum nächsten manuellen Tastendruck leer
@@ -4698,6 +4757,16 @@ class ShellDeckTerminalWidget(QWidget):
             "shell_start", shell_generation=self._shell_generation)
         self._reset_shell_transient_state()
         shell_path = self.window.system_shell(self.shell_type)
+        if not shell_path and str(self.shell_type or "").strip().lower() == "shelldeck":
+            self.output_area.append(
+                "\nShellDeck Shell ist nicht verfügbar. Baue sie im Ordner "
+                "rust/shelldeck-shell mit `cargo build --release` und starte ShellDeck neu.\n"
+            )
+            show_status = getattr(self.window, "show_status", None)
+            if callable(show_status):
+                show_status("ShellDeck Shell nicht gefunden; bitte zuerst cargo build --release ausführen.")
+            self.update_input_prompt_label()
+            return
         if not shell_path:
             shell_path = self.window.system_shell("powershell" if sys.platform == "win32" else "bash")
         if self.start_directory:
@@ -4721,7 +4790,10 @@ class ShellDeckTerminalWidget(QWidget):
         # Readline-Vorbefehle funktionieren auch bei deaktivierter farbiger
         # ShellDeck-Prompt-Option; QProcess und andere Shells bleiben wie zuvor.
         old_prompt_rc = getattr(self, "_shelldeck_prompt_rc", None)
+        old_shelldeck_precommand_dir = getattr(self, "_shelldeck_shell_precommand_dir", None)
         self._shelldeck_prompt_rc = None
+        self._shelldeck_shell_precommand_dir = None
+        self._shelldeck_shell_precommand_skip_file = None
         self._shelldeck_grid_precommand_file = None
         self._shelldeck_grid_precommand_last = None
         self._shelldeck_grid_quick_command_file = None
@@ -4743,10 +4815,39 @@ class ShellDeckTerminalWidget(QWidget):
                 shell_args = ["--noprofile", "--rcfile", rc_path, "-i"]
             except (OSError, ValueError):
                 self._shelldeck_prompt_rc = None
+        if str(self.shell_type or "").strip().lower() == "shelldeck":
+            try:
+                self._shelldeck_shell_precommand_dir = tempfile.TemporaryDirectory(
+                    prefix="shelldeck-shell-"
+                )
+                precommand_path = Path(self._shelldeck_shell_precommand_dir.name) / "precommand"
+                skip_path = Path(self._shelldeck_shell_precommand_dir.name) / "precommand_skip"
+                precommand_path.write_text("", encoding="utf-8")
+                skip_path.write_text("", encoding="utf-8")
+                self._shelldeck_grid_precommand_file = str(precommand_path)
+                self._shelldeck_shell_precommand_skip_file = str(skip_path)
+                self._shelldeck_grid_precommand_last = None
+                shell_args.extend([
+                    "--precommand-file", str(precommand_path),
+                    "--precommand-skip-file", str(skip_path),
+                ])
+                self.sync_grid_precommand_file()
+            except OSError as exc:
+                self._shelldeck_shell_precommand_dir = None
+                self._shelldeck_grid_precommand_file = None
+                self._shelldeck_shell_precommand_skip_file = None
+                show_status = getattr(self.window, "show_status", None)
+                if callable(show_status):
+                    show_status(f"ShellDeck-Vorbefehl konnte nicht vorbereitet werden: {exc}")
         # Vorherige rc-Datei erst freigeben, nachdem die alte Shell beendet
         # wurde. Neue Datei bleibt bis zum naechsten Start/Tab-Abbau erhalten.
         if old_prompt_rc is not None:
             old_prompt_rc.cleanup()
+        if old_shelldeck_precommand_dir is not None:
+            try:
+                old_shelldeck_precommand_dir.cleanup()
+            except Exception:
+                pass
         if self.process_uses_pty_engine() and str(self.shell_type or "").lower() in {"powershell", "pwsh"}:
             # PSReadLine repaints long input lines in a real terminal using
             # carriage-return redraws. QTextEdit is not a terminal emulator and
@@ -4915,6 +5016,13 @@ class ShellDeckTerminalWidget(QWidget):
             self.stop_process(fast=True)
         except Exception:
             pass
+        precommand_dir = getattr(self, "_shelldeck_shell_precommand_dir", None)
+        if precommand_dir is not None:
+            try:
+                precommand_dir.cleanup()
+            except Exception:
+                pass
+            self._shelldeck_shell_precommand_dir = None
 
     def closeEvent(self, event):
         # Auch eingebettet sicher aufraeumen, falls dieses Widget als eigenes
@@ -5985,6 +6093,10 @@ class ShellDeckTerminalWidget(QWidget):
             re.compile(r"(?:^|\n)\s*PS\s+[^\r\n>]+>\s*$"),
             re.compile(r"(?:^|\n)\s*\([^\r\n()]+\)\s*PS\s+[^\r\n>]+>\s*$"),
             re.compile(r"(?:^|\n)\s*[A-Za-z]:[\\/][^\r\n>]*>\s*$"),
+            # The Rust CLI prints its absolute working directory as ``PATH >``.
+            # Recognize this prompt on POSIX and Windows so command completion
+            # returns control to ShellDeck's input line.
+            re.compile(r"(?:^|\n)\s*(?:[A-Za-z]:[\\/]|/|\\\\)[^\r\n]*\s>\s*$"),
             # Virtuelle Umgebungen koennen mehrfach aktiviert sein und auch
             # geschachtelte Klammern im Prompt erzeugen, etwa:
             #   ((.venv_A)) ((.venv) ) name@host:~/projekt$
@@ -6669,9 +6781,9 @@ class ShellDeckTerminalWidget(QWidget):
                            if getattr(self, "_quick_command_apply_precommand", True) else "")
             if prefix_text:
                 self.window.remember_pre_command_text(prefix_text)
-                # Bei echter PTY-Bash wird derselbe Vorbefehl bereits vom
-                # Readline-Accept-Line-Hook ausgefuehrt. Andernfalls wuerde
-                # der klassische API-Pfad ihn doppelt an die Shell senden.
+                # Im nativen VT-Modus führt Bash den Vorbefehl über Readline
+                # und ShellDeck Shell über ihren Host-Hook aus. Andernfalls
+                # würde der klassische API-Pfad ihn doppelt an die Shell senden.
                 native_hook = self.sync_grid_precommand_file()
                 if not native_hook:
                     prefix_commands = self.command_sequence_from_text(prefix_text, include_prefix=False)
@@ -7160,16 +7272,72 @@ class ShellDeckTerminalWidget(QWidget):
             update()
 
     # --- Programmspezifische VT-Bedienhilfe --------------------------------
+    def _reset_stale_foreground_mouse_modes(self):
+        """Clear mouse modes left active after control returns to the shell."""
+        grid = getattr(self, "terminal_grid", None)
+        model = getattr(grid, "_model", None)
+        if (
+            str(getattr(self, "shell_type", "")).strip().lower() == "shelldeck"
+            and model is not None
+            and not model.in_alternate_screen()
+            and model.bracketed_paste()
+        ):
+            # Reedline's prompt owns mouse tracking while bracketed paste is
+            # active; prompt detection must not reset its click-to-cursor mode.
+            return False
+        screen = getattr(model, "screen", None)
+        reset_mode = getattr(screen, "reset_mode", None)
+        if not callable(reset_mode):
+            return False
+        try:
+            reset_mode(1000, 1002, 1003, 1006, private=True)
+            return True
+        except (TypeError, ValueError, RuntimeError):
+            return False
+
+    def _terminal_grid_at_shell_prompt(self):
+        """Check the VT cursor row for a complete prompt and an empty input."""
+        grid = getattr(self, "terminal_grid", None)
+        model = getattr(grid, "_model", None)
+        if model is None:
+            return False
+        screen = getattr(model, "screen", None)
+        if getattr(screen, "alternate_active", False):
+            return False
+        try:
+            cursor = model.cursor
+            x, y = int(cursor["x"]), int(cursor["y"])
+            if cursor.get("hidden", False):
+                return False
+            cells = model.row_cells(y)
+            if not (0 <= x <= len(cells)):
+                return False
+            prefix = "".join(str(cell.get("char", " ")) for cell in cells[:x])
+            suffix = "".join(str(cell.get("char", " ")) for cell in cells[x:])
+            if suffix.strip():
+                return False
+            return self.output_ends_with_shell_prompt(prefix)
+        except (AttributeError, KeyError, TypeError, ValueError, IndexError):
+            return False
+
+    def _reset_mouse_modes_at_shell_prompt(self):
+        """Use the prompt itself as a fallback when foreground detection misses a TUI."""
+        if self._terminal_grid_at_shell_prompt():
+            return self._reset_stale_foreground_mouse_modes()
+        return False
+
     def _refresh_detected_program(self):
         """Sicherer, lesender PTY-Vordergrundcheck pro Tab, nie /proc-Scanning."""
         process = getattr(self, "process", None)
         identity = None
+        foreground_probe_succeeded = False
         if (getattr(self, "real_terminal_active", False)
                 and process is not None and self.process_uses_pty_engine()):
             probe = getattr(process, "foreground_guide", None)
             if callable(probe):
                 try:
                     identity = probe()
+                    foreground_probe_succeeded = True
                 except (OSError, RuntimeError, ValueError):
                     identity = None
         if identity is not None:
@@ -7180,8 +7348,11 @@ class ShellDeckTerminalWidget(QWidget):
                 identity = None
         if self._assist_identity == identity and self._assist_process is process:
             return
+        previous_identity = self._assist_identity
         self._assist_identity = identity
         self._assist_process = process if identity else None
+        if previous_identity is not None and identity is None and foreground_probe_succeeded:
+            self._reset_stale_foreground_mouse_modes()
         if identity:
             guide = GUIDES[identity[0]]
             self._assist_name.setText(f"{guide.label} läuft")
@@ -7344,19 +7515,21 @@ class ShellDeckTerminalWidget(QWidget):
         return self.set_real_terminal_mode(not getattr(self, "real_terminal_active", False))
 
     def sync_grid_precommand_file(self):
-        """Aktualisiert den Bash-Readline-Hook ohne Eingaben zu manipulieren.
+        """Aktualisiert den nativen Shell-Hook ohne Eingaben zu manipulieren.
 
-        Nur der echte PTY-Gittermodus nutzt den Hook. In der klassischen
-        Ansicht verarbeitet execute_command() Vorbefehle wie bisher selbst.
-        Schreiboperationen erfolgen nur bei Aenderungen; das Ziel liegt im
-        privaten temporären Verzeichnis der aktuellen Bash-Sitzung.
+        Bash nutzt den Readline-Hook, ShellDeck Shell liest dieselbe Datei
+        direkt vor einer eingegebenen Befehlszeile. In der klassischen Ansicht
+        verarbeitet execute_command() Vorbefehle weiterhin selbst.
         """
         path = getattr(self, "_shelldeck_grid_precommand_file", None)
         if not path:
             return False
-        active = (self.process_uses_pty_engine()
-                  and getattr(self, "real_terminal_active", False)
-                  and str(self.shell_type or "").lower() == "bash")
+        shell = str(self.shell_type or "").strip().lower()
+        active = (
+            self.process_uses_pty_engine()
+            and getattr(self, "real_terminal_active", False)
+            and shell in {"bash", "shelldeck"}
+        )
         prefix = (str(self.window.active_pre_command_text() or "")
                   if active and getattr(self, "_quick_command_apply_precommand", True) else "")
         if prefix != getattr(self, "_shelldeck_grid_precommand_last", None):
@@ -7556,6 +7729,7 @@ class ShellDeckTerminalWidget(QWidget):
                 switch()
         if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
             self.terminal_grid.feed(raw)
+            self._reset_mouse_modes_at_shell_prompt()
             self._schedule_qprocess_output_pump()
             return
         completed_codes = []
@@ -7619,6 +7793,7 @@ class ShellDeckTerminalWidget(QWidget):
                 switch()
         if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
             self.terminal_grid.feed(raw)
+            self._reset_mouse_modes_at_shell_prompt()
             self._schedule_qprocess_output_pump()
             return
         data = self.decoded_terminal_output(
