@@ -74,13 +74,41 @@ from PySide6.QtGui import (
 
 
 def find_shelldeck_shell_executable():
-    """Find the already-built ShellDeck Rust CLI without invoking Cargo."""
+    """Find the bundled or already-built ShellDeck Rust CLI without Cargo."""
     executable = "shelldeck-shell.exe" if sys.platform == "win32" else "shelldeck-shell"
-    project_root = Path(__file__).resolve().parents[1]
-    roots = [project_root]
+    module_path = Path(__file__).resolve()
+    project_root = module_path.parents[1]
+    roots = []
+
+    def add_root(value):
+        if not value:
+            return
+        try:
+            path = Path(value).expanduser().resolve()
+            root = path if path.is_dir() else path.parent
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return
+        if root not in roots:
+            roots.append(root)
+
+    # A packaged ShellDeck carries the Rust CLI as a sidecar in one of these
+    # app-relative folders. sys.argv[0]/sys.executable are needed for Nuitka
+    # standalone builds, where __file__ can point into a compiled module tree.
+    add_root(project_root)
+    add_root(sys.argv[0] if sys.argv else "")
+    add_root(sys.executable)
     bundled_root = getattr(sys, "_MEIPASS", None)
-    if bundled_root:
-        roots.append(Path(bundled_root))
+    add_root(bundled_root)
+
+    # Source checkouts can be launched through a wrapper or a copied module.
+    # Walk only the module's parent chain and accept a root when it clearly
+    # contains this project's Rust crate; do not scan arbitrary directories.
+    for ancestor in module_path.parents:
+        if (ancestor / "rust" / "shelldeck-shell" / "Cargo.toml").is_file():
+            project_root = ancestor
+            add_root(project_root)
+            break
+
     custom_target = os.environ.get("CARGO_TARGET_DIR", "").strip()
     target_dirs = []
     if custom_target:
@@ -88,17 +116,27 @@ def find_shelldeck_shell_executable():
         if not target.is_absolute():
             target = project_root / target
         target_dirs.append(target)
-    target_dirs.append(project_root / "rust" / "shelldeck-shell" / "target")
+
     candidates = []
     for root in roots:
-        candidates.extend((root / "bin" / executable, root / "resources" / "bin" / executable))
+        candidates.extend((
+            root / "bin" / executable,
+            root / "resources" / "bin" / executable,
+            root / executable,
+        ))
+    target_dirs.append(project_root / "rust" / "shelldeck-shell" / "target")
     for target in target_dirs:
         candidates.extend((target / "release" / executable, target / "debug" / executable))
+    # Also support a Rust CLI installed separately in the user's PATH.
+    path_candidate = shutil.which(executable)
+    if path_candidate:
+        candidates.append(Path(path_candidate))
+
     for candidate in candidates:
         try:
-            if candidate.is_file():
+            if candidate.is_file() and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
                 return str(candidate.resolve())
-        except OSError:
+        except (OSError, RuntimeError, TypeError, ValueError):
             continue
     return ""
 

@@ -73,6 +73,31 @@ Dieselbe Integration ist auch direkt aus ShellDeck heraus über
 **Einstellungen → Systemintegration…** verfügbar (installieren/entfernen,
 Statusanzeige). Die Logik liegt in `src/shelldeck_system_integration.py`.
 
+## ShellDeck Shell in installierten Paketen
+
+Die Rust-Shell ist eine separate Programmdatei und wird nicht automatisch in
+ein Nuitka- oder Setup-Paket aufgenommen. Für jedes Zielsystem muss sie mit
+dem passenden Rust-Target gebaut und als zusätzliche Paketdatei mitgeliefert
+werden:
+
+- Linux: `rust/shelldeck-shell/target/release/shelldeck-shell`
+- Windows: `rust/shelldeck-shell/target/release/shelldeck-shell.exe`
+
+Im Installationspaket muss die Datei unter `bin/shelldeck-shell` bzw.
+`bin/shelldeck-shell.exe` relativ zum installierten ShellDeck-Programm landen.
+Im Setup- bzw. Kompiler-Pro-Projekt daher die jeweilige Release-Datei als
+zusätzliche Datei aufnehmen und in den Unterordner `bin` des Anwendungsordners
+installieren. Unter Linux muss das Ausführungsrecht erhalten bleiben. Ein
+Linux-Build kann nicht als Windows-Binärdatei verwendet werden; die Datei muss
+für jedes Betriebssystem separat gebaut werden.
+
+ShellDeck sucht die Rust-Shell zuerst in den App-Verzeichnissen `bin` und
+`resources/bin`, danach im Rust-Quellprojekt und zuletzt im `PATH`. Bei einem
+Quellstart genügt `cargo build --release` im Ordner `rust/shelldeck-shell`.
+Bei einer installierten Version muss die zusätzliche Programmdatei Bestandteil
+des Installationspakets sein. Nach dem Hinzufügen die App neu paketieren und
+installieren; anschließend erscheint **ShellDeck Shell** in der Backend-Auswahl.
+
 ## Gemeinsame Versionsdatei für Kompiler Pro und ShellDeck
 
 Im Projektstamm liegt **`version.txt`**, genau eine Zeile (z. B. `2.16.0`).
