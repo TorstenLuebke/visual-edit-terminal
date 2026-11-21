@@ -648,12 +648,26 @@ fn run_shell(
     precommand_file: Option<PathBuf>,
     precommand_skip_file: Option<PathBuf>,
 ) -> io::Result<i32> {
-    let mut shell = ShellEngine::new();
+    // The desktop GUI supplies the precommand channel for its ShellDeck tabs.
+    // Those tabs must not mistake the GUI application's Python runtime venv
+    // for a user-activated project environment. Standalone CLI sessions do
+    // not receive these files and retain their inherited environment.
+    let is_gui_terminal_tab = precommand_file.is_some() || precommand_skip_file.is_some();
     let mut host = CliHost::new(precommand_file, precommand_skip_file)?;
+    let mut shell = ShellEngine::new();
+    if is_gui_terminal_tab {
+        shell
+            .clear_inherited_python_venv(&host)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    }
 
     loop {
         let cwd = host.current_dir()?;
-        let prompt = format!("{} > ", cwd.display());
+        let venv_prefix = active_virtual_environment_prefix(&shell);
+        let prompt = match venv_prefix {
+            Some(prefix) => format!("{prefix} {} > ", cwd.display()),
+            None => format!("{} > ", cwd.display()),
+        };
         let Some(input) = host.read_prompted_line(&prompt)? else {
             return Ok(0);
         };
@@ -674,6 +688,36 @@ fn run_shell(
             Ok(_) => {}
             Err(error) => host.write_stderr(&format!("{error}\n"))?,
         }
+    }
+}
+
+fn active_virtual_environment_prefix(shell: &ShellEngine) -> Option<String> {
+    let prompt_value = match shell.variables().get("VIRTUAL_ENV_PROMPT") {
+        Some(value) => Some(value.clone()),
+        None => env::var("VIRTUAL_ENV_PROMPT").ok(),
+    }
+    .filter(|value| !value.trim().is_empty());
+
+    let label = prompt_value.or_else(|| {
+        let venv_path = match shell.variables().get("VIRTUAL_ENV") {
+            Some(value) => Some(value.clone()),
+            None => env::var("VIRTUAL_ENV").ok(),
+        }?;
+        Path::new(&venv_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    })?;
+
+    let label = label.trim();
+    let label = label
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(label)
+        .trim();
+    if label.is_empty() {
+        None
+    } else {
+        Some(format!("({label})"))
     }
 }
 

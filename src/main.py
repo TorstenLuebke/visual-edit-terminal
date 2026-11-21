@@ -2155,6 +2155,9 @@ class TerminalWindow(QMainWindow):
             if other_tab is not tab and other_tab.title == base
         )
         title = f"{base} {index + 1}" if existing_same_title and not tab.custom_title else base
+        venv_badge = str(getattr(tab, "_shell_venv_badge", "") or "").strip()
+        if venv_badge:
+            title = f"{title} ({venv_badge})"
         icon = self.shell_backend_icon(tab.shell_type)
         tab_widget.setTabText(index, f"{icon} {title}".strip())
         tab_widget.tabBar().setTabTextColor(index, QColor(self.shell_backend_color(tab.shell_type)))
@@ -5270,6 +5273,17 @@ Virtuelle Umgebungen und Restore
 - Bei Workspaces werden Restore-Befehle und venv-Pfade je Tab gespeichert.
 - Beim Laden eines Workspace kann ein erkannter Aktivierungsbefehl erneut ausgeführt werden.
 - Die Funktion ist bewusst allgemein gehalten und hängt vom Backend und vom sichtbaren Shell-Prompt ab.
+
+ShellDeck Shell – Befehle und Diagnose
+- Diese Befehle gelten, wenn im aktuellen Tab das Backend „ShellDeck Shell“ ausgewählt ist. Bash, Zsh, Fish und andere Backends verwenden ihre eigene Shell-Hilfe.
+- Linux/macOS: im Projektordner `source .venv/bin/activate`; Windows: `source .venv/Scripts/activate`. Wenn die venv anderswo liegt, den passenden relativen oder absoluten Pfad einsetzen.
+- Nach erfolgreicher Aktivierung zeigt ShellDeck im Prompt `(.venv)` (oder den Namen der Umgebung). `venv info` bzw. `venv status` zeigt zusätzlich Status, Pfad, Interpreter und erkannte Python-Version.
+- `deactivate` beendet die aktive venv. `diagnose venv` prüft den venv-Zustand, `diagnose python` zeigt die Python-Auflösung, `diagnose path` listet PATH-Verzeichnisse samt Existenz und `diagnose shell` zeigt Shell-/Systemdaten. `diagnose` führt die allgemeine Zusammenfassung aus.
+- Python unabhängig prüfen (Linux/macOS): `python3 -c 'import sys; print(sys.executable); print(sys.prefix); print(sys.base_prefix)'`. Eine aktive venv verwendet üblicherweise einen Interpreter innerhalb ihres Ordners; `sys.prefix` zeigt auf die venv und unterscheidet sich von `sys.base_prefix`. Unter Windows kann der Befehl `python` statt `python3` heißen.
+- `help`, `help venv`, `help diagnose` und `help wait` zeigen die ShellDeck-Shell-Hilfe direkt im Terminal; für die drei Detailthemen funktioniert auch `venv --help`, `diagnose --help` oder `wait --help`.
+- `jobs` zeigt Hintergrundjobs dieser Shell. `wait` wartet auf alle noch geführten Jobs, `wait JOB_ID` auf eine einzelne ID aus `jobs`.
+- `ping localhost` ist ein externes Systemprogramm und wird mit Ctrl+C beendet. `ifconfig` ist auf vielen Systemen nicht vorinstalliert; ShellDeck stellt es nicht selbst bereit. `ip address` kann unter Linux eine Alternative sein, sofern `ip` installiert ist.
+- Wenn ein eingebauter Befehl wie `venv info` als „shell host error: No such file or directory“ erscheint, läuft wahrscheinlich eine ältere Rust-Shell-Datei. Für die installierte App muss `shelldeck-shell` neu gebaut und im Paket unter `bin/shelldeck-shell` (Windows: `bin/shelldeck-shell.exe`) mitgeliefert und installiert werden; danach ShellDeck neu starten.
 
 Gespeicherte Daten
 - Allgemeine Einstellungen werden über die Anwendungseinstellungen gespeichert.

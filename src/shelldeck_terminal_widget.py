@@ -1629,6 +1629,8 @@ class ShellDeckTerminalWidget(QWidget):
         self.command_history = self.normalize_command_history(command_history)
         self.restore_command = str(restore_command or "").strip()
         self.venv_path = self.normalize_venv_path(venv_path)
+        self._shell_venv_badge = ""
+        self._shelldeck_prompt_text_tail = ""
         # True, sobald die Shell keine aktive venv mehr meldet oder der Benutzer
         # "deactivate" ausgefuehrt hat. Sperrt die Ersatz-Erkennung in
         # active_venv_label(), damit das Praefix nicht aus dem Restore-Befehl
@@ -2632,7 +2634,9 @@ class ShellDeckTerminalWidget(QWidget):
             # gespeicherten Restore-Befehl oder aus alten Ausgabezeilen.
             self.venv_path = ""
             self._venv_deactivated = True
+            self._shell_venv_badge = ""
             self.update_input_prompt_label()
+            self.refresh_shell_tab_title()
             return True
         if not self.command_looks_like_venv_activation(text):
             return False
@@ -2648,6 +2652,8 @@ class ShellDeckTerminalWidget(QWidget):
             script_text = str(parts[1])
         elif "activate" in str(parts[0]).lower():
             script_text = str(parts[0])
+        if len(script_text) >= 2 and script_text[0] == script_text[-1] and script_text[0] in {"'", '"'}:
+            script_text = script_text[1:-1]
         if not script_text:
             return False
 
@@ -2661,10 +2667,12 @@ class ShellDeckTerminalWidget(QWidget):
                 if venv_dir.exists() and venv_dir.is_dir():
                     self.venv_path = str(venv_dir)
                     self._venv_deactivated = False
+                    self._shell_venv_badge = venv_dir.name or "venv"
                     project_dir = venv_dir.parent
                     if project_dir.exists() and project_dir.is_dir():
                         self.current_working_directory = str(project_dir)
                     self.update_input_prompt_label()
+                    self.refresh_shell_tab_title()
                     return True
         except OSError:
             return False
@@ -2787,6 +2795,7 @@ class ShellDeckTerminalWidget(QWidget):
                     if venv_path.exists() and venv_path.is_dir():
                         self.venv_path = str(venv_path)
                         self._venv_deactivated = False
+                        self._shell_venv_badge = venv_path.name or "venv"
                         changed = True
                 else:
                     # Eine leere VIRTUAL_ENV-Marke bedeutet: Die Shell hat keine
@@ -2798,11 +2807,130 @@ class ShellDeckTerminalWidget(QWidget):
                         changed = True
                     self.venv_path = ""
                     self._venv_deactivated = True
+                    if self._shell_venv_badge:
+                        self._shell_venv_badge = ""
+                        changed = True
             except OSError:
                 pass
         if changed:
             QTimer.singleShot(0, self.update_input_prompt_label)
+            QTimer.singleShot(0, self.refresh_shell_tab_title)
         return "".join(kept)
+
+    def refresh_shell_tab_title(self):
+        update_title = getattr(self.window, "update_tab_title", None)
+        if callable(update_title):
+            try:
+                update_title(self)
+            except Exception:
+                pass
+
+    def parse_shelldeck_prompt_context(self, prompt_text):
+        """Return the real cwd and optional venv label from ShellDeck's prompt."""
+        prompt = str(prompt_text or "").rstrip()
+        if not prompt.endswith(" >"):
+            return None
+        displayed = prompt[:-2].rstrip()
+        venv_label = ""
+        if displayed.startswith("[venv: "):
+            closing = displayed.find("] ")
+            if closing <= len("[venv: "):
+                return None
+            venv_label = displayed[len("[venv: "):closing].strip()
+            displayed = displayed[closing + 2:].strip()
+            if not venv_label:
+                return None
+        elif displayed.startswith("("):
+            closing = displayed.find(") ")
+            if closing > 1:
+                venv_label = displayed[1:closing].strip()
+                displayed = displayed[closing + 2:].strip()
+        if not displayed or not os.path.isabs(displayed):
+            return None
+        try:
+            directory = Path(displayed).expanduser().resolve()
+            if not directory.exists() or not directory.is_dir():
+                return None
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return str(directory), venv_label
+
+    def sync_shelldeck_context_from_prompt(self, prompt_text):
+        """Use ShellDeck's exact prompt as the authority for cwd and venv state."""
+        if str(getattr(self, "shell_type", "") or "").lower() != "shelldeck":
+            return False
+        context = self.parse_shelldeck_prompt_context(prompt_text)
+        if context is None:
+            return False
+        directory, venv_label = context
+        changed = False
+        if directory != str(getattr(self, "current_working_directory", "") or ""):
+            self.current_working_directory = directory
+            changed = True
+        old_badge = str(getattr(self, "_shell_venv_badge", "") or "")
+        if old_badge != venv_label:
+            self._shell_venv_badge = venv_label
+            changed = True
+            self.refresh_shell_tab_title()
+        if venv_label:
+            self._venv_deactivated = False
+            if not str(getattr(self, "venv_path", "") or ""):
+                candidate = Path(directory) / venv_label
+                try:
+                    if candidate.is_dir():
+                        self.venv_path = str(candidate.resolve())
+                        changed = True
+                except (OSError, RuntimeError, ValueError):
+                    pass
+        elif old_badge or str(getattr(self, "venv_path", "") or ""):
+            self.venv_path = ""
+            self._venv_deactivated = True
+            changed = True
+        if changed:
+            self.update_input_prompt_label()
+        return True
+
+    def sync_shelldeck_context_from_terminal_text(self, text):
+        """Track prompts in classic output mode, where no VT grid is active."""
+        if (str(getattr(self, "shell_type", "") or "").lower() != "shelldeck"
+                or getattr(self, "real_terminal_active", False)):
+            return False
+        combined = str(getattr(self, "_shelldeck_prompt_text_tail", "") or "") + str(text or "")
+        lines = combined.splitlines()
+        for line in reversed(lines):
+            if self.sync_shelldeck_context_from_prompt(line):
+                self._shelldeck_prompt_text_tail = ""
+                return True
+        if combined and not combined.endswith(("\n", "\r")):
+            self._shelldeck_prompt_text_tail = combined.splitlines()[-1][-4096:]
+        else:
+            self._shelldeck_prompt_text_tail = ""
+        return False
+
+    def sync_shelldeck_venv_badge_from_terminal_prompt(self):
+        """Read the live VT prompt so direct input updates cwd and venv state."""
+        if str(getattr(self, "shell_type", "") or "").lower() != "shelldeck":
+            return False
+        grid = getattr(self, "terminal_grid", None)
+        model = getattr(grid, "_model", None)
+        if model is None:
+            return False
+        try:
+            if model.screen.alternate_active:
+                return False
+            cursor = model.cursor
+            if cursor.get("hidden", False):
+                return False
+            row, column = int(cursor["y"]), int(cursor["x"])
+            rows = model.display()
+            if not (0 <= row < len(rows) and 0 <= column <= len(rows[row])):
+                return False
+            line = rows[row]
+            if line[column:].strip():
+                return False
+            return self.sync_shelldeck_context_from_prompt(line[:column].rstrip())
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return False
 
     def normalize_start_directory(self, directory):
         text = str(directory or "").strip().strip('"')
@@ -2889,6 +3017,35 @@ class ShellDeckTerminalWidget(QWidget):
             # Workspace-/Profil-Restore-Befehle auf Linux robust, egal ob der
             # Tab als Bash oder sh gestartet wurde.
             return relative_or_absolute(script_path, ". ").replace("\\", "/")
+
+        def shelldeck_activation_command(script_path):
+            # The Rust interpreter recognizes Python venv activation files and
+            # applies PATH/VIRTUAL_ENV natively instead of parsing Bash syntax.
+            try:
+                base = Path(base_text) if base_text else Path.cwd()
+                text = str(script_path.resolve().relative_to(base.resolve()))
+                if not text.startswith((".", os.sep)):
+                    text = "." + os.sep + text
+            except (OSError, ValueError):
+                text = str(script_path)
+            return "source " + shlex.quote(text)
+
+        if shell == "shelldeck":
+            if sys.platform == "win32":
+                candidates = (
+                    venv / "Scripts" / "activate",
+                    venv / "Scripts" / "activate.bat",
+                    venv / "Scripts" / "Activate.ps1",
+                )
+            else:
+                candidates = (
+                    venv / "bin" / "activate",
+                    venv / "bin" / "activate.fish",
+                )
+            for script in candidates:
+                if script.exists():
+                    return shelldeck_activation_command(script)
+            return ""
 
         if sys.platform == "win32" and shell in {"powershell", "pwsh"}:
             script = venv / "Scripts" / "Activate.ps1"
@@ -4231,6 +4388,11 @@ class ShellDeckTerminalWidget(QWidget):
                 return False
             left = line[:x]
             shell = str(self.shell_type or "").lower()
+            if shell == "shelldeck":
+                # Direct `cd` in Reedline bypasses the GUI's cwd tracker. Use
+                # ShellDeck's exact, empty prompt as the cwd authority instead
+                # of comparing it to a stale cached path.
+                return self.sync_shelldeck_context_from_prompt(left.rstrip())
             if shell in {"powershell", "pwsh", "powershell7"}:
                 return bool(re.search(r"^PS (?:[^>\r\n]+)>\s*$", left))
             if shell in {"cmd", "cmd.exe"}:
@@ -6971,7 +7133,9 @@ class ShellDeckTerminalWidget(QWidget):
         if uses_pty:
             text = self.suppress_pending_pty_command_echo(text)
         text = self.suppress_pending_interactive_response_echo(text)
-        return self.consume_shell_context_markers(text)
+        text = self.consume_shell_context_markers(text)
+        self.sync_shelldeck_context_from_terminal_text(text)
+        return text
 
     def normalize_response_echo_text(self, value):
         return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -7767,6 +7931,7 @@ class ShellDeckTerminalWidget(QWidget):
                 switch()
         if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
             self.terminal_grid.feed(raw)
+            self.sync_shelldeck_venv_badge_from_terminal_prompt()
             self._reset_mouse_modes_at_shell_prompt()
             self._schedule_qprocess_output_pump()
             return
@@ -7831,6 +7996,7 @@ class ShellDeckTerminalWidget(QWidget):
                 switch()
         if getattr(self, "real_terminal_active", False) and self.terminal_grid is not None:
             self.terminal_grid.feed(raw)
+            self.sync_shelldeck_venv_badge_from_terminal_prompt()
             self._reset_mouse_modes_at_shell_prompt()
             self._schedule_qprocess_output_pump()
             return

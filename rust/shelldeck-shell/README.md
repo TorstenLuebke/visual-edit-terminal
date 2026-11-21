@@ -6,7 +6,8 @@ The library has no Qt dependency and currently has no third-party dependencies.
 ## Current command set
 
 - Built-ins: `cd` (including `cd -`), `pwd`, `help`, `history` (`history -c`),
-  `source FILE`/`. FILE`, `jobs`, `wait [JOB_ID]`, `true`, `false`, `clear`,
+  `source FILE`/`. FILE`, `deactivate`, `venv [info|status]`,
+  `diagnose [venv|python|path|shell]`, `jobs`, `wait [JOB_ID]`, `true`, `false`, `clear`,
   `exit [STATUS]`, `return [STATUS]` (inside sourced scripts/functions), `break`,
   `continue` (inside sourced loops), `test`, `[ ]`, `printf`, `local`, `read`
 - `cd -` switches to the previous directory and writes the destination path to
@@ -195,6 +196,15 @@ returns status 1 and leaves the arguments unchanged.
 returns a status from 0 to 255. Without an argument it returns the last command's
 status. Nested `source` calls and function calls keep their return scopes
 separate.
+
+Python virtual environments are activated natively by sourcing their standard
+activation file. On Linux and macOS, use `source .venv/bin/activate`; on Windows,
+use `source .venv/Scripts/activate`, `activate.bat`, or `Activate.ps1`. The shell
+recognizes the venv through its `pyvenv.cfg`, then updates `PATH`, `VIRTUAL_ENV`,
+and `VIRTUAL_ENV_PROMPT` without interpreting the platform shell script. Run
+`deactivate` to restore the environment values that were active before the venv.
+This keeps activation usable with ShellDeck's limited cross-platform interpreter
+without depending on Bash, PowerShell, or cmd syntax.
 
 Sourced scripts can define reusable multiline functions with `NAME() {` and a
 matching `}` on its own line. Call a function by name and pass arguments as usual;
@@ -512,3 +522,70 @@ handles arrow keys, cursor movement, deletion, and an in-memory command history;
 it restores terminal input mode before the shell starts a foreground program.
 When stdin is not a terminal, Rustyline keeps a direct line-reading fallback.
 The library ShellHost interface remains independent of Rustyline.
+
+## Patch 364
+
+Patch 364 adds native, cross-platform Python virtual-environment activation to
+the ShellDeck interpreter. It recognizes standard activation paths under `bin`
+and `Scripts`, updates the shell environment, and adds `deactivate` to restore
+the previous values. The GUI uses this native behavior when it restores a venv
+in a ShellDeck Shell tab.
+
+## Patch 365
+
+The interactive prompt now displays the active virtual-environment name before
+the working directory, for example `(.venv) /project >`. The prefix
+disappears after `deactivate`; an inherited `VIRTUAL_ENV_PROMPT` or
+`VIRTUAL_ENV` is also shown when ShellDeck starts inside an active environment.
+
+## Patch 366
+
+ShellDeck keeps the active environment visible as `(.venv) /project >`
+and as `(.venv)` in the tab title, including when
+the user activates or deactivates the environment directly in the ShellDeck
+line editor. The built-in `venv info` (also `venv status`) prints the active
+environment path and its Python interpreter path when that interpreter exists.
+
+## Patch 367
+
+ShellDeck synchronizes its cached working directory and venv badge from the
+live ShellDeck prompt in both the VT grid and classic terminal view. Quick
+commands use the exact empty ShellDeck prompt as the authority for the current
+directory, so a direct `cd` no longer leaves a stale GUI path that blocks the
+quick command. GUI-submitted activation and `deactivate` commands also update
+the tab badge immediately.
+
+## Patch 368
+
+Patch 368 expands the ShellDeck Shell's built-in diagnostics without adding
+dependencies. `venv info` reports the active environment, its path, detected
+Python interpreter, and version from `pyvenv.cfg`; it can also detect the
+standard `bin`/`Scripts` PATH layout when `VIRTUAL_ENV` is unavailable.
+`diagnose` summarizes the shell and Python resolution. The focused forms
+`diagnose venv`, `diagnose python`, `diagnose path`, and `diagnose shell` show
+virtual-environment state, Python commands resolved through PATH, PATH entries
+with their existence, or shell/platform details respectively. It requires
+Patch 367.
+
+## Patch 369
+
+The built-in terminal help now documents Python environment activation and
+diagnosis, the prompt indicator, Python interpreter checks, external network
+commands, and background-job waiting. `help venv`, `help diagnose`, and
+`help wait` provide focused help, as do `venv --help`, `diagnose --help`, and
+`wait --help`. No third-party dependencies are added. For installed builds,
+rebuild and package the Rust sidecar as described above so the documented
+built-ins are available in the installed app.
+
+## Patch 372
+
+`deactivate` also handles an environment inherited when ShellDeck starts
+inside a Python venv. It masks `VIRTUAL_ENV` and `VIRTUAL_ENV_PROMPT` in that
+ShellDeck session and removes the environment's `bin` or `Scripts` directory
+from the PATH passed to child processes. This does not change the environment
+of the parent desktop application. An environment activated within ShellDeck
+still restores the values that were active before that activation. GUI tabs
+are identified by their precommand channel and clear the desktop application's
+inherited venv before the first prompt. Standalone CLI launches without that
+channel retain the environment inherited from their caller. The parent
+application's process environment is never changed.

@@ -202,6 +202,13 @@ struct ScriptFunction {
 }
 
 #[derive(Debug)]
+struct VirtualEnvironmentState {
+    previous_path: Option<String>,
+    previous_virtual_env: Option<String>,
+    previous_virtual_env_prompt: Option<String>,
+}
+
+#[derive(Debug)]
 struct ScriptCaseBranch {
     patterns: Vec<String>,
     body_start: usize,
@@ -617,6 +624,7 @@ fn find_script_loop_end(lines: &[&str], start: usize) -> Option<usize> {
 pub struct ShellEngine {
     history: Vec<String>,
     variables: BTreeMap<String, String>,
+    virtual_environment_state: Option<VirtualEnvironmentState>,
     functions: BTreeMap<String, ScriptFunction>,
     function_local_stack: Vec<BTreeMap<String, Option<String>>>,
     script_arguments: Vec<String>,
@@ -640,6 +648,240 @@ impl ShellEngine {
 
     pub fn variables(&self) -> &BTreeMap<String, String> {
         &self.variables
+    }
+
+    fn shell_variable_or_host<H: ShellHost>(&self, name: &str, host: &H) -> Option<String> {
+        self.variables
+            .get(name)
+            .cloned()
+            .or_else(|| host.env_var(name))
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    fn shell_path_entries<H: ShellHost>(&self, host: &H) -> Vec<PathBuf> {
+        self.shell_variable_or_host("PATH", host)
+            .map(|path| std::env::split_paths(&OsString::from(path)).collect())
+            .unwrap_or_default()
+    }
+
+    fn active_python_venv_path<H: ShellHost>(
+        &self,
+        host: &H,
+    ) -> Result<Option<PathBuf>, ShellError> {
+        // An empty shell-local value explicitly masks an inherited host
+        // environment after `deactivate`; do not rediscover it from PATH.
+        if self
+            .variables
+            .get("VIRTUAL_ENV")
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        if let Some(path) = self.shell_variable_or_host("VIRTUAL_ENV", host) {
+            return Ok(Some(PathBuf::from(path)));
+        }
+
+        // Some activation mechanisms only prepend the venv's bin/Scripts
+        // directory to PATH. Detect that standard layout as a fallback.
+        let Some(first_path) = self.shell_path_entries(host).into_iter().next() else {
+            return Ok(None);
+        };
+        let scripts_name = first_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(scripts_name.as_str(), "bin" | "scripts") {
+            return Ok(None);
+        }
+        let Some(venv_path) = first_path.parent() else {
+            return Ok(None);
+        };
+        let config = venv_path.join("pyvenv.cfg");
+        if host.path_kind(&config)? == Some(ShellPathKind::File) {
+            Ok(Some(venv_path.to_path_buf()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn venv_python_path<H: ShellHost>(
+        &self,
+        venv_path: &Path,
+        host: &H,
+    ) -> Result<Option<PathBuf>, ShellError> {
+        let candidates: &[&str] = if cfg!(windows) {
+            &["Scripts/python.exe", "Scripts/python3.exe"]
+        } else {
+            &["bin/python", "bin/python3"]
+        };
+        for candidate in candidates {
+            let path = venv_path.join(candidate);
+            if host.path_kind(&path)? == Some(ShellPathKind::File) {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
+    fn find_python_on_path<H: ShellHost>(
+        &self,
+        name: &str,
+        host: &H,
+    ) -> Result<Option<PathBuf>, ShellError> {
+        let mut names = vec![name.to_owned()];
+        if cfg!(windows) && Path::new(name).extension().is_none() {
+            let extensions = self
+                .shell_variable_or_host("PATHEXT", host)
+                .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned());
+            for extension in extensions.split(';').filter(|value| !value.is_empty()) {
+                names.push(format!("{name}{extension}"));
+            }
+        }
+        for directory in self.shell_path_entries(host) {
+            for candidate_name in &names {
+                let candidate = directory.join(candidate_name);
+                if host.path_kind(&candidate)? == Some(ShellPathKind::File) {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn append_venv_info<H: ShellHost>(
+        &self,
+        output: &mut Vec<u8>,
+        host: &mut H,
+    ) -> Result<(), ShellError> {
+        if let Some(venv_path) = self.active_python_venv_path(host)? {
+            output.extend_from_slice(b"Python-venv: aktiv\n");
+            output.extend_from_slice(format!("Pfad: {}\n", venv_path.display()).as_bytes());
+            if let Some(name) = venv_path.file_name() {
+                output.extend_from_slice(
+                    format!("Name: {}\n", name.to_string_lossy()).as_bytes(),
+                );
+            }
+            let config = venv_path.join("pyvenv.cfg");
+            if host.path_kind(&config)? == Some(ShellPathKind::File) {
+                if let Ok(contents) = host.read_file_bytes(&config) {
+                    let contents = String::from_utf8_lossy(&contents);
+                    if let Some(version) = contents.lines().find_map(|line| {
+                        let (key, value) = line.split_once('=')?;
+                        key.trim()
+                            .eq_ignore_ascii_case("version")
+                            .then(|| value.trim())
+                    }) {
+                        output.extend_from_slice(
+                            format!("Python-Version laut pyvenv.cfg: {version}\n").as_bytes(),
+                        );
+                    }
+                }
+            }
+            if let Some(python_path) = self.venv_python_path(&venv_path, host)? {
+                output.extend_from_slice(
+                    format!("Python-Interpreter: {}\n", python_path.display()).as_bytes(),
+                );
+            } else {
+                output.extend_from_slice(b"Python-Interpreter: im venv nicht gefunden\n");
+            }
+        } else {
+            output.extend_from_slice(b"Python-venv: nicht aktiv\n");
+        }
+        Ok(())
+    }
+
+    fn append_python_info<H: ShellHost>(
+        &self,
+        output: &mut Vec<u8>,
+        host: &mut H,
+    ) -> Result<(), ShellError> {
+        self.append_venv_info(output, host)?;
+        for name in ["python", "python3"] {
+            match self.find_python_on_path(name, host)? {
+                Some(path) => output.extend_from_slice(
+                    format!("{name} auf PATH: {}\n", path.display()).as_bytes(),
+                ),
+                None => output.extend_from_slice(format!("{name} auf PATH: nicht gefunden\n").as_bytes()),
+            }
+        }
+        Ok(())
+    }
+
+    fn append_path_info<H: ShellHost>(
+        &self,
+        output: &mut Vec<u8>,
+        host: &H,
+    ) -> Result<(), ShellError> {
+        let entries = self.shell_path_entries(host);
+        output.extend_from_slice(format!("PATH-Einträge: {}\n", entries.len()).as_bytes());
+        if entries.is_empty() {
+            output.extend_from_slice(b"PATH ist nicht gesetzt oder leer.\n");
+            return Ok(());
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            let state = match host.path_kind(entry)? {
+                Some(ShellPathKind::Directory) => "Verzeichnis vorhanden",
+                Some(ShellPathKind::File) => "Datei statt Verzeichnis",
+                Some(ShellPathKind::Other) => "kein Verzeichnis",
+                None => "nicht vorhanden",
+            };
+            output.extend_from_slice(
+                format!("[{}] {} — {}\n", index + 1, entry.display(), state).as_bytes(),
+            );
+        }
+        Ok(())
+    }
+
+    fn append_shell_info<H: ShellHost>(
+        &self,
+        output: &mut Vec<u8>,
+        host: &mut H,
+    ) -> Result<(), ShellError> {
+        output.extend_from_slice(
+            format!(
+                "ShellDeck Shell: {}\nBetriebssystem: {}\nArchitektur: {}\nArbeitsverzeichnis: {}\nShell-Variablen: {}\nPATH-Einträge: {}\n",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                host.current_dir()?.display(),
+                self.variables.len(),
+                self.shell_path_entries(host).len(),
+            )
+            .as_bytes(),
+        );
+        self.append_venv_info(output, host)
+    }
+
+    fn append_diagnostics<H: ShellHost>(
+        &self,
+        args: &[String],
+        output: &mut Vec<u8>,
+        host: &mut H,
+    ) -> Result<(), ShellError> {
+        if args.len() > 1
+            || args
+                .first()
+                .is_some_and(|section| !matches!(section.as_str(), "venv" | "python" | "path" | "shell"))
+        {
+            return Err(ShellError::Parse(
+                "Verwendung: diagnose [venv|python|path|shell]".to_owned(),
+            ));
+        }
+        match args.first().map(String::as_str) {
+            Some("venv") => self.append_venv_info(output, host),
+            Some("python") => self.append_python_info(output, host),
+            Some("path") => self.append_path_info(output, host),
+            Some("shell") => self.append_shell_info(output, host),
+            Some(_) => Err(ShellError::Parse(
+                "Verwendung: diagnose [venv|python|path|shell]".to_owned(),
+            )),
+            None => {
+                output.extend_from_slice(b"=== ShellDeck Shell ===\n");
+                self.append_shell_info(output, host)?;
+                output.extend_from_slice(b"\n=== Python-Aufloesung ===\n");
+                self.append_python_info(output, host)
+            }
+        }
     }
 
     /// Parses and executes one line without delegating to a system shell.
@@ -885,7 +1127,29 @@ impl ShellEngine {
         let mut output = Vec::new();
 
         match command {
-            "help" => output.extend_from_slice(HELP_TEXT.as_bytes()),
+            "help" => {
+                if args.is_empty()
+                    || (args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h"))
+                {
+                    output.extend_from_slice(HELP_TEXT.as_bytes());
+                } else if args.len() == 1 {
+                    let text = match args[0].as_str() {
+                        "venv" => VENV_HELP_TEXT,
+                        "diagnose" => DIAGNOSE_HELP_TEXT,
+                        "wait" => WAIT_HELP_TEXT,
+                        _ => {
+                            return Err(ShellError::Parse(
+                                "Eigene Detailhilfe: help [venv|diagnose|wait]".to_owned(),
+                            ));
+                        }
+                    };
+                    output.extend_from_slice(text.as_bytes());
+                } else {
+                    return Err(ShellError::Parse(
+                        "Verwendung: help [venv|diagnose|wait]".to_owned(),
+                    ));
+                }
+            }
             "pwd" => {
                 output.extend_from_slice(format!("{}\n", host.current_dir()?.display()).as_bytes())
             }
@@ -941,6 +1205,36 @@ impl ShellEngine {
                     .source_script(&args[0], &args[1..], host)
                     .map(|result| (result, output));
             }
+            "deactivate" => {
+                if !args.is_empty() {
+                    return Err(ShellError::Parse("Verwendung: deactivate".to_owned()));
+                }
+                return self
+                    .deactivate_python_venv(host)
+                    .map(|result| (result, output));
+            }
+            "venv" => {
+                let valid_arguments = args.is_empty()
+                    || (args.len() == 1
+                        && matches!(args[0].as_str(), "info" | "status" | "--help" | "-h"));
+                if !valid_arguments {
+                    return Err(ShellError::Parse(
+                        "Verwendung: venv [info|status|--help]".to_owned(),
+                    ));
+                }
+                if args.first().is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h")) {
+                    output.extend_from_slice(VENV_HELP_TEXT.as_bytes());
+                } else {
+                    self.append_venv_info(&mut output, host)?;
+                }
+            }
+            "diagnose" => {
+                if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+                    output.extend_from_slice(DIAGNOSE_HELP_TEXT.as_bytes());
+                } else {
+                    self.append_diagnostics(args, &mut output, host)?;
+                }
+            }
             "history" => {
                 if args.len() == 1 && args[0] == "-c" {
                     self.history.clear();
@@ -972,6 +1266,10 @@ impl ShellEngine {
                 }
             }
             "wait" => {
+                if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+                    output.extend_from_slice(WAIT_HELP_TEXT.as_bytes());
+                    return Ok((CommandResult::default(), output));
+                }
                 if args.len() > 1 {
                     return Err(ShellError::Parse("Verwendung: wait [JOB_ID]".to_owned()));
                 }
@@ -1351,6 +1649,14 @@ impl ShellEngine {
             )));
         }
         let resolved = resolve_path(path, host)?;
+        if arguments.is_empty() {
+            if let Some((venv_root, scripts_directory)) =
+                self.python_venv_from_activation_path(&resolved, host)?
+            {
+                self.activate_python_venv(&venv_root, &scripts_directory, host)?;
+                return Ok(CommandResult::default());
+            }
+        }
         let bytes = host.read_file_bytes(&resolved).map_err(|error| {
             ShellError::Script(format!("Skript kann nicht gelesen werden ({}): {error}", resolved.display()))
         })?;
@@ -1374,6 +1680,164 @@ impl ShellEngine {
             }
             (result, _) => result,
         }
+    }
+
+    fn python_venv_from_activation_path<H: ShellHost>(
+        &self,
+        script_path: &Path,
+        host: &H,
+    ) -> Result<Option<(PathBuf, PathBuf)>, ShellError> {
+        let file_name = script_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(
+            file_name.as_str(),
+            "activate" | "activate.fish" | "activate.bat" | "activate.ps1"
+        ) {
+            return Ok(None);
+        }
+
+        let Some(scripts_directory) = script_path.parent() else {
+            return Ok(None);
+        };
+        let scripts_name = scripts_directory
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(scripts_name.as_str(), "bin" | "scripts") {
+            return Ok(None);
+        }
+        let Some(venv_root) = scripts_directory.parent() else {
+            return Ok(None);
+        };
+        let marker = venv_root.join("pyvenv.cfg");
+        if host.path_kind(&marker)? != Some(ShellPathKind::File)
+            || host.path_kind(scripts_directory)? != Some(ShellPathKind::Directory)
+        {
+            return Ok(None);
+        }
+        Ok(Some((venv_root.to_path_buf(), scripts_directory.to_path_buf())))
+    }
+
+    fn activate_python_venv<H: ShellHost>(
+        &mut self,
+        venv_root: &Path,
+        scripts_directory: &Path,
+        host: &H,
+    ) -> Result<(), ShellError> {
+        // Switching environments first restores the state from the previous
+        // native activation, just as Python's activate script does.
+        if self.virtual_environment_state.is_some() {
+            self.deactivate_python_venv(host)?;
+        }
+
+        let previous_path = self
+            .variables
+            .get("PATH")
+            .cloned()
+            .or_else(|| host.env_var("PATH"));
+        let previous_virtual_env = self
+            .variables
+            .get("VIRTUAL_ENV")
+            .cloned()
+            .or_else(|| host.env_var("VIRTUAL_ENV"));
+        let previous_virtual_env_prompt = self
+            .variables
+            .get("VIRTUAL_ENV_PROMPT")
+            .cloned()
+            .or_else(|| host.env_var("VIRTUAL_ENV_PROMPT"));
+
+        let mut path_entries = vec![scripts_directory.to_path_buf()];
+        if let Some(path) = previous_path.as_deref() {
+            path_entries.extend(std::env::split_paths(&OsString::from(path)));
+        }
+        let path = std::env::join_paths(path_entries)
+            .map_err(|_| ShellError::Parse("Der PATH der Python-Umgebung ist ungültig.".to_owned()))?
+            .into_string()
+            .map_err(|_| ShellError::Parse("Der PATH enthält nicht darstellbare Zeichen.".to_owned()))?;
+        let venv_name = venv_root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "venv".to_owned());
+
+        self.virtual_environment_state = Some(VirtualEnvironmentState {
+            previous_path,
+            previous_virtual_env,
+            previous_virtual_env_prompt,
+        });
+        self.variables.insert("PATH".to_owned(), path);
+        self.variables.insert(
+            "VIRTUAL_ENV".to_owned(),
+            venv_root.to_string_lossy().into_owned(),
+        );
+        self.variables.insert(
+            "VIRTUAL_ENV_PROMPT".to_owned(),
+            format!("({venv_name})"),
+        );
+        Ok(())
+    }
+
+    fn deactivate_python_venv<H: ShellHost>(
+        &mut self,
+        host: &H,
+    ) -> Result<CommandResult, ShellError> {
+        if let Some(state) = self.virtual_environment_state.take() {
+            restore_shell_variable(&mut self.variables, "PATH", state.previous_path);
+            restore_shell_variable(
+                &mut self.variables,
+                "VIRTUAL_ENV",
+                state.previous_virtual_env,
+            );
+            restore_shell_variable(
+                &mut self.variables,
+                "VIRTUAL_ENV_PROMPT",
+                state.previous_virtual_env_prompt,
+            );
+            return Ok(CommandResult::default());
+        }
+
+        if !self.clear_inherited_python_venv(host)? {
+            return Err(ShellError::Parse(
+                "Keine aktive Python-Umgebung vorhanden.".to_owned(),
+            ));
+        }
+        Ok(CommandResult::default())
+    }
+
+    /// Clears the Python venv inherited from the parent application. ShellDeck
+    /// calls this before the first prompt in GUI terminal tabs; standalone CLI
+    /// sessions keep their inherited environment unless explicitly requested.
+    pub fn clear_inherited_python_venv<H: ShellHost>(
+        &mut self,
+        host: &H,
+    ) -> Result<bool, ShellError> {
+        if self.virtual_environment_state.is_some() {
+            return Ok(false);
+        }
+        let Some(venv_root) = self.active_python_venv_path(host)? else {
+            return Ok(false);
+        };
+        let scripts_directory = venv_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        let path_value = self
+            .shell_variable_or_host("PATH", host)
+            .unwrap_or_default();
+        let path_value_os = OsString::from(path_value);
+        let path_entries = std::env::split_paths(&path_value_os);
+        let filtered_entries: Vec<PathBuf> = path_entries
+            .filter(|entry| !same_path_entry(entry, &scripts_directory))
+            .collect();
+        let path = std::env::join_paths(filtered_entries)
+            .map_err(|_| ShellError::Parse("Der PATH der Python-Umgebung ist ungültig.".to_owned()))?
+            .into_string()
+            .map_err(|_| ShellError::Parse("Der PATH enthält nicht darstellbare Zeichen.".to_owned()))?;
+
+        self.variables.insert("PATH".to_owned(), path);
+        self.variables.insert("VIRTUAL_ENV".to_owned(), String::new());
+        self.variables
+            .insert("VIRTUAL_ENV_PROMPT".to_owned(), String::new());
+        Ok(true)
     }
 
     fn execute_script_function<H: ShellHost>(
@@ -2161,17 +2625,17 @@ fn format_command_label(stages: &[ParsedStage], background: bool) -> String {
 fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "help" | "pwd" | "dirs" | "cd" | "pushd" | "popd" | "source" | "." | "history" | "jobs" | "wait" | "clear"
+        "help" | "pwd" | "dirs" | "cd" | "pushd" | "popd" | "source" | "." | "history" | "jobs" | "wait" | "clear" | "diagnose"
             | "shift"
             | "break" | "continue" | "return"
-            | "true" | "false" | "test" | "["
+            | "true" | "false" | "test" | "[" | "deactivate" | "venv"
             | "echo" | "printf" | "read" | "set" | "local" | "let" | "unset" | "ls" | "dir" | "cat" | "mkdir" | "exit"
     )
 }
 
 fn pipeline_safe_builtin(words: &[String]) -> bool {
     match words[0].as_str() {
-        "help" | "pwd" | "echo" | "printf" | "true" | "false" | "test" | "[" | "ls"
+        "help" | "pwd" | "echo" | "printf" | "true" | "false" | "test" | "[" | "ls" | "diagnose"
         | "dir" | "cat" => true,
         "dirs" => {
             words.len() == 1
@@ -2180,6 +2644,11 @@ fn pipeline_safe_builtin(words: &[String]) -> bool {
                     .is_some_and(|option| matches!(option.as_str(), "-p" | "-v"))
         }
         "history" | "set" | "jobs" => words.len() == 1,
+        "venv" => {
+            words.len() == 1
+                || (words.len() == 2
+                    && matches!(words[1].as_str(), "info" | "status" | "--help" | "-h"))
+        }
         _ => false,
     }
 }
@@ -2411,7 +2880,14 @@ impl<H: ShellHost> TestExpressionParser<'_, '_, H> {
 }
 
 const HELP_TEXT: &str = "ShellDeck Shell — aktuelle Ausbaustufe\n\
-Eigene Befehle: cd [--] [PFAD|-] (cd - gibt den Zielpfad aus), pushd [--] [PFAD|+N], popd [+N], source DATEI [ARGUMENT ...], shift [ANZAHL], break, continue, test AUSDRUCK, [ AUSDRUCK ], printf FORMAT [WERT ...], let NAME=AUSDRUCK, pwd, dirs [-p|-v|-c], help, history [-c], jobs, wait [JOB_ID], true, false, clear, exit [STATUS]\n\
+Eigene Befehle: cd [--] [PFAD|-] (cd - gibt den Zielpfad aus), pushd [--] [PFAD|+N], popd [+N], source DATEI [ARGUMENT ...], deactivate, venv [info|status], diagnose [venv|python|path|shell], shift [ANZAHL], break, continue, test AUSDRUCK, [ AUSDRUCK ], printf FORMAT [WERT ...], let NAME=AUSDRUCK, pwd, dirs [-p|-v|-c], help [BEFEHL], history [-c], jobs, wait [JOB_ID], true, false, clear, exit [STATUS]\n\
+Detailhilfe: help venv, help diagnose und help wait; alternativ venv --help, diagnose --help und wait --help.\n\
+Python-venv: source PFAD/bin/activate (Linux/macOS) oder source PFAD/Scripts/activate[.bat|.ps1] (Windows); deactivate beendet die venv dieses Tabs, auch wenn sie von ShellDeck geerbt wurde.\n\
+Diagnose: venv info zeigt Status, Umgebungspfad, Interpreter und Version; diagnose fasst Shell und Python-Auflösung zusammen. diagnose path listet PATH-Verzeichnisse samt Existenzstatus.\n\
+Python-Prüfung: python3 -c 'import sys; print(sys.executable); print(sys.prefix); print(sys.base_prefix)' (unter Windows ggf. python verwenden).\n\
+Netzwerk: ping localhost ist ein externes Systemprogramm und kann mit Ctrl+C beendet werden. ifconfig ist nicht überall installiert; ShellDeck liefert es nicht mit.\n\
+Hintergrundjobs: jobs zeigt die IDs; wait wartet auf alle, wait JOB_ID auf einen einzelnen Job. wait --help zeigt Details.\n\
+ShellDeck-eigene Befehle werden kleingeschrieben verwendet (zum Beispiel dir, venv info, diagnose); andere Namen werden als externe Programme gestartet.\n\
 test unterstützt -e, -f und -d für plattformabhängig bereitgestellte Pfadtypen.\n\
 Dateien: ls [-a] [PFAD], dir [PFAD], cat DATEI..., mkdir [-p] PFAD...\n\
 Text und Variablen: echo [-n] TEXT..., read [NAME ...], set NAME=WERT, local NAME[=WERT], unset NAME...\n\
@@ -2429,6 +2905,33 @@ Funktionen: mehrzeilige FUNKTION() { ... }-Blöcke; return [STATUS]; $? zeigt de
 Funktionen: mehrzeilige FUNKTION() { ... }-Blöcke in source-Skripten definieren und per Namen aufrufen.\n\
 test unterstützt -a (UND) und -o (ODER), -a bindet stärker.\n\
 Schleifen sind nur in source-Skripten verfügbar; break / continue steuern ohne Argument die innerste aktive Schleife.\n";
+
+const VENV_HELP_TEXT: &str = "ShellDeck Shell — Python-Umgebungen\n\
+venv info | venv status  Zeigt, ob eine Python-venv aktiv ist, sowie Pfad und Interpreter.\n\
+source PFAD/bin/activate  Aktiviert eine venv unter Linux/macOS.\n\
+source PFAD/Scripts/activate  Aktiviert eine venv unter Windows.\n\
+deactivate  Beendet die aktive venv dieses Tabs; geerbte Umgebungen werden im Shell-Prozess ausgeblendet.\n\
+Nach der Aktivierung sollte der Prompt (NAME) enthalten, zum Beispiel (.venv).\n\
+Beispiel im Projektordner: source .venv/bin/activate\n\
+Liegt die venv in einem anderen Ordner, verwende den passenden relativen oder absoluten Pfad.\n\
+Für zusätzliche Diagnose: diagnose venv oder diagnose python.\n";
+
+const DIAGNOSE_HELP_TEXT: &str = "ShellDeck Shell — Diagnose\n\
+diagnose          Shell- und Python-Auflösung zusammenfassen.\n\
+diagnose venv     Aktive Python-venv, Pfad und Interpreter anzeigen.\n\
+diagnose python   Python-Befehle und aufgelöste Interpreter anzeigen.\n\
+diagnose path     PATH-Verzeichnisse samt Existenzstatus auflisten.\n\
+diagnose shell    Shell-, Betriebssystem- und Arbeitsordnerdaten anzeigen.\n\
+venv info         Kompakte Statusanzeige für die virtuelle Umgebung.\n\
+Tipp: python3 -c 'import sys; print(sys.executable); print(sys.prefix); print(sys.base_prefix)'\n\
+Bei Windows kann python statt python3 der verfügbare Befehlsname sein.\n";
+
+const WAIT_HELP_TEXT: &str = "ShellDeck Shell — Hintergrundjobs\n\
+jobs         Zeigt von ShellDeck gestartete Hintergrundjobs und ihre IDs.\n\
+wait         Wartet, bis alle noch geführten Hintergrundjobs beendet sind.\n\
+wait JOB_ID  Wartet auf einen einzelnen Job; die ID steht in der jobs-Ausgabe.\n\
+wait --help  Zeigt diese Hilfe.\n\
+wait ist ein ShellDeck-Shell-Befehl. Er wartet nicht auf externe Jobs anderer Tabs oder Shells.\n";
 
 #[derive(Debug)]
 struct ParsedCommand {
@@ -2634,6 +3137,32 @@ fn resolve_path<H: ShellHost>(value: &str, host: &H) -> Result<PathBuf, ShellErr
         Ok(value)
     } else {
         Ok(host.current_dir()?.join(value))
+    }
+}
+
+fn restore_shell_variable(
+    variables: &mut BTreeMap<String, String>,
+    name: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        variables.insert(name.to_owned(), value);
+    } else {
+        variables.remove(name);
+    }
+}
+
+fn same_path_entry(left: &Path, right: &Path) -> bool {
+    let left = left.as_os_str().to_string_lossy();
+    let right = right.as_os_str().to_string_lossy();
+    #[cfg(windows)]
+    {
+        left.trim_end_matches(|ch| ch == '/' || ch == '\\')
+            .eq_ignore_ascii_case(right.trim_end_matches(|ch| ch == '/' || ch == '\\'))
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
     }
 }
 

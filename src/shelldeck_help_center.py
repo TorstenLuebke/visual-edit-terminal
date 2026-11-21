@@ -34,7 +34,7 @@ def _category(title: str) -> str:
     name = title.casefold()
     if name.startswith(("übersicht", "grundbedienung")):
         return "Erste Schritte"
-    if name.startswith(("schnellbefehle", "vorbefehl", "backends", "echtes terminal", "virtuelle umgebungen")):
+    if name.startswith(("schnellbefehle", "vorbefehl", "backends", "echtes terminal", "virtuelle umgebungen", "shelldeck shell")):
         return "Terminal und Befehle"
     if name.startswith(("datei-menü", "pfade-menü", "profile-menü", "workspaces-menü", "gespeicherte daten")):
         return "Tabs, Projekte und Workspaces"
